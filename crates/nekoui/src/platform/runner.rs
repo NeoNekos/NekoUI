@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::WindowEvent;
@@ -24,6 +24,7 @@ struct RuntimeWindow {
     public_window: Window,
     native_window: Arc<WinitWindow>,
     template_root: crate::Element,
+    referenced_views: HashSet<u64>,
     retained_tree: RetainedTree,
     compiled_scene: crate::scene::CompiledScene,
     render_state: WindowRenderState,
@@ -82,11 +83,11 @@ impl Runner {
                 metrics.scale_factor,
             );
             let template_root = (request.build_root)(&mut public_window, &mut self.app);
-            let resolved_root = match self
+            let (resolved_root, referenced_views) = match self
                 .app
-                .resolve_root_element(&mut public_window, &template_root)
+                .resolve_root_element_with_views(&mut public_window, &template_root)
             {
-                Ok(resolved_root) => resolved_root,
+                Ok(value) => value,
                 Err(error) => {
                     log::error!("failed to resolve root element: {error}");
                     continue;
@@ -131,6 +132,7 @@ impl Runner {
                     public_window,
                     native_window: native_window.clone(),
                     template_root,
+                    referenced_views,
                     retained_tree,
                     compiled_scene,
                     render_state,
@@ -141,27 +143,47 @@ impl Runner {
     }
 
     fn process_runtime_updates(&mut self) {
-        if self.app.take_dirty_entities().is_empty() {
+        let runtime = match self.app.process_runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                log::error!("runtime processing failed: {error}");
+                return;
+            }
+        };
+
+        if runtime.dirty_views.is_empty() {
             return;
         }
 
         for runtime_window in self.windows.values_mut() {
-            let resolved_root = match self.app.resolve_root_element(
+            if !window_depends_on_dirty_views(runtime_window, &runtime.dirty_views) {
+                continue;
+            }
+
+            let (resolved_root, referenced_views) = match self.app.resolve_root_element_with_views(
                 &mut runtime_window.public_window,
                 &runtime_window.template_root,
             ) {
-                Ok(resolved_root) => resolved_root,
+                Ok(value) => value,
                 Err(error) => {
                     log::error!("failed to rebuild root element: {error}");
                     continue;
                 }
             };
-            runtime_window.retained_tree = RetainedTree::from_element(&resolved_root);
-            runtime_window
+            runtime_window.referenced_views = referenced_views;
+            let dirty = runtime_window
                 .retained_tree
-                .compute_layout(runtime_window.public_window.size(), &mut self.text_system);
-            runtime_window.compiled_scene = runtime_window.retained_tree.compile_scene();
-            runtime_window.native_window.request_redraw();
+                .update_from_element(&resolved_root);
+
+            if dirty.needs_layout() {
+                runtime_window
+                    .retained_tree
+                    .compute_layout(runtime_window.public_window.size(), &mut self.text_system);
+            }
+            if dirty.needs_scene_compile() {
+                runtime_window.compiled_scene = runtime_window.retained_tree.compile_scene();
+                runtime_window.native_window.request_redraw();
+            }
         }
     }
 
@@ -334,4 +356,13 @@ fn sanitize_scale_factor(scale_factor: f64) -> f64 {
     } else {
         1.0
     }
+}
+
+fn window_depends_on_dirty_views(
+    runtime_window: &RuntimeWindow,
+    dirty_views: &HashMap<u64, crate::scene::DirtyLaneMask>,
+) -> bool {
+    dirty_views
+        .keys()
+        .any(|view_id| runtime_window.referenced_views.contains(view_id))
 }

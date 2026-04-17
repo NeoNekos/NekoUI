@@ -16,7 +16,7 @@ use wgpu::{
 use winit::window::Window as WinitWindow;
 
 use crate::error::PlatformError;
-use crate::platform::wgpu::atlas::{AtlasEntry, GlyphAtlas};
+use crate::platform::wgpu::atlas::{AtlasEntry, GlyphAtlas, GlyphAtlasKind};
 use crate::platform::wgpu::context::WgpuContext;
 use crate::scene::{CompiledScene, Primitive};
 use crate::style::Color;
@@ -50,6 +50,14 @@ struct TextInstance {
     color: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ColorTextInstance {
+    rect: [f32; 4],
+    uv_rect: [f32; 4],
+    alpha: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum RenderOutcome {
     Presented,
@@ -68,15 +76,21 @@ pub struct RenderSystem {
     view_bind_group_layout: BindGroupLayout,
     view_bind_group: BindGroup,
     quad_pipeline: RenderPipeline,
-    text_pipeline: RenderPipeline,
-    atlas: GlyphAtlas,
+    mono_text_pipeline: RenderPipeline,
+    color_text_pipeline: RenderPipeline,
+    text_texture_bind_group_layout: BindGroupLayout,
+    mono_atlas: GlyphAtlas,
+    color_atlas: GlyphAtlas,
     swash_cache: SwashCache,
     quad_instances: Vec<QuadInstance>,
-    text_instances: Vec<TextInstance>,
+    mono_text_instances: Vec<TextInstance>,
+    color_text_instances: Vec<ColorTextInstance>,
     quad_instance_buffer: Buffer,
-    text_instance_buffer: Buffer,
+    mono_text_instance_buffer: Buffer,
+    color_text_instance_buffer: Buffer,
     quad_instance_capacity: usize,
-    text_instance_capacity: usize,
+    mono_text_instance_capacity: usize,
+    color_text_instance_capacity: usize,
 }
 
 impl RenderSystem {
@@ -124,30 +138,54 @@ impl RenderSystem {
             }],
         });
 
-        let atlas = GlyphAtlas::new(&context.device, ATLAS_SIZE.min(context.max_texture_size))?;
+        let text_texture_bind_group_layout = create_text_texture_bind_group_layout(&context.device);
+        let mono_atlas = GlyphAtlas::new(
+            &context.device,
+            &text_texture_bind_group_layout,
+            GlyphAtlasKind::Mono,
+            ATLAS_SIZE.min(context.max_texture_size),
+        )?;
+        let color_atlas = GlyphAtlas::new(
+            &context.device,
+            &text_texture_bind_group_layout,
+            GlyphAtlasKind::Color,
+            ATLAS_SIZE.min(context.max_texture_size),
+        )?;
         let quad_pipeline = create_quad_pipeline(
             &context.device,
             &view_bind_group_layout,
             TextureFormat::Bgra8UnormSrgb,
         );
-        let text_pipeline = create_text_pipeline(
+        let mono_text_pipeline = create_mono_text_pipeline(
             &context.device,
             &view_bind_group_layout,
-            atlas.bind_group_layout(),
+            &text_texture_bind_group_layout,
+            TextureFormat::Bgra8UnormSrgb,
+        );
+        let color_text_pipeline = create_color_text_pipeline(
+            &context.device,
+            &view_bind_group_layout,
+            &text_texture_bind_group_layout,
             TextureFormat::Bgra8UnormSrgb,
         );
 
         let quad_instance_capacity = 64;
-        let text_instance_capacity = 256;
+        let mono_text_instance_capacity = 256;
+        let color_text_instance_capacity = 64;
         let quad_instance_buffer = create_instance_buffer::<QuadInstance>(
             &context.device,
             "nekoui_quad_instances",
             quad_instance_capacity,
         );
-        let text_instance_buffer = create_instance_buffer::<TextInstance>(
+        let mono_text_instance_buffer = create_instance_buffer::<TextInstance>(
             &context.device,
-            "nekoui_text_instances",
-            text_instance_capacity,
+            "nekoui_mono_text_instances",
+            mono_text_instance_capacity,
+        );
+        let color_text_instance_buffer = create_instance_buffer::<ColorTextInstance>(
+            &context.device,
+            "nekoui_color_text_instances",
+            color_text_instance_capacity,
         );
 
         let mut render_system = Self {
@@ -156,15 +194,21 @@ impl RenderSystem {
             view_bind_group_layout,
             view_bind_group,
             quad_pipeline,
-            text_pipeline,
-            atlas,
+            mono_text_pipeline,
+            color_text_pipeline,
+            text_texture_bind_group_layout,
+            mono_atlas,
+            color_atlas,
             swash_cache: SwashCache::new(),
             quad_instances: Vec::new(),
-            text_instances: Vec::new(),
+            mono_text_instances: Vec::new(),
+            color_text_instances: Vec::new(),
             quad_instance_buffer,
-            text_instance_buffer,
+            mono_text_instance_buffer,
+            color_text_instance_buffer,
             quad_instance_capacity,
-            text_instance_capacity,
+            mono_text_instance_capacity,
+            color_text_instance_capacity,
         };
         let render_state = render_system.create_window_state(surface, physical_size)?;
         render_system.rebuild_pipelines(render_state.config.format);
@@ -240,10 +284,12 @@ impl RenderSystem {
         );
 
         self.quad_instances.clear();
-        self.text_instances.clear();
+        self.mono_text_instances.clear();
+        self.color_text_instances.clear();
         self.collect_instances(scene, text_system, scale_factor as f32);
         self.ensure_quad_capacity(self.quad_instances.len());
-        self.ensure_text_capacity(self.text_instances.len());
+        self.ensure_mono_text_capacity(self.mono_text_instances.len());
+        self.ensure_color_text_capacity(self.color_text_instances.len());
 
         if !self.quad_instances.is_empty() {
             self.context.queue.write_buffer(
@@ -252,11 +298,18 @@ impl RenderSystem {
                 bytemuck::cast_slice(&self.quad_instances),
             );
         }
-        if !self.text_instances.is_empty() {
+        if !self.mono_text_instances.is_empty() {
             self.context.queue.write_buffer(
-                &self.text_instance_buffer,
+                &self.mono_text_instance_buffer,
                 0,
-                bytemuck::cast_slice(&self.text_instances),
+                bytemuck::cast_slice(&self.mono_text_instances),
+            );
+        }
+        if !self.color_text_instances.is_empty() {
+            self.context.queue.write_buffer(
+                &self.color_text_instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.color_text_instances),
             );
         }
 
@@ -307,12 +360,20 @@ impl RenderSystem {
                 pass.draw(0..6, 0..self.quad_instances.len() as u32);
             }
 
-            if !self.text_instances.is_empty() {
-                pass.set_pipeline(&self.text_pipeline);
+            if !self.mono_text_instances.is_empty() {
+                pass.set_pipeline(&self.mono_text_pipeline);
                 pass.set_bind_group(0, &self.view_bind_group, &[]);
-                pass.set_bind_group(1, self.atlas.bind_group(), &[]);
-                pass.set_vertex_buffer(0, self.text_instance_buffer.slice(..));
-                pass.draw(0..6, 0..self.text_instances.len() as u32);
+                pass.set_bind_group(1, self.mono_atlas.bind_group(), &[]);
+                pass.set_vertex_buffer(0, self.mono_text_instance_buffer.slice(..));
+                pass.draw(0..6, 0..self.mono_text_instances.len() as u32);
+            }
+
+            if !self.color_text_instances.is_empty() {
+                pass.set_pipeline(&self.color_text_pipeline);
+                pass.set_bind_group(0, &self.view_bind_group, &[]);
+                pass.set_bind_group(1, self.color_atlas.bind_group(), &[]);
+                pass.set_vertex_buffer(0, self.color_text_instance_buffer.slice(..));
+                pass.draw(0..6, 0..self.color_text_instances.len() as u32);
             }
         }
 
@@ -354,23 +415,48 @@ impl RenderSystem {
                                 ),
                                 scale_factor,
                             );
-                            let Some(entry) =
+                            let Some((atlas_kind, entry)) =
                                 self.ensure_glyph_entry(text_system, physical.cache_key)
                             else {
                                 continue;
                             };
-                            let glyph_color =
-                                glyph.color_opt.map(cosmic_to_style_color).unwrap_or(*color);
-                            self.text_instances.push(TextInstance {
-                                rect: [
-                                    (physical.x + entry.placement_left) as f32,
-                                    (physical.y - entry.placement_top) as f32,
-                                    entry.width as f32,
-                                    entry.height as f32,
-                                ],
-                                uv_rect: entry.uv_rect,
-                                color: [glyph_color.r, glyph_color.g, glyph_color.b, glyph_color.a],
-                            });
+                            let rect = [
+                                (physical.x + entry.placement_left) as f32,
+                                (physical.y - entry.placement_top) as f32,
+                                entry.width as f32,
+                                entry.height as f32,
+                            ];
+
+                            match atlas_kind {
+                                GlyphAtlasKind::Mono => {
+                                    let glyph_color = glyph
+                                        .color_opt
+                                        .map(cosmic_to_style_color)
+                                        .unwrap_or(*color);
+                                    self.mono_text_instances.push(TextInstance {
+                                        rect,
+                                        uv_rect: entry.uv_rect,
+                                        color: [
+                                            glyph_color.r,
+                                            glyph_color.g,
+                                            glyph_color.b,
+                                            glyph_color.a,
+                                        ],
+                                    });
+                                }
+                                GlyphAtlasKind::Color => {
+                                    let alpha = glyph
+                                        .color_opt
+                                        .map(cosmic_to_style_color)
+                                        .unwrap_or(*color)
+                                        .a;
+                                    self.color_text_instances.push(ColorTextInstance {
+                                        rect,
+                                        uv_rect: entry.uv_rect,
+                                        alpha,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -382,16 +468,30 @@ impl RenderSystem {
         &mut self,
         text_system: &mut TextSystem,
         cache_key: CacheKey,
-    ) -> Option<AtlasEntry> {
-        if let Some(entry) = self.atlas.get(&cache_key) {
-            return Some(entry);
+    ) -> Option<(GlyphAtlasKind, AtlasEntry)> {
+        if let Some(entry) = self.mono_atlas.get(&cache_key) {
+            return Some((GlyphAtlasKind::Mono, entry));
         }
+        if let Some(entry) = self.color_atlas.get(&cache_key) {
+            return Some((GlyphAtlasKind::Color, entry));
+        }
+
         let image = self
             .swash_cache
             .get_image(text_system.font_system_mut(), cache_key)
             .as_ref()?
             .clone();
-        self.atlas.upload(&self.context.queue, cache_key, &image)
+
+        match image.content {
+            cosmic_text::SwashContent::Color => self
+                .color_atlas
+                .upload_color(&self.context.queue, cache_key, &image)
+                .map(|entry| (GlyphAtlasKind::Color, entry)),
+            cosmic_text::SwashContent::Mask | cosmic_text::SwashContent::SubpixelMask => self
+                .mono_atlas
+                .upload_mask(&self.context.queue, cache_key, &image)
+                .map(|entry| (GlyphAtlasKind::Mono, entry)),
+        }
     }
 
     fn surface_extent_for(&self, physical_size: WindowSize) -> WindowSize {
@@ -408,10 +508,16 @@ impl RenderSystem {
             &self.view_bind_group_layout,
             surface_format,
         );
-        self.text_pipeline = create_text_pipeline(
+        self.mono_text_pipeline = create_mono_text_pipeline(
             &self.context.device,
             &self.view_bind_group_layout,
-            self.atlas.bind_group_layout(),
+            &self.text_texture_bind_group_layout,
+            surface_format,
+        );
+        self.color_text_pipeline = create_color_text_pipeline(
+            &self.context.device,
+            &self.view_bind_group_layout,
+            &self.text_texture_bind_group_layout,
             surface_format,
         );
     }
@@ -430,17 +536,31 @@ impl RenderSystem {
         );
     }
 
-    fn ensure_text_capacity(&mut self, count: usize) {
-        if count <= self.text_instance_capacity {
+    fn ensure_mono_text_capacity(&mut self, count: usize) {
+        if count <= self.mono_text_instance_capacity {
             return;
         }
-        while self.text_instance_capacity < count {
-            self.text_instance_capacity *= 2;
+        while self.mono_text_instance_capacity < count {
+            self.mono_text_instance_capacity *= 2;
         }
-        self.text_instance_buffer = create_instance_buffer::<TextInstance>(
+        self.mono_text_instance_buffer = create_instance_buffer::<TextInstance>(
             &self.context.device,
-            "nekoui_text_instances",
-            self.text_instance_capacity,
+            "nekoui_mono_text_instances",
+            self.mono_text_instance_capacity,
+        );
+    }
+
+    fn ensure_color_text_capacity(&mut self, count: usize) {
+        if count <= self.color_text_instance_capacity {
+            return;
+        }
+        while self.color_text_instance_capacity < count {
+            self.color_text_instance_capacity *= 2;
+        }
+        self.color_text_instance_buffer = create_instance_buffer::<ColorTextInstance>(
+            &self.context.device,
+            "nekoui_color_text_instances",
+            self.color_text_instance_capacity,
         );
     }
 }
@@ -490,7 +610,31 @@ fn create_quad_pipeline(
     })
 }
 
-fn create_text_pipeline(
+fn create_text_texture_bind_group_layout(device: &Device) -> BindGroupLayout {
+    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("nekoui_text_texture_bind_group_layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn create_mono_text_pipeline(
     device: &Device,
     view_layout: &BindGroupLayout,
     glyph_layout: &BindGroupLayout,
@@ -501,16 +645,16 @@ fn create_text_pipeline(
         source: ShaderSource::Wgsl(TEXT_SHADER.into()),
     });
     let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("nekoui_text_pipeline_layout"),
+        label: Some("nekoui_mono_text_pipeline_layout"),
         bind_group_layouts: &[Some(view_layout), Some(glyph_layout)],
         immediate_size: 0,
     });
     device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("nekoui_text_pipeline"),
+        label: Some("nekoui_mono_text_pipeline"),
         layout: Some(&layout),
         vertex: VertexState {
             module: &shader,
-            entry_point: Some("vs_main"),
+            entry_point: Some("vs_mono"),
             compilation_options: PipelineCompilationOptions::default(),
             buffers: &[VertexBufferLayout {
                 array_stride: std::mem::size_of::<TextInstance>() as u64,
@@ -520,7 +664,53 @@ fn create_text_pipeline(
         },
         fragment: Some(FragmentState {
             module: &shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some("fs_mono"),
+            compilation_options: PipelineCompilationOptions::default(),
+            targets: &[Some(ColorTargetState {
+                format: surface_format,
+                blend: Some(BlendState::ALPHA_BLENDING),
+                write_mask: ColorWrites::ALL,
+            })],
+        }),
+        primitive: PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_color_text_pipeline(
+    device: &Device,
+    view_layout: &BindGroupLayout,
+    glyph_layout: &BindGroupLayout,
+    surface_format: TextureFormat,
+) -> RenderPipeline {
+    let shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("nekoui_text_shader"),
+        source: ShaderSource::Wgsl(TEXT_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("nekoui_color_text_pipeline_layout"),
+        bind_group_layouts: &[Some(view_layout), Some(glyph_layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("nekoui_color_text_pipeline"),
+        layout: Some(&layout),
+        vertex: VertexState {
+            module: &shader,
+            entry_point: Some("vs_color"),
+            compilation_options: PipelineCompilationOptions::default(),
+            buffers: &[VertexBufferLayout {
+                array_stride: std::mem::size_of::<ColorTextInstance>() as u64,
+                step_mode: VertexStepMode::Instance,
+                attributes: &vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32],
+            }],
+        },
+        fragment: Some(FragmentState {
+            module: &shader,
+            entry_point: Some("fs_color"),
             compilation_options: PipelineCompilationOptions::default(),
             targets: &[Some(ColorTargetState {
                 format: surface_format,

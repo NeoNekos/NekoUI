@@ -31,12 +31,12 @@ fn main() -> Result<(), nekoui::Error> {
                                 top: 0.0,
                                 right: 0.0,
                                 bottom: 0.0,
-                                left: 20.0
+                                left: 20.0,
                             })
                             .background(Color::rgb(0xFFFFFF))
                             .child(
                                 text("这是一个简单示例喵 🍥")
-                                    .font_size(18.0)
+                                    .font_size(24.0)
                                     .line_height(28.0)
                                     .color(Color::rgb(0x111827)),
                             ),

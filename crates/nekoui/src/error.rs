@@ -14,6 +14,8 @@ pub enum RuntimeError {
     EntityNotFound(u64),
     #[error("entity {0} has a different concrete type")]
     TypeMismatch(u64),
+    #[error("queued event payload type did not match its subscription")]
+    EventTypeMismatch,
 }
 
 #[derive(Debug, Error)]

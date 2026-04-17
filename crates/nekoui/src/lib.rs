@@ -9,9 +9,13 @@ pub mod window;
 
 pub type SharedString = std::sync::Arc<str>;
 
-pub use app::{App, Application, Context, Entity, LastWindowBehavior, Render, View, WeakEntity};
+pub use app::{
+    App, Application, BackgroundExecutor, Context, Entity, EventEmitter, LastWindowBehavior,
+    Render, Subscription, Task, TaskResult, UiExecutor, View, WeakEntity,
+};
 pub use element::{Div, Element, ElementKind, IntoElement, ParentElement, Text, div, text};
 pub use error::{Error, PlatformError, RuntimeError};
+pub use scene::DirtyLaneMask;
 pub use style::{
     AlignItems, Color, Direction, EdgeInsets, JustifyContent, LayoutStyle, Length, PaintStyle,
     Size, Style, TextStyle,

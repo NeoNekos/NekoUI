@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
 use slotmap::{SlotMap, new_key_type};
+use smallvec::SmallVec;
 use taffy::prelude::{
     AlignItems as TaffyAlignItems, AvailableSpace, Dimension, Display,
     JustifyContent as TaffyJustifyContent, LengthPercentage, LengthPercentageAuto,
@@ -14,43 +13,38 @@ use crate::style::{AlignItems, Direction, JustifyContent, Length, Style};
 use crate::text_system::{TextLayout, TextMeasureKey, TextSystem, measure_key};
 use crate::window::WindowSize;
 
+use super::{CompiledScene, DirtyLaneMask, LayoutBox, Primitive};
+
 new_key_type! {
     pub struct NodeId;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LayoutBox {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-}
-
-impl Default for LayoutBox {
-    fn default() -> Self {
-        Self {
-            x: 0.0,
-            y: 0.0,
-            width: 0.0,
-            height: 0.0,
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NodeClass {
+    Div,
+    Text,
 }
 
 #[derive(Debug, Clone)]
 pub struct RetainedNode {
+    pub id: NodeId,
     pub parent: Option<NodeId>,
-    pub children: Vec<NodeId>,
+    pub children: SmallVec<[NodeId; 4]>,
     pub kind: NodeKind,
+    pub key: Option<u64>,
     pub style: Style,
     pub layout: LayoutBox,
+    pub dirty: DirtyLaneMask,
     pub taffy_node: TaffyNodeId,
 }
 
 #[derive(Debug, Clone)]
 pub enum NodeKind {
     Div,
-    Text { layout: Option<TextLayout> },
+    Text {
+        content: SharedString,
+        layout: Option<TextLayout>,
+    },
 }
 
 #[derive(Debug)]
@@ -58,25 +52,6 @@ pub struct RetainedTree {
     root: NodeId,
     nodes: SlotMap<NodeId, RetainedNode>,
     taffy: TaffyTree<MeasureContext>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CompiledScene {
-    pub clear_color: Option<crate::style::Color>,
-    pub primitives: Vec<Primitive>,
-}
-
-#[derive(Debug, Clone)]
-pub enum Primitive {
-    Quad {
-        bounds: LayoutBox,
-        color: crate::style::Color,
-    },
-    Text {
-        bounds: LayoutBox,
-        layout: TextLayout,
-        color: crate::style::Color,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -116,8 +91,19 @@ impl RetainedTree {
         tree
     }
 
+    pub fn update_from_element(&mut self, root: &Element) -> DirtyLaneMask {
+        self.clear_dirty_marks();
+
+        if !self.can_reuse_node(self.root, root) {
+            *self = RetainedTree::from_element(root);
+            return DirtyLaneMask::BUILD.normalized();
+        }
+
+        self.diff_node(self.root, root).normalized()
+    }
+
     pub fn compute_layout(&mut self, size: WindowSize, text_system: &mut TextSystem) {
-        let mut measured_layouts = HashMap::<TextMeasureKey, TextLayout>::new();
+        let mut measured_layouts = rustc_hash::FxHashMap::<TextMeasureKey, TextLayout>::default();
         self.taffy
             .compute_layout_with_measure(
                 self.nodes[self.root].taffy_node,
@@ -163,14 +149,14 @@ impl RetainedTree {
             )
             .expect("taffy layout computation must succeed for retained nodes");
 
-        let node_ids = self.nodes.keys().collect::<Vec<_>>();
-        for node_id in node_ids {
-            let taffy_node = self.nodes[node_id].taffy_node;
-            let layout = *self
-                .taffy
-                .layout(taffy_node)
+        let taffy = &self.taffy;
+        for (node_id, node) in &mut self.nodes {
+            debug_assert_eq!(node.id, node_id);
+
+            let layout = *taffy
+                .layout(node.taffy_node)
                 .expect("layout must be available after compute_layout");
-            self.nodes[node_id].layout = LayoutBox {
+            node.layout = LayoutBox {
                 x: layout.location.x,
                 y: layout.location.y,
                 width: layout.size.width,
@@ -180,11 +166,11 @@ impl RetainedTree {
             if let NodeKind::Text {
                 layout: text_layout,
                 ..
-            } = &mut self.nodes[node_id].kind
+            } = &mut node.kind
             {
                 *text_layout =
-                    self.taffy
-                        .get_node_context(taffy_node)
+                    taffy
+                        .get_node_context(node.taffy_node)
                         .and_then(|context| match context {
                             MeasureContext::Text(text_context) => text_context.last_layout.clone(),
                         });
@@ -213,11 +199,211 @@ impl RetainedTree {
     }
 
     pub fn compile_scene(&self) -> CompiledScene {
-        let mut primitives = Vec::new();
+        let mut primitives = Vec::with_capacity(self.nodes.len());
         self.collect_primitives(self.root, 0.0, 0.0, &mut primitives);
         CompiledScene {
             clear_color: None,
             primitives,
+        }
+    }
+
+    fn clear_dirty_marks(&mut self) {
+        for (_, node) in &mut self.nodes {
+            node.dirty = DirtyLaneMask::empty();
+        }
+    }
+
+    fn diff_node(&mut self, node_id: NodeId, element: &Element) -> DirtyLaneMask {
+        match element.kind() {
+            ElementKind::Div(div) => self.diff_div(node_id, div),
+            ElementKind::Text(text) => self.diff_text(node_id, text),
+            ElementKind::View(_) => {
+                unreachable!("view nodes must be resolved before retained diff")
+            }
+        }
+    }
+
+    fn diff_div(&mut self, node_id: NodeId, div: &Div) -> DirtyLaneMask {
+        let mut dirty = diff_div_style(&self.nodes[node_id].style, &div.style);
+        if self.nodes[node_id].style != div.style {
+            self.nodes[node_id].style = div.style.clone();
+            self.taffy
+                .set_style(
+                    self.nodes[node_id].taffy_node,
+                    div_style_to_taffy(&div.style),
+                )
+                .expect("div style patch must succeed");
+        }
+        self.nodes[node_id].key = div.key;
+
+        let child_dirty = self.sync_children(node_id, &div.children);
+        dirty |= child_dirty;
+        self.nodes[node_id].dirty |= dirty;
+        dirty
+    }
+
+    fn diff_text(&mut self, node_id: NodeId, text: &Text) -> DirtyLaneMask {
+        let mut dirty = diff_text_style(&self.nodes[node_id].style, &text.style);
+        let content_changed = match &self.nodes[node_id].kind {
+            NodeKind::Text { content, .. } => content.as_ref() != text.content.as_ref(),
+            NodeKind::Div => unreachable!("text diff called for non-text node"),
+        };
+
+        if content_changed {
+            dirty |= DirtyLaneMask::LAYOUT | DirtyLaneMask::PAINT;
+        }
+
+        if self.nodes[node_id].style != text.style {
+            self.nodes[node_id].style = text.style.clone();
+            self.taffy
+                .set_style(
+                    self.nodes[node_id].taffy_node,
+                    text_style_to_taffy(&text.style),
+                )
+                .expect("text style patch must succeed");
+        }
+
+        if let NodeKind::Text { content, layout } = &mut self.nodes[node_id].kind {
+            *content = text.content.clone();
+            if dirty.needs_layout() || dirty.contains(DirtyLaneMask::PAINT) {
+                *layout = None;
+            }
+        }
+        self.nodes[node_id].key = text.key;
+
+        if !dirty.is_empty() {
+            self.taffy
+                .set_node_context(
+                    self.nodes[node_id].taffy_node,
+                    Some(MeasureContext::Text(TextMeasureContext::new(text))),
+                )
+                .expect("text node context patch must succeed");
+        }
+
+        self.nodes[node_id].dirty |= dirty;
+        dirty
+    }
+
+    fn sync_children(&mut self, parent_id: NodeId, new_children: &[Element]) -> DirtyLaneMask {
+        let old_children = self.nodes[parent_id].children.clone();
+        let keyed_path = self.uses_keyed_path(&old_children, new_children);
+        let mut next_children = SmallVec::<[NodeId; 4]>::with_capacity(new_children.len());
+        let mut dirty = DirtyLaneMask::empty();
+        let mut rebuild_required = false;
+        let mut child_list_changed = old_children.len() != new_children.len();
+        let mut reused = rustc_hash::FxHashSet::<NodeId>::default();
+        let mut keyed_old = rustc_hash::FxHashMap::<(u64, NodeClass), NodeId>::default();
+
+        if keyed_path {
+            for child_id in &old_children {
+                if let Some(key) = self.nodes[*child_id].key {
+                    keyed_old.insert((key, self.node_class(*child_id)), *child_id);
+                }
+            }
+        }
+
+        for (index, element) in new_children.iter().enumerate() {
+            let positional = old_children
+                .get(index)
+                .copied()
+                .filter(|child_id| !reused.contains(child_id));
+            let reused_child = if keyed_path {
+                if let Some(key) = element_key(element) {
+                    keyed_old
+                        .get(&(key, element_class(element)))
+                        .copied()
+                        .filter(|child_id| !reused.contains(child_id))
+                        .filter(|child_id| self.can_reuse_node(*child_id, element))
+                        .or_else(|| {
+                            positional.filter(|child_id| self.can_reuse_node(*child_id, element))
+                        })
+                } else {
+                    positional.filter(|child_id| self.can_reuse_node(*child_id, element))
+                }
+            } else {
+                positional.filter(|child_id| self.can_reuse_node(*child_id, element))
+            };
+
+            let child_id = match reused_child {
+                Some(existing_child) => {
+                    reused.insert(existing_child);
+                    if old_children.get(index).copied() != Some(existing_child) {
+                        child_list_changed = true;
+                        dirty |= DirtyLaneMask::LAYOUT;
+                    }
+                    dirty |= self.diff_node(existing_child, element);
+                    self.nodes[existing_child].parent = Some(parent_id);
+                    existing_child
+                }
+                None => {
+                    child_list_changed = true;
+                    rebuild_required = true;
+                    dirty |= DirtyLaneMask::BUILD;
+                    self.build_node(element, Some(parent_id))
+                }
+            };
+
+            next_children.push(child_id);
+        }
+
+        for old_child in old_children.iter().copied() {
+            if !reused.contains(&old_child) {
+                child_list_changed = true;
+                rebuild_required = true;
+                dirty |= DirtyLaneMask::BUILD;
+                self.remove_subtree(old_child);
+            }
+        }
+
+        if child_list_changed {
+            self.nodes[parent_id].children = next_children.clone();
+            let taffy_children = next_children
+                .iter()
+                .map(|child_id| self.nodes[*child_id].taffy_node)
+                .collect::<SmallVec<[TaffyNodeId; 4]>>();
+            self.taffy
+                .set_children(self.nodes[parent_id].taffy_node, &taffy_children)
+                .expect("children patch must succeed");
+
+            if !rebuild_required {
+                dirty |= DirtyLaneMask::LAYOUT;
+            }
+        }
+
+        dirty
+    }
+
+    fn can_reuse_node(&self, node_id: NodeId, element: &Element) -> bool {
+        let node = &self.nodes[node_id];
+        let new_key = element_key(element);
+        let same_kind = matches!(
+            (&node.kind, element.kind()),
+            (NodeKind::Div, ElementKind::Div(_)) | (NodeKind::Text { .. }, ElementKind::Text(_))
+        );
+        if !same_kind {
+            return false;
+        }
+
+        match (node.key, new_key) {
+            (Some(existing), Some(new)) => existing == new,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn uses_keyed_path(&self, old_children: &[NodeId], new_children: &[Element]) -> bool {
+        old_children
+            .iter()
+            .any(|child_id| self.nodes[*child_id].key.is_some())
+            || new_children
+                .iter()
+                .any(|element| element_key(element).is_some())
+    }
+
+    fn node_class(&self, node_id: NodeId) -> NodeClass {
+        match self.nodes[node_id].kind {
+            NodeKind::Div => NodeClass::Div,
+            NodeKind::Text { .. } => NodeClass::Text,
         }
     }
 
@@ -236,23 +422,26 @@ impl RetainedTree {
             .children
             .iter()
             .map(|child| self.build_node(child, None))
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[NodeId; 4]>>();
         let child_taffy_nodes = child_ids
             .iter()
             .map(|child_id| self.nodes[*child_id].taffy_node)
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[TaffyNodeId; 4]>>();
 
         let taffy_node = self
             .taffy
             .new_with_children(div_style_to_taffy(&div.style), &child_taffy_nodes)
             .expect("div node creation must succeed");
 
-        let node_id = self.nodes.insert_with_key(|_id| RetainedNode {
+        let node_id = self.nodes.insert_with_key(|id| RetainedNode {
+            id,
             parent,
             children: child_ids.clone(),
             kind: NodeKind::Div,
+            key: div.key,
             style: div.style.clone(),
             layout: LayoutBox::default(),
+            dirty: DirtyLaneMask::BUILD.normalized(),
             taffy_node,
         });
 
@@ -272,14 +461,33 @@ impl RetainedTree {
             )
             .expect("text node creation must succeed");
 
-        self.nodes.insert_with_key(|_id| RetainedNode {
+        self.nodes.insert_with_key(|id| RetainedNode {
+            id,
             parent,
-            children: Vec::new(),
-            kind: NodeKind::Text { layout: None },
+            children: SmallVec::new(),
+            kind: NodeKind::Text {
+                content: text.content.clone(),
+                layout: None,
+            },
+            key: text.key,
             style: text.style.clone(),
             layout: LayoutBox::default(),
+            dirty: DirtyLaneMask::BUILD.normalized(),
             taffy_node,
         })
+    }
+
+    fn remove_subtree(&mut self, node_id: NodeId) {
+        let children = self.nodes[node_id].children.clone();
+        for child_id in children {
+            self.remove_subtree(child_id);
+        }
+
+        let taffy_node = self.nodes[node_id].taffy_node;
+        self.taffy
+            .remove(taffy_node)
+            .expect("retained subtree removal must succeed");
+        self.nodes.remove(node_id);
     }
 
     fn collect_primitives(
@@ -290,6 +498,7 @@ impl RetainedTree {
         primitives: &mut Vec<Primitive>,
     ) {
         let node = &self.nodes[node_id];
+        debug_assert_eq!(node.id, node_id);
         let bounds = LayoutBox {
             x: offset_x + node.layout.x,
             y: offset_y + node.layout.y,
@@ -306,7 +515,7 @@ impl RetainedTree {
                     });
                 }
             }
-            NodeKind::Text { layout } => {
+            NodeKind::Text { layout, .. } => {
                 if let Some(layout) = layout.clone() {
                     primitives.push(Primitive::Text {
                         bounds,
@@ -327,6 +536,50 @@ fn definite_space(space: AvailableSpace) -> Option<f32> {
     match space {
         AvailableSpace::Definite(value) => Some(value),
         AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
+    }
+}
+
+fn diff_div_style(old: &Style, new: &Style) -> DirtyLaneMask {
+    let mut dirty = DirtyLaneMask::empty();
+    if old.layout != new.layout {
+        dirty |= DirtyLaneMask::LAYOUT;
+    }
+    if old.paint != new.paint {
+        dirty |= DirtyLaneMask::PAINT;
+    }
+    dirty
+}
+
+fn diff_text_style(old: &Style, new: &Style) -> DirtyLaneMask {
+    let mut dirty = DirtyLaneMask::empty();
+    if old.layout != new.layout {
+        dirty |= DirtyLaneMask::LAYOUT;
+    }
+    if old.paint != new.paint || old.text.color != new.text.color {
+        dirty |= DirtyLaneMask::PAINT;
+    }
+    if old.text.font_family != new.text.font_family
+        || old.text.font_size != new.text.font_size
+        || old.text.line_height != new.text.line_height
+    {
+        dirty |= DirtyLaneMask::LAYOUT | DirtyLaneMask::PAINT;
+    }
+    dirty
+}
+
+fn element_key(element: &Element) -> Option<u64> {
+    match element.kind() {
+        ElementKind::Div(div) => div.key,
+        ElementKind::Text(text) => text.key,
+        ElementKind::View(_) => None,
+    }
+}
+
+fn element_class(element: &Element) -> NodeClass {
+    match element.kind() {
+        ElementKind::Div(_) => NodeClass::Div,
+        ElementKind::Text(_) => NodeClass::Text,
+        ElementKind::View(_) => unreachable!("view nodes must be resolved before retained diff"),
     }
 }
 
@@ -414,11 +667,11 @@ fn edge_to_auto(value: f32) -> LengthPercentageAuto {
 mod tests {
     use crate::app::{App, Render};
     use crate::element::{IntoElement, ParentElement};
-    use crate::style::{EdgeInsets, Length};
+    use crate::style::{Color, EdgeInsets, Length};
     use crate::text_system::TextSystem;
     use crate::window::{Window, WindowId, WindowSize};
 
-    use super::{NodeKind, RetainedTree};
+    use super::{DirtyLaneMask, NodeKind, RetainedTree};
 
     #[test]
     fn text_measurement_wraps_within_available_width() {
@@ -441,12 +694,61 @@ mod tests {
         assert!(text_node.layout.height > 20.0);
 
         match &text_node.kind {
-            NodeKind::Text { layout } => {
+            NodeKind::Text { layout, .. } => {
                 let layout = layout.as_ref().expect("text layout exists");
                 assert!(layout.runs.len() >= 2);
             }
             NodeKind::Div => panic!("expected text node"),
         }
+    }
+
+    #[test]
+    fn diff_marks_paint_without_rebuilding_tree_for_text_color_change() {
+        let root = crate::div().child(crate::text("hello").color(Color::rgb(0x111111)));
+        let updated = crate::div().child(crate::text("hello").color(Color::rgb(0x222222)));
+
+        let mut tree = RetainedTree::from_element(&root.into_element());
+        let dirty = tree.update_from_element(&updated.into_element());
+        assert_eq!(dirty, DirtyLaneMask::PAINT);
+    }
+
+    #[test]
+    fn diff_marks_layout_for_div_size_change() {
+        let root = crate::div().width(Length::Px(100.0));
+        let updated = crate::div().width(Length::Px(140.0));
+
+        let mut tree = RetainedTree::from_element(&root.into_element());
+        let dirty = tree.update_from_element(&updated.into_element());
+        assert_eq!(dirty, DirtyLaneMask::LAYOUT);
+    }
+
+    #[test]
+    fn diff_marks_build_for_child_structure_change() {
+        let root = crate::div().child(crate::text("a"));
+        let updated = crate::div().child(crate::text("a")).child(crate::text("b"));
+
+        let mut tree = RetainedTree::from_element(&root.into_element());
+        let dirty = tree.update_from_element(&updated.into_element());
+        assert_eq!(dirty, DirtyLaneMask::BUILD.normalized());
+    }
+
+    #[test]
+    fn keyed_reorder_reuses_existing_nodes_without_build() {
+        let root = crate::div()
+            .child(crate::text("a").key(1))
+            .child(crate::text("b").key(2));
+        let updated = crate::div()
+            .child(crate::text("b").key(2))
+            .child(crate::text("a").key(1));
+
+        let mut tree = RetainedTree::from_element(&root.into_element());
+        let first = tree.children(tree.root_id())[0];
+        let second = tree.children(tree.root_id())[1];
+
+        let dirty = tree.update_from_element(&updated.into_element());
+        assert!(!dirty.contains(DirtyLaneMask::BUILD));
+        assert!(dirty.contains(DirtyLaneMask::LAYOUT));
+        assert_eq!(tree.children(tree.root_id()), &[second, first]);
     }
 
     #[test]
@@ -474,7 +776,9 @@ mod tests {
         );
         let root = crate::div().child(view).into_element();
 
-        let resolved = app.resolve_root_element(&mut window, &root).unwrap();
+        let (resolved, _) = app
+            .resolve_root_element_with_views(&mut window, &root)
+            .unwrap();
         let mut tree = RetainedTree::from_element(&resolved);
         let mut text_system = TextSystem::new();
         tree.compute_layout(window.size(), &mut text_system);
