@@ -19,6 +19,9 @@ pub(crate) struct RuntimeWindow {
     pub(crate) retained_tree: RetainedTree,
     pub(crate) compiled_scene: crate::scene::CompiledScene,
     pub(crate) render_state: WindowRenderState,
+    pub(crate) presentation_pending: bool,
+    pub(crate) metrics_scene_sync_pending: bool,
+    pub(crate) occluded: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +58,26 @@ pub(crate) fn window_depends_on_dirty_views(
         .any(|view_id| runtime_window.referenced_views.contains(view_id))
 }
 
+pub(crate) fn window_metrics_changed(
+    runtime_window: &RuntimeWindow,
+    metrics: WindowMetrics,
+) -> bool {
+    runtime_window.public_window.size() != metrics.logical_size
+        || runtime_window.public_window.physical_size() != metrics.physical_size
+        || (runtime_window.public_window.scale_factor() - metrics.scale_factor).abs() > f64::EPSILON
+}
+
+pub(crate) fn window_can_present(runtime_window: &RuntimeWindow) -> bool {
+    !runtime_window.occluded
+        && !window_is_zero_sized(runtime_window)
+        && !runtime_window.native_window.is_minimized().unwrap_or(false)
+}
+
+pub(crate) fn window_is_zero_sized(runtime_window: &RuntimeWindow) -> bool {
+    let size = runtime_window.public_window.physical_size();
+    size.width == 0 || size.height == 0
+}
+
 fn metrics_from_parts(physical_size: PhysicalSize<u32>, scale_factor: f64) -> WindowMetrics {
     let scale_factor = sanitize_scale_factor(scale_factor);
     let logical_width = (f64::from(physical_size.width) / scale_factor)
@@ -76,5 +99,27 @@ fn sanitize_scale_factor(scale_factor: f64) -> f64 {
         scale_factor
     } else {
         1.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::window::WindowSize;
+
+    use super::WindowMetrics;
+
+    #[test]
+    fn metrics_difference_detects_zero_and_scale_changes() {
+        let old = WindowMetrics {
+            logical_size: WindowSize::new(800, 600),
+            physical_size: WindowSize::new(1600, 1200),
+            scale_factor: 2.0,
+        };
+        let new = WindowMetrics {
+            logical_size: WindowSize::new(800, 600),
+            physical_size: WindowSize::new(0, 0),
+            scale_factor: 2.0,
+        };
+        assert_ne!(old.physical_size, new.physical_size);
     }
 }

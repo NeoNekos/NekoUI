@@ -221,8 +221,9 @@ impl RetainedTree {
 
     pub fn compile_scene(&mut self) -> CompiledScene {
         let root_fragment = self.get_or_build_subtree_fragment(self.root, false);
+        let clear_color = self.nodes[self.root].style.paint.background;
         CompiledScene {
-            clear_color: None,
+            clear_color,
             scene_nodes: root_fragment.scene_nodes.clone(),
             primitives: root_fragment.primitives.clone(),
             logical_batches: root_fragment.logical_batches.clone(),
@@ -1001,6 +1002,8 @@ fn append_subtree_fragment(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::app::{App, Render};
     use crate::element::{BuildCx, IntoElement, ParentElement, SpecArena};
     use crate::style::{Color, EdgeInsets, Length};
@@ -1259,6 +1262,56 @@ mod tests {
     }
 
     #[test]
+    fn paint_only_update_reuses_root_scene_structure_cache() {
+        let root = crate::div()
+            .background(Color::rgb(0x111111))
+            .child(crate::text("hello").color(Color::rgb(0x222222)))
+            .into_any_element();
+        let updated = crate::div()
+            .background(Color::rgb(0x333333))
+            .child(crate::text("hello").color(Color::rgb(0x444444)))
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+        let original = tree.compile_scene();
+
+        let mut window = Window::new_with_metrics(
+            WindowId::new(),
+            String::from("test"),
+            WindowSize::new(320, 200),
+            WindowSize::new(320, 200),
+            1.0,
+        );
+        let mut resolver = |_view_id: u64,
+                            _window: &mut Window|
+         -> Result<crate::AnyElement, crate::RuntimeError> {
+            unreachable!("static test tree should not resolve nested views")
+        };
+        let mut arena = SpecArena::new();
+        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+            .build_root(updated)
+            .unwrap();
+        let dirty = tree.update_from_spec(&arena, built.root);
+        assert_eq!(dirty, DirtyLaneMask::PAINT);
+
+        let updated_scene = tree.compile_scene();
+        assert!(Arc::ptr_eq(
+            &original.scene_nodes,
+            &updated_scene.scene_nodes
+        ));
+        assert!(Arc::ptr_eq(
+            &original.logical_batches,
+            &updated_scene.logical_batches
+        ));
+        assert!(!Arc::ptr_eq(
+            &original.primitives,
+            &updated_scene.primitives
+        ));
+    }
+
+    #[test]
     fn logical_batches_reflect_clip_and_opacity_classes() {
         let root = crate::div()
             .clip()
@@ -1284,6 +1337,55 @@ mod tests {
                 .iter()
                 .any(|batch| batch.effect_class == EffectClass::Opacity)
         );
+    }
+
+    #[test]
+    fn paint_only_update_reuses_clean_sibling_fragment_cache() {
+        let root = crate::div()
+            .child(crate::div().background(Color::rgb(0x111111)).key(1))
+            .child(crate::div().background(Color::rgb(0x222222)).key(2))
+            .into_any_element();
+        let updated = crate::div()
+            .child(crate::div().background(Color::rgb(0x333333)).key(1))
+            .child(crate::div().background(Color::rgb(0x222222)).key(2))
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+        let _ = tree.compile_scene();
+
+        let sibling = tree.children(tree.root_id())[1];
+        let original_fragment = tree.nodes[sibling]
+            .compiled_fragment
+            .clone()
+            .expect("clean sibling fragment cached after compile");
+
+        let mut window = Window::new_with_metrics(
+            WindowId::new(),
+            String::from("test"),
+            WindowSize::new(320, 200),
+            WindowSize::new(320, 200),
+            1.0,
+        );
+        let mut resolver = |_view_id: u64,
+                            _window: &mut Window|
+         -> Result<crate::AnyElement, crate::RuntimeError> {
+            unreachable!("static test tree should not resolve nested views")
+        };
+        let mut arena = SpecArena::new();
+        let built = BuildCx::new(&mut window, &mut resolver, &mut arena)
+            .build_root(updated)
+            .unwrap();
+        let dirty = tree.update_from_spec(&arena, built.root);
+        assert_eq!(dirty, DirtyLaneMask::PAINT);
+
+        let _ = tree.compile_scene();
+        let reused_fragment = tree.nodes[sibling]
+            .compiled_fragment
+            .clone()
+            .expect("clean sibling fragment remains cached");
+        assert!(Arc::ptr_eq(&original_fragment, &reused_fragment));
     }
 
     #[test]
