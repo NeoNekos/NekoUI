@@ -19,7 +19,8 @@ pub use element::{
 pub use error::{Error, PlatformError, RuntimeError};
 pub use scene::DirtyLaneMask;
 pub use style::{
-    AlignItems, Color, Direction, EdgeInsets, JustifyContent, LayoutStyle, Length, PaintStyle,
-    Size, Style, TextStyle,
+    AlignItems, BackgroundFill, Color, CornerRadii, Direction, EdgeInsets, EdgeWidths,
+    JustifyContent, LayoutStyle, Length, LinearGradient, PaintStyle, Size, Style, TextStyle,
+    gradient,
 };
 pub use window::{Window, WindowHandle, WindowId, WindowOptions, WindowSize};

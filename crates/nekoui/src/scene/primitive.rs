@@ -1,7 +1,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::style::Color;
+use crate::style::{Color, CornerRadii, EdgeWidths, LinearGradient};
 use crate::text_system::TextLayout;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -81,7 +81,7 @@ pub struct SceneNode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MaterialClass {
-    Quad,
+    Rect,
     Text,
 }
 
@@ -136,12 +136,25 @@ pub struct CompiledScene {
     pub effect_regions: Arc<[EffectRegion]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RectFill {
+    Solid(Color),
+    LinearGradient(LinearGradient),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RectPrimitive {
+    pub bounds: LayoutBox,
+    pub fill: RectFill,
+    pub corner_radii: CornerRadii,
+    pub border_widths: EdgeWidths,
+    pub border_color: Option<Color>,
+    pub opacity: f32,
+}
+
 #[derive(Debug, Clone)]
 pub enum Primitive {
-    Quad {
-        bounds: LayoutBox,
-        color: Color,
-    },
+    Rect(RectPrimitive),
     Text {
         bounds: LayoutBox,
         layout: TextLayout,
@@ -152,7 +165,7 @@ pub enum Primitive {
 impl Primitive {
     pub fn material_class(&self) -> MaterialClass {
         match self {
-            Primitive::Quad { .. } => MaterialClass::Quad,
+            Primitive::Rect(_) => MaterialClass::Rect,
             Primitive::Text { .. } => MaterialClass::Text,
         }
     }

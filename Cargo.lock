@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "nekoui"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "accesskit",
  "accesskit_winit",

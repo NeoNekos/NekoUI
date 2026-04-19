@@ -25,6 +25,33 @@ impl Default for Color {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LinearGradient {
+    pub start_color: Color,
+    pub end_color: Color,
+    pub angle_radians: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BackgroundFill {
+    Solid(Color),
+    LinearGradient(LinearGradient),
+}
+
+impl From<Color> for BackgroundFill {
+    fn from(value: Color) -> Self {
+        Self::Solid(value)
+    }
+}
+
+pub fn gradient(start_color: Color, end_color: Color, angle_radians: f32) -> BackgroundFill {
+    BackgroundFill::LinearGradient(LinearGradient {
+        start_color,
+        end_color,
+        angle_radians,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Length {
     #[default]
@@ -73,6 +100,44 @@ impl EdgeInsets {
 impl Default for EdgeInsets {
     fn default() -> Self {
         Self::all(0.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CornerRadii {
+    pub top_left: f32,
+    pub top_right: f32,
+    pub bottom_right: f32,
+    pub bottom_left: f32,
+}
+
+impl CornerRadii {
+    pub const fn all(radius: f32) -> Self {
+        Self {
+            top_left: radius,
+            top_right: radius,
+            bottom_right: radius,
+            bottom_left: radius,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EdgeWidths {
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub left: f32,
+}
+
+impl EdgeWidths {
+    pub const fn all(width: f32) -> Self {
+        Self {
+            top: width,
+            right: width,
+            bottom: width,
+            left: width,
+        }
     }
 }
 
@@ -128,7 +193,10 @@ impl Default for LayoutStyle {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaintStyle {
-    pub background: Option<Color>,
+    pub background: Option<BackgroundFill>,
+    pub corner_radii: CornerRadii,
+    pub border_widths: EdgeWidths,
+    pub border_color: Option<Color>,
     pub opacity: f32,
     pub clip_children: bool,
 }
@@ -137,6 +205,9 @@ impl Default for PaintStyle {
     fn default() -> Self {
         Self {
             background: None,
+            corner_radii: CornerRadii::default(),
+            border_widths: EdgeWidths::default(),
+            border_color: None,
             opacity: 1.0,
             clip_children: false,
         }

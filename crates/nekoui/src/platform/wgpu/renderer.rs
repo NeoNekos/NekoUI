@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use cosmic_text::{CacheKey, Color as CosmicColor, SwashCache};
-use wgpu::util::DeviceExt;
+use wgpu::util::{DeviceExt, StagingBelt};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingType, BlendState, Buffer, BufferBindingType, ColorTargetState,
-    ColorWrites, Device, FragmentState, LoadOp, MultisampleState, Operations,
+    BindGroupLayoutEntry, BindingType, BlendState, Buffer, BufferBindingType, BufferSize,
+    ColorTargetState, ColorWrites, Device, FragmentState, LoadOp, MultisampleState, Operations,
     PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState,
     RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
     ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, SurfaceConfiguration,
@@ -19,6 +19,7 @@ use winit::window::Window as WinitWindow;
 use crate::error::PlatformError;
 use crate::platform::wgpu::atlas::{AtlasEntry, GlyphAtlas, GlyphAtlasKind};
 use crate::platform::wgpu::context::WgpuContext;
+use crate::platform::wgpu::shader::{RECT_SHADER, TEXT_SHADER};
 use crate::scene::{
     ClipClass, CompiledScene, EffectClass, LogicalBatch, MaterialClass, Primitive, SceneNodeId,
 };
@@ -27,9 +28,8 @@ use crate::text_system::TextSystem;
 use crate::window::WindowSize;
 
 const ATLAS_SIZE: u32 = 2048;
-
-const QUAD_SHADER: &str = include_str!("shader/quad.wgsl");
-const TEXT_SHADER: &str = include_str!("shader/text.wgsl");
+const STAGING_BELT_CHUNK_SIZE: u64 = 64 * 1024;
+const SHRINK_IDLE_FRAME_THRESHOLD: u32 = 90;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -40,9 +40,14 @@ struct ViewUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct QuadInstance {
+struct RectInstance {
     rect: [f32; 4],
-    color: [f32; 4],
+    fill_start_color: [f32; 4],
+    fill_end_color: [f32; 4],
+    fill_meta: [f32; 4],
+    corner_radii: [f32; 4],
+    border_widths: [f32; 4],
+    border_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -63,7 +68,7 @@ struct ColorTextInstance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PipelineKey {
-    Quad,
+    Rect,
     MonoText,
     ColorText,
 }
@@ -238,26 +243,31 @@ pub struct WindowRenderState {
 
 pub struct RenderSystem {
     context: WgpuContext,
+    staging_belt: StagingBelt,
     view_buffer: Buffer,
     view_bind_group_layout: BindGroupLayout,
     view_bind_group: BindGroup,
-    quad_pipeline: RenderPipeline,
+    rect_pipeline: RenderPipeline,
     mono_text_pipeline: RenderPipeline,
     color_text_pipeline: RenderPipeline,
     text_texture_bind_group_layout: BindGroupLayout,
     mono_atlas: GlyphAtlas,
     color_atlas: GlyphAtlas,
     swash_cache: SwashCache,
-    quad_instances: Vec<QuadInstance>,
+    rect_instances: Vec<RectInstance>,
     mono_text_instances: Vec<TextInstance>,
     color_text_instances: Vec<ColorTextInstance>,
     gpu_batches: Vec<GpuBatch>,
-    quad_instance_buffer: Buffer,
+    rect_instance_buffer: Buffer,
     mono_text_instance_buffer: Buffer,
     color_text_instance_buffer: Buffer,
-    quad_instance_capacity: usize,
+    rect_instance_capacity: usize,
     mono_text_instance_capacity: usize,
     color_text_instance_capacity: usize,
+    rect_low_usage_frames: u32,
+    mono_text_low_usage_frames: u32,
+    color_text_low_usage_frames: u32,
+    current_surface_format: TextureFormat,
 }
 
 impl RenderSystem {
@@ -318,7 +328,7 @@ impl RenderSystem {
             GlyphAtlasKind::Color,
             ATLAS_SIZE.min(context.max_texture_size),
         )?;
-        let quad_pipeline = create_quad_pipeline(
+        let rect_pipeline = create_rect_pipeline(
             &context.device,
             &view_bind_group_layout,
             TextureFormat::Bgra8UnormSrgb,
@@ -336,13 +346,13 @@ impl RenderSystem {
             TextureFormat::Bgra8UnormSrgb,
         );
 
-        let quad_instance_capacity = 64;
+        let rect_instance_capacity = 64;
         let mono_text_instance_capacity = 256;
         let color_text_instance_capacity = 64;
-        let quad_instance_buffer = create_instance_buffer::<QuadInstance>(
+        let rect_instance_buffer = create_instance_buffer::<RectInstance>(
             &context.device,
-            "nekoui_quad_instances",
-            quad_instance_capacity,
+            "nekoui_rect_instances",
+            rect_instance_capacity,
         );
         let mono_text_instance_buffer = create_instance_buffer::<TextInstance>(
             &context.device,
@@ -354,32 +364,37 @@ impl RenderSystem {
             "nekoui_color_text_instances",
             color_text_instance_capacity,
         );
+        let staging_device = context.device.clone();
 
         let mut render_system = Self {
             context,
+            staging_belt: StagingBelt::new(staging_device, STAGING_BELT_CHUNK_SIZE),
             view_buffer,
             view_bind_group_layout,
             view_bind_group,
-            quad_pipeline,
+            rect_pipeline,
             mono_text_pipeline,
             color_text_pipeline,
             text_texture_bind_group_layout,
             mono_atlas,
             color_atlas,
             swash_cache: SwashCache::new(),
-            quad_instances: Vec::new(),
+            rect_instances: Vec::new(),
             mono_text_instances: Vec::new(),
             color_text_instances: Vec::new(),
             gpu_batches: Vec::new(),
-            quad_instance_buffer,
+            rect_instance_buffer,
             mono_text_instance_buffer,
             color_text_instance_buffer,
-            quad_instance_capacity,
+            rect_instance_capacity,
             mono_text_instance_capacity,
             color_text_instance_capacity,
+            rect_low_usage_frames: 0,
+            mono_text_low_usage_frames: 0,
+            color_text_low_usage_frames: 0,
+            current_surface_format: TextureFormat::Bgra8UnormSrgb,
         };
         let render_state = render_system.create_window_state(surface, physical_size)?;
-        render_system.rebuild_pipelines(render_state.config.format);
         Ok((render_system, render_state))
     }
 
@@ -405,7 +420,7 @@ impl RenderSystem {
             )
             .ok_or_else(|| PlatformError::new("surface has no default configuration"))?;
         surface.configure(&self.context.device, &config);
-        self.rebuild_pipelines(config.format);
+        self.ensure_pipelines_for_format(config.format);
         Ok(WindowRenderState {
             surface,
             config,
@@ -437,7 +452,7 @@ impl RenderSystem {
         state.config.height = physical_size.height;
         state.suspended = false;
         state.surface.configure(&self.context.device, &state.config);
-        self.rebuild_pipelines(state.config.format);
+        self.ensure_pipelines_for_format(state.config.format);
         Ok(())
     }
 
@@ -471,47 +486,19 @@ impl RenderSystem {
             self.resize(state, state.current_size)?;
         }
 
-        self.context.queue.write_buffer(
-            &self.view_buffer,
-            0,
-            bytemuck::bytes_of(&ViewUniform {
-                viewport: [state.config.width as f32, state.config.height as f32],
-                _pad: [0.0; 2],
-            }),
-        );
-
-        self.quad_instances.clear();
+        self.rect_instances.clear();
         self.mono_text_instances.clear();
         self.color_text_instances.clear();
         self.gpu_batches.clear();
         self.mono_atlas.begin_frame();
         self.color_atlas.begin_frame();
         self.collect_instances(scene, text_system, scale_factor as f32);
-        self.ensure_quad_capacity(self.quad_instances.len());
+        self.ensure_rect_capacity(self.rect_instances.len());
         self.ensure_mono_text_capacity(self.mono_text_instances.len());
         self.ensure_color_text_capacity(self.color_text_instances.len());
-
-        if !self.quad_instances.is_empty() {
-            self.context.queue.write_buffer(
-                &self.quad_instance_buffer,
-                0,
-                bytemuck::cast_slice(&self.quad_instances),
-            );
-        }
-        if !self.mono_text_instances.is_empty() {
-            self.context.queue.write_buffer(
-                &self.mono_text_instance_buffer,
-                0,
-                bytemuck::cast_slice(&self.mono_text_instances),
-            );
-        }
-        if !self.color_text_instances.is_empty() {
-            self.context.queue.write_buffer(
-                &self.color_text_instance_buffer,
-                0,
-                bytemuck::cast_slice(&self.color_text_instances),
-            );
-        }
+        self.maybe_shrink_rect_capacity(self.rect_instances.len());
+        self.maybe_shrink_mono_text_capacity(self.mono_text_instances.len());
+        self.maybe_shrink_color_text_capacity(self.color_text_instances.len());
 
         let frame = match state.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -543,6 +530,35 @@ impl RenderSystem {
                     label: Some("nekoui_encoder"),
                 });
 
+        stage_write_bytes(
+            &mut self.staging_belt,
+            &mut encoder,
+            &self.view_buffer,
+            bytemuck::bytes_of(&ViewUniform {
+                viewport: [state.config.width as f32, state.config.height as f32],
+                _pad: [0.0; 2],
+            }),
+        );
+        stage_write_pod_slice(
+            &mut self.staging_belt,
+            &mut encoder,
+            &self.rect_instance_buffer,
+            &self.rect_instances,
+        );
+        stage_write_pod_slice(
+            &mut self.staging_belt,
+            &mut encoder,
+            &self.mono_text_instance_buffer,
+            &self.mono_text_instances,
+        );
+        stage_write_pod_slice(
+            &mut self.staging_belt,
+            &mut encoder,
+            &self.color_text_instance_buffer,
+            &self.color_text_instances,
+        );
+        self.staging_belt.finish();
+
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("nekoui_render_pass"),
@@ -571,10 +587,10 @@ impl RenderSystem {
                         != Some(submit_state.pipeline_key)
                     {
                         match submit_state.pipeline_key {
-                            PipelineKey::Quad => {
-                                pass.set_pipeline(&self.quad_pipeline);
+                            PipelineKey::Rect => {
+                                pass.set_pipeline(&self.rect_pipeline);
                                 pass.set_bind_group(0, &self.view_bind_group, &[]);
-                                pass.set_vertex_buffer(0, self.quad_instance_buffer.slice(..));
+                                pass.set_vertex_buffer(0, self.rect_instance_buffer.slice(..));
                             }
                             PipelineKey::MonoText => {
                                 pass.set_pipeline(&self.mono_text_pipeline);
@@ -649,6 +665,7 @@ impl RenderSystem {
 
         window.pre_present_notify();
         self.context.queue.submit(Some(encoder.finish()));
+        self.staging_belt.recall();
         frame.present();
         Ok(RenderOutcome::Presented)
     }
@@ -720,8 +737,11 @@ impl RenderSystem {
         )
     }
 
-    fn rebuild_pipelines(&mut self, surface_format: TextureFormat) {
-        self.quad_pipeline = create_quad_pipeline(
+    fn ensure_pipelines_for_format(&mut self, surface_format: TextureFormat) {
+        if self.current_surface_format == surface_format {
+            return;
+        }
+        self.rect_pipeline = create_rect_pipeline(
             &self.context.device,
             &self.view_bind_group_layout,
             surface_format,
@@ -738,19 +758,32 @@ impl RenderSystem {
             &self.text_texture_bind_group_layout,
             surface_format,
         );
+        self.current_surface_format = surface_format;
     }
 
-    fn ensure_quad_capacity(&mut self, count: usize) {
-        if count <= self.quad_instance_capacity {
+    fn ensure_rect_capacity(&mut self, count: usize) {
+        if count <= self.rect_instance_capacity {
             return;
         }
-        while self.quad_instance_capacity < count {
-            self.quad_instance_capacity *= 2;
+        while self.rect_instance_capacity < count {
+            self.rect_instance_capacity *= 2;
         }
-        self.quad_instance_buffer = create_instance_buffer::<QuadInstance>(
+        self.rect_instance_buffer = create_instance_buffer::<RectInstance>(
             &self.context.device,
-            "nekoui_quad_instances",
-            self.quad_instance_capacity,
+            "nekoui_rect_instances",
+            self.rect_instance_capacity,
+        );
+    }
+
+    fn maybe_shrink_rect_capacity(&mut self, count: usize) {
+        maybe_shrink_instance_buffer::<RectInstance>(
+            &self.context.device,
+            count,
+            64,
+            &mut self.rect_instance_capacity,
+            &mut self.rect_low_usage_frames,
+            &mut self.rect_instance_buffer,
+            "nekoui_rect_instances",
         );
     }
 
@@ -768,6 +801,18 @@ impl RenderSystem {
         );
     }
 
+    fn maybe_shrink_mono_text_capacity(&mut self, count: usize) {
+        maybe_shrink_instance_buffer::<TextInstance>(
+            &self.context.device,
+            count,
+            256,
+            &mut self.mono_text_instance_capacity,
+            &mut self.mono_text_low_usage_frames,
+            &mut self.mono_text_instance_buffer,
+            "nekoui_mono_text_instances",
+        );
+    }
+
     fn ensure_color_text_capacity(&mut self, count: usize) {
         if count <= self.color_text_instance_capacity {
             return;
@@ -779,6 +824,18 @@ impl RenderSystem {
             &self.context.device,
             "nekoui_color_text_instances",
             self.color_text_instance_capacity,
+        );
+    }
+
+    fn maybe_shrink_color_text_capacity(&mut self, count: usize) {
+        maybe_shrink_instance_buffer::<ColorTextInstance>(
+            &self.context.device,
+            count,
+            64,
+            &mut self.color_text_instance_capacity,
+            &mut self.color_text_low_usage_frames,
+            &mut self.color_text_instance_buffer,
+            "nekoui_color_text_instances",
         );
     }
 
@@ -855,7 +912,7 @@ impl RenderSystem {
 
     fn instance_count_for(&self, pipeline_key: PipelineKey) -> u32 {
         match pipeline_key {
-            PipelineKey::Quad => self.quad_instances.len() as u32,
+            PipelineKey::Rect => self.rect_instances.len() as u32,
             PipelineKey::MonoText => self.mono_text_instances.len() as u32,
             PipelineKey::ColorText => self.color_text_instances.len() as u32,
         }
@@ -891,34 +948,79 @@ impl RenderSystem {
         for primitive_index in node.primitive_range.as_range() {
             let batch = batch_cursor.batch_for_primitive(primitive_index as u32);
             match &scene.primitives[primitive_index] {
-                Primitive::Quad { bounds, color } => {
-                    debug_assert_eq!(batch.material_class, MaterialClass::Quad);
-                    let start = self.quad_instances.len() as u32;
-                    let rect = crate::scene::LayoutBox {
-                        x: bounds.x + current_state.offset[0],
-                        y: bounds.y + current_state.offset[1],
-                        width: bounds.width,
-                        height: bounds.height,
+                Primitive::Rect(rect_primitive) => {
+                    debug_assert_eq!(batch.material_class, MaterialClass::Rect);
+                    let start = self.rect_instances.len() as u32;
+                    let (fill_start_color, fill_end_color, fill_meta) = match rect_primitive.fill {
+                        crate::scene::RectFill::Solid(color) => {
+                            (color, color, [0.0, 0.0, 0.0, 0.0])
+                        }
+                        crate::scene::RectFill::LinearGradient(gradient) => (
+                            gradient.start_color,
+                            gradient.end_color,
+                            [1.0, gradient.angle_radians, 0.0, 0.0],
+                        ),
                     };
-                    let Some(clipped_rect) = clip_rect(rect, current_state.clip) else {
+                    let rect_bounds = crate::scene::LayoutBox {
+                        x: rect_primitive.bounds.x + current_state.offset[0],
+                        y: rect_primitive.bounds.y + current_state.offset[1],
+                        width: rect_primitive.bounds.width,
+                        height: rect_primitive.bounds.height,
+                    };
+                    let Some(clipped_rect) = clip_rect(rect_bounds, current_state.clip) else {
                         continue;
                     };
-                    self.quad_instances.push(QuadInstance {
+                    self.rect_instances.push(RectInstance {
                         rect: [
                             clipped_rect.x * scale_factor,
                             clipped_rect.y * scale_factor,
                             clipped_rect.width * scale_factor,
                             clipped_rect.height * scale_factor,
                         ],
-                        color: [color.r, color.g, color.b, color.a * current_state.opacity],
+                        fill_start_color: [
+                            fill_start_color.r,
+                            fill_start_color.g,
+                            fill_start_color.b,
+                            fill_start_color.a * current_state.opacity,
+                        ],
+                        fill_end_color: [
+                            fill_end_color.r,
+                            fill_end_color.g,
+                            fill_end_color.b,
+                            fill_end_color.a * current_state.opacity,
+                        ],
+                        fill_meta,
+                        corner_radii: [
+                            rect_primitive.corner_radii.top_left * scale_factor,
+                            rect_primitive.corner_radii.top_right * scale_factor,
+                            rect_primitive.corner_radii.bottom_right * scale_factor,
+                            rect_primitive.corner_radii.bottom_left * scale_factor,
+                        ],
+                        border_widths: [
+                            rect_primitive.border_widths.top * scale_factor,
+                            rect_primitive.border_widths.right * scale_factor,
+                            rect_primitive.border_widths.bottom * scale_factor,
+                            rect_primitive.border_widths.left * scale_factor,
+                        ],
+                        border_color: rect_primitive
+                            .border_color
+                            .map(|border_color| {
+                                [
+                                    border_color.r,
+                                    border_color.g,
+                                    border_color.b,
+                                    border_color.a * current_state.opacity,
+                                ]
+                            })
+                            .unwrap_or([0.0; 4]),
                     });
                     self.push_gpu_batch(
-                        PipelineKey::Quad,
+                        PipelineKey::Rect,
                         TextureBindingKey::None,
                         batch.clip_class,
                         current_state.clip,
                         batch.effect_class,
-                        start..self.quad_instances.len() as u32,
+                        start..self.rect_instances.len() as u32,
                     );
                 }
                 Primitive::Text {
@@ -1127,6 +1229,43 @@ fn draw_gpu_batch_inline_opacity(pass: &mut wgpu::RenderPass<'_>, instance_range
     pass.draw(0..6, instance_range);
 }
 
+fn stage_write_pod_slice<T: Pod>(
+    staging_belt: &mut StagingBelt,
+    encoder: &mut wgpu::CommandEncoder,
+    target: &Buffer,
+    values: &[T],
+) {
+    if values.is_empty() {
+        return;
+    }
+    stage_write_bytes(staging_belt, encoder, target, bytemuck::cast_slice(values));
+}
+
+fn stage_write_bytes(
+    staging_belt: &mut StagingBelt,
+    encoder: &mut wgpu::CommandEncoder,
+    target: &Buffer,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    let aligned_size = align_copy_size(bytes.len() as u64);
+    let mut view = staging_belt.write_buffer(
+        encoder,
+        target,
+        0,
+        BufferSize::new(aligned_size).expect("aligned size must be non-zero"),
+    );
+    debug_assert_eq!(aligned_size as usize, bytes.len());
+    view.copy_from_slice(bytes);
+}
+
+fn align_copy_size(size: u64) -> u64 {
+    size.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+}
+
 fn clip_rect(
     rect: crate::scene::LayoutBox,
     clip: Option<crate::scene::LayoutBox>,
@@ -1192,31 +1331,39 @@ fn intersect_rect(
     })
 }
 
-fn create_quad_pipeline(
+fn create_rect_pipeline(
     device: &Device,
     view_layout: &BindGroupLayout,
     surface_format: TextureFormat,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("nekoui_quad_shader"),
-        source: ShaderSource::Wgsl(QUAD_SHADER.into()),
+        label: Some("nekoui_rect_shader"),
+        source: ShaderSource::Wgsl(RECT_SHADER.into()),
     });
     let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("nekoui_quad_pipeline_layout"),
+        label: Some("nekoui_rect_pipeline_layout"),
         bind_group_layouts: &[Some(view_layout)],
         immediate_size: 0,
     });
     device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("nekoui_quad_pipeline"),
+        label: Some("nekoui_rect_pipeline"),
         layout: Some(&layout),
         vertex: VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
             compilation_options: PipelineCompilationOptions::default(),
             buffers: &[VertexBufferLayout {
-                array_stride: std::mem::size_of::<QuadInstance>() as u64,
+                array_stride: std::mem::size_of::<RectInstance>() as u64,
                 step_mode: VertexStepMode::Instance,
-                attributes: &vertex_attr_array![0 => Float32x4, 1 => Float32x4],
+                attributes: &vertex_attr_array![
+                    0 => Float32x4,
+                    1 => Float32x4,
+                    2 => Float32x4,
+                    3 => Float32x4,
+                    4 => Float32x4,
+                    5 => Float32x4,
+                    6 => Float32x4
+                ],
             }],
         },
         fragment: Some(FragmentState {
@@ -1362,6 +1509,45 @@ fn create_instance_buffer<T: Pod>(device: &Device, label: &str, capacity: usize)
     })
 }
 
+fn maybe_shrink_instance_buffer<T: Pod>(
+    device: &Device,
+    count: usize,
+    min_capacity: usize,
+    capacity: &mut usize,
+    low_usage_frames: &mut u32,
+    buffer: &mut Buffer,
+    label: &str,
+) {
+    if *capacity <= min_capacity {
+        *low_usage_frames = 0;
+        return;
+    }
+
+    if count.saturating_mul(4) > *capacity {
+        *low_usage_frames = 0;
+        return;
+    }
+
+    *low_usage_frames += 1;
+    if *low_usage_frames < SHRINK_IDLE_FRAME_THRESHOLD {
+        return;
+    }
+
+    let target = count
+        .max(1)
+        .saturating_mul(2)
+        .max(min_capacity)
+        .next_power_of_two();
+    if target >= *capacity {
+        *low_usage_frames = 0;
+        return;
+    }
+
+    *capacity = target;
+    *buffer = create_instance_buffer::<T>(device, label, *capacity);
+    *low_usage_frames = 0;
+}
+
 fn cosmic_to_style_color(color: CosmicColor) -> Color {
     Color::rgba(
         f32::from(color.r()) / 255.0,
@@ -1450,7 +1636,7 @@ mod tests {
         push_gpu_batch(
             &mut batches,
             GpuBatch {
-                pipeline_key: PipelineKey::Quad,
+                pipeline_key: PipelineKey::Rect,
                 texture_binding: TextureBindingKey::None,
                 clip_class: ClipClass::Rect,
                 clip_bounds: Some(LayoutBox {
@@ -1466,7 +1652,7 @@ mod tests {
         push_gpu_batch(
             &mut batches,
             GpuBatch {
-                pipeline_key: PipelineKey::Quad,
+                pipeline_key: PipelineKey::Rect,
                 texture_binding: TextureBindingKey::None,
                 clip_class: ClipClass::Rect,
                 clip_bounds: Some(LayoutBox {
@@ -1529,7 +1715,7 @@ mod tests {
         push_gpu_batch(
             &mut batches,
             GpuBatch {
-                pipeline_key: PipelineKey::Quad,
+                pipeline_key: PipelineKey::Rect,
                 texture_binding: TextureBindingKey::None,
                 clip_class: ClipClass::Rect,
                 clip_bounds: Some(LayoutBox {
@@ -1545,7 +1731,7 @@ mod tests {
         push_gpu_batch(
             &mut batches,
             GpuBatch {
-                pipeline_key: PipelineKey::Quad,
+                pipeline_key: PipelineKey::Rect,
                 texture_binding: TextureBindingKey::None,
                 clip_class: ClipClass::Rect,
                 clip_bounds: Some(LayoutBox {

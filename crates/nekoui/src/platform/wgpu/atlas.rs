@@ -10,7 +10,8 @@ use wgpu::{
 
 use crate::error::PlatformError;
 
-const MAX_ATLAS_PAGES: usize = 4;
+const GLYPH_ATLAS_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
+const MAX_ATLAS_PAGES_PER_FAMILY: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GlyphAtlasKind {
@@ -54,13 +55,13 @@ struct AtlasPage {
 
 impl GlyphAtlas {
     pub(crate) fn new(
-        device: &Device,
+        _device: &Device,
         bind_group_layout: &BindGroupLayout,
         kind: GlyphAtlasKind,
         size: u32,
     ) -> Result<Self, PlatformError> {
         let size = size.max(1).min(u16::MAX as u32);
-        let mut atlas = Self {
+        let atlas = Self {
             kind,
             bind_group_layout: bind_group_layout.clone(),
             width: size,
@@ -70,8 +71,6 @@ impl GlyphAtlas {
             next_page_id: 0,
             frame_id: 0,
         };
-        let first_page = atlas.create_page(device);
-        atlas.pages.push(first_page);
         Ok(atlas)
     }
 
@@ -277,7 +276,7 @@ impl GlyphAtlas {
             return Some((current_index, allocation));
         }
 
-        if self.pages.len() < MAX_ATLAS_PAGES {
+        if self.pages.len() < self.max_pages() {
             let page = self.create_page(device);
             self.pages.push(page);
             let current_index = self.pages.len() - 1;
@@ -303,7 +302,7 @@ impl GlyphAtlas {
             return Some((current_index, allocation));
         }
 
-        if self.pages.len() < MAX_ATLAS_PAGES {
+        if self.pages.len() < self.max_pages() {
             let page = self.create_page(device);
             self.pages.push(page);
             let current_index = self.pages.len() - 1;
@@ -317,7 +316,8 @@ impl GlyphAtlas {
     }
 
     fn evict_unused_pages(&mut self) {
-        if self.pages.len() < MAX_ATLAS_PAGES {
+        let max_pages = self.max_pages();
+        if self.pages.len() < max_pages {
             return;
         }
 
@@ -331,7 +331,7 @@ impl GlyphAtlas {
                     last_used_frame: page.last_used_frame,
                 })
                 .collect::<Vec<_>>(),
-            MAX_ATLAS_PAGES,
+            max_pages,
         );
 
         if eviction_ids.is_empty() {
@@ -354,6 +354,19 @@ impl GlyphAtlas {
             page.used_in_frame = true;
             page.last_used_frame = self.frame_id;
         }
+    }
+
+    fn max_pages(&self) -> usize {
+        let budget_pages = (GLYPH_ATLAS_BYTE_BUDGET / self.page_byte_size()).max(1) as usize;
+        budget_pages.min(MAX_ATLAS_PAGES_PER_FAMILY)
+    }
+
+    fn page_byte_size(&self) -> u64 {
+        let bytes_per_pixel = match self.kind {
+            GlyphAtlasKind::Mono => 1_u64,
+            GlyphAtlasKind::Color => 4_u64,
+        };
+        u64::from(self.width) * u64::from(self.height) * bytes_per_pixel
     }
 }
 
@@ -385,7 +398,7 @@ fn eviction_page_ids(pages: &[AtlasPageState], max_pages: usize) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtlasPageState, MAX_ATLAS_PAGES, eviction_page_ids};
+    use super::{AtlasPageState, GLYPH_ATLAS_BYTE_BUDGET, eviction_page_ids};
 
     #[test]
     fn eviction_prefers_oldest_unused_pages() {
@@ -412,7 +425,7 @@ mod tests {
                     last_used_frame: 5,
                 },
             ],
-            MAX_ATLAS_PAGES,
+            4,
         );
 
         assert_eq!(eviction, vec![2]);
@@ -443,9 +456,17 @@ mod tests {
                     last_used_frame: 6,
                 },
             ],
-            MAX_ATLAS_PAGES,
+            4,
         );
 
         assert!(eviction.is_empty());
+    }
+
+    #[test]
+    fn color_family_page_budget_caps_pages_more_aggressively() {
+        let page_bytes = 2048_u64 * 2048_u64 * 4_u64;
+        let budget_pages = (GLYPH_ATLAS_BYTE_BUDGET / page_bytes).max(1) as usize;
+        assert_eq!(page_bytes, 16 * 1024 * 1024);
+        assert_eq!(budget_pages.min(16), 4);
     }
 }

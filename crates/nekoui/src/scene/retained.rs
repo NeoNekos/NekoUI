@@ -221,7 +221,14 @@ impl RetainedTree {
 
     pub fn compile_scene(&mut self) -> CompiledScene {
         let root_fragment = self.get_or_build_subtree_fragment(self.root, false);
-        let clear_color = self.nodes[self.root].style.paint.background;
+        let clear_color = self.nodes[self.root]
+            .style
+            .paint
+            .background
+            .map(|background| match background {
+                crate::style::BackgroundFill::Solid(color) => color,
+                crate::style::BackgroundFill::LinearGradient(gradient) => gradient.start_color,
+            });
         CompiledScene {
             clear_color,
             scene_nodes: root_fragment.scene_nodes.clone(),
@@ -632,11 +639,32 @@ impl RetainedTree {
 
         match &node.kind {
             NodeKind::Div => {
-                if let Some(background) = node.style.paint.background {
-                    primitives.push(Primitive::Quad {
+                let border_visible = node.style.paint.border_color.is_some()
+                    && (node.style.paint.border_widths.top > 0.0
+                        || node.style.paint.border_widths.right > 0.0
+                        || node.style.paint.border_widths.bottom > 0.0
+                        || node.style.paint.border_widths.left > 0.0);
+                if let Some(background) = node.style.paint.background.or_else(|| {
+                    border_visible.then_some(crate::style::BackgroundFill::Solid(
+                        crate::style::Color::rgba(0.0, 0.0, 0.0, 0.0),
+                    ))
+                }) {
+                    let rect = super::RectPrimitive {
                         bounds,
-                        color: background,
-                    });
+                        fill: match background {
+                            crate::style::BackgroundFill::Solid(color) => {
+                                super::RectFill::Solid(color)
+                            }
+                            crate::style::BackgroundFill::LinearGradient(gradient) => {
+                                super::RectFill::LinearGradient(gradient)
+                            }
+                        },
+                        corner_radii: node.style.paint.corner_radii,
+                        border_widths: node.style.paint.border_widths,
+                        border_color: node.style.paint.border_color,
+                        opacity: 1.0,
+                    };
+                    primitives.push(Primitive::Rect(rect));
                 }
             }
             NodeKind::Text { layout, .. } => {
@@ -693,11 +721,32 @@ impl RetainedTree {
 
         match &node.kind {
             NodeKind::Div => {
-                if let Some(background) = node.style.paint.background {
-                    primitives.push(Primitive::Quad {
+                let border_visible = node.style.paint.border_color.is_some()
+                    && (node.style.paint.border_widths.top > 0.0
+                        || node.style.paint.border_widths.right > 0.0
+                        || node.style.paint.border_widths.bottom > 0.0
+                        || node.style.paint.border_widths.left > 0.0);
+                if let Some(background) = node.style.paint.background.or_else(|| {
+                    border_visible.then_some(crate::style::BackgroundFill::Solid(
+                        crate::style::Color::rgba(0.0, 0.0, 0.0, 0.0),
+                    ))
+                }) {
+                    let rect = super::RectPrimitive {
                         bounds,
-                        color: background,
-                    });
+                        fill: match background {
+                            crate::style::BackgroundFill::Solid(color) => {
+                                super::RectFill::Solid(color)
+                            }
+                            crate::style::BackgroundFill::LinearGradient(gradient) => {
+                                super::RectFill::LinearGradient(gradient)
+                            }
+                        },
+                        corner_radii: node.style.paint.corner_radii,
+                        border_widths: node.style.paint.border_widths,
+                        border_color: node.style.paint.border_color,
+                        opacity: 1.0,
+                    };
+                    primitives.push(Primitive::Rect(rect));
                 }
             }
             NodeKind::Text { layout, .. } => {
@@ -1006,7 +1055,8 @@ mod tests {
 
     use crate::app::{App, Render};
     use crate::element::{BuildCx, IntoElement, ParentElement, SpecArena};
-    use crate::style::{Color, EdgeInsets, Length};
+    use crate::scene::{Primitive, RectFill};
+    use crate::style::{Color, CornerRadii, EdgeInsets, EdgeWidths, Length, gradient};
     use crate::text_system::TextSystem;
     use crate::window::{Window, WindowId, WindowSize};
 
@@ -1177,7 +1227,7 @@ mod tests {
     #[test]
     fn compile_scene_emits_scene_nodes_and_logical_batches() {
         let root = crate::div()
-            .background(Color::rgb(0x111111))
+            .bg(Color::rgb(0x111111))
             .child(crate::text("hello"))
             .into_any_element();
 
@@ -1217,11 +1267,11 @@ mod tests {
     #[test]
     fn paint_only_update_preserves_logical_batch_structure() {
         let root = crate::div()
-            .background(Color::rgb(0x111111))
+            .bg(Color::rgb(0x111111))
             .child(crate::text("hello").color(Color::rgb(0x222222)))
             .into_any_element();
         let updated = crate::div()
-            .background(Color::rgb(0x333333))
+            .bg(Color::rgb(0x333333))
             .child(crate::text("hello").color(Color::rgb(0x444444)))
             .into_any_element();
 
@@ -1264,11 +1314,11 @@ mod tests {
     #[test]
     fn paint_only_update_reuses_root_scene_structure_cache() {
         let root = crate::div()
-            .background(Color::rgb(0x111111))
+            .bg(Color::rgb(0x111111))
             .child(crate::text("hello").color(Color::rgb(0x222222)))
             .into_any_element();
         let updated = crate::div()
-            .background(Color::rgb(0x333333))
+            .bg(Color::rgb(0x333333))
             .child(crate::text("hello").color(Color::rgb(0x444444)))
             .into_any_element();
 
@@ -1316,7 +1366,7 @@ mod tests {
         let root = crate::div()
             .clip()
             .opacity(0.5)
-            .background(Color::rgb(0x111111))
+            .bg(Color::rgb(0x111111))
             .child(crate::text("hello"))
             .into_any_element();
 
@@ -1340,14 +1390,92 @@ mod tests {
     }
 
     #[test]
+    fn compile_scene_rect_primitive_carries_corner_and_border_style() {
+        let root = crate::div()
+            .bg(Color::rgb(0x111111))
+            .corner_radii(CornerRadii {
+                top_left: 8.0,
+                top_right: 12.0,
+                bottom_right: 16.0,
+                bottom_left: 20.0,
+            })
+            .border_widths(EdgeWidths {
+                top: 1.0,
+                right: 2.0,
+                bottom: 3.0,
+                left: 4.0,
+            })
+            .border_color(Color::rgb(0x222222))
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+        let compiled = tree.compile_scene();
+
+        let Primitive::Rect(rect) = &compiled.primitives[0] else {
+            panic!("expected rect primitive");
+        };
+        assert_eq!(rect.corner_radii.top_left, 8.0);
+        assert_eq!(rect.corner_radii.top_right, 12.0);
+        assert_eq!(rect.corner_radii.bottom_right, 16.0);
+        assert_eq!(rect.corner_radii.bottom_left, 20.0);
+        assert_eq!(rect.border_widths.top, 1.0);
+        assert_eq!(rect.border_widths.right, 2.0);
+        assert_eq!(rect.border_widths.bottom, 3.0);
+        assert_eq!(rect.border_widths.left, 4.0);
+        assert_eq!(rect.border_color, Some(Color::rgb(0x222222)));
+    }
+
+    #[test]
+    fn compile_scene_emits_rect_for_border_only_div() {
+        let root = crate::div()
+            .border(2.0, Color::rgb(0x333333))
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+        let compiled = tree.compile_scene();
+
+        assert!(!compiled.primitives.is_empty());
+        let Primitive::Rect(rect) = &compiled.primitives[0] else {
+            panic!("expected rect primitive");
+        };
+        assert_eq!(rect.fill, RectFill::Solid(Color::rgba(0.0, 0.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn compile_scene_rect_primitive_carries_gradient_fill() {
+        let root = crate::div()
+            .bg(gradient(Color::rgb(0x111111), Color::rgb(0x444444), 1.25))
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+        let compiled = tree.compile_scene();
+
+        let Primitive::Rect(rect) = &compiled.primitives[0] else {
+            panic!("expected rect primitive");
+        };
+        let RectFill::LinearGradient(gradient) = rect.fill else {
+            panic!("expected gradient fill");
+        };
+        assert_eq!(gradient.start_color, Color::rgb(0x111111));
+        assert_eq!(gradient.end_color, Color::rgb(0x444444));
+        assert_eq!(gradient.angle_radians, 1.25);
+    }
+
+    #[test]
     fn paint_only_update_reuses_clean_sibling_fragment_cache() {
         let root = crate::div()
-            .child(crate::div().background(Color::rgb(0x111111)).key(1))
-            .child(crate::div().background(Color::rgb(0x222222)).key(2))
+            .child(crate::div().bg(Color::rgb(0x111111)).key(1))
+            .child(crate::div().bg(Color::rgb(0x222222)).key(2))
             .into_any_element();
         let updated = crate::div()
-            .child(crate::div().background(Color::rgb(0x333333)).key(1))
-            .child(crate::div().background(Color::rgb(0x222222)).key(2))
+            .child(crate::div().bg(Color::rgb(0x333333)).key(1))
+            .child(crate::div().bg(Color::rgb(0x222222)).key(2))
             .into_any_element();
 
         let mut tree = build_static_tree(root);

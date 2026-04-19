@@ -1,4 +1,7 @@
-use crate::style::{AlignItems, Color, Direction, EdgeInsets, JustifyContent, Length, Size, Style};
+use crate::style::{
+    AlignItems, BackgroundFill, Color, CornerRadii, Direction, EdgeInsets, EdgeWidths,
+    JustifyContent, Length, Size, Style,
+};
 
 use super::{AnyElement, Fragment, IntoElement, IntoElements, ParentElement};
 
@@ -74,8 +77,44 @@ impl Div {
         self
     }
 
-    pub fn background(mut self, color: Color) -> Self {
-        self.style.paint.background = Some(color);
+    pub fn bg(mut self, background: impl Into<BackgroundFill>) -> Self {
+        self.style.paint.background = Some(background.into());
+        self
+    }
+
+    pub fn corner_radius(mut self, radius: f32) -> Self {
+        self.style.paint.corner_radii = CornerRadii::all(radius.max(0.0));
+        self
+    }
+
+    pub fn corner_radii(mut self, corner_radii: CornerRadii) -> Self {
+        self.style.paint.corner_radii = CornerRadii {
+            top_left: corner_radii.top_left.max(0.0),
+            top_right: corner_radii.top_right.max(0.0),
+            bottom_right: corner_radii.bottom_right.max(0.0),
+            bottom_left: corner_radii.bottom_left.max(0.0),
+        };
+        self
+    }
+
+    pub fn border(mut self, width: f32, color: Color) -> Self {
+        self.style.paint.border_widths = EdgeWidths::all(width.max(0.0));
+        self.style.paint.border_color = Some(color);
+        self
+    }
+
+    pub fn border_widths(mut self, border_widths: EdgeWidths) -> Self {
+        self.style.paint.border_widths = EdgeWidths {
+            top: border_widths.top.max(0.0),
+            right: border_widths.right.max(0.0),
+            bottom: border_widths.bottom.max(0.0),
+            left: border_widths.left.max(0.0),
+        };
+        self
+    }
+
+    pub fn border_color(mut self, color: Color) -> Self {
+        self.style.paint.border_color = Some(color);
         self
     }
 

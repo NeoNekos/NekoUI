@@ -14,11 +14,11 @@ fn main() -> Result<(), nekoui::Error> {
                     .padding(EdgeInsets::all(24.0))
                     .direction(Direction::Column)
                     .gap(16.0)
-                    .background(Color::rgb(0xF5F3EF))
+                    .bg(Color::rgb(0xF5F3EF))
                     .child(
                         div()
                             .padding(EdgeInsets::all(20.0))
-                            .background(Color::rgb(0x1F2937))
+                            .bg(Color::rgb(0x1F2937))
                             .child(
                                 text("Hello world!")
                                     .font_size(32.0)
@@ -33,7 +33,7 @@ fn main() -> Result<(), nekoui::Error> {
                                 bottom: 0.0,
                                 left: 20.0,
                             })
-                            .background(Color::rgb(0xFFFFFF))
+                            .bg(Color::rgb(0xFFFFFF))
                             .child(
                                 text("这是一个简单示例喵 🍥")
                                     .font_size(24.0)
