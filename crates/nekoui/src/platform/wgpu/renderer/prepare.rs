@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use cosmic_text::{CacheKey, SwashContent};
 
 use crate::platform::wgpu::atlas::{AtlasEntry, GlyphAtlasKind};
@@ -42,10 +44,10 @@ impl RenderSystem {
         let final_key = self.prepared_frame_key(scene, scale_factor);
         state.prepared_frame = Some(PreparedFrame {
             key: final_key,
-            rect_instances: self.rect_instances.clone(),
-            mono_text_instances: self.mono_text_instances.clone(),
-            color_text_instances: self.color_text_instances.clone(),
-            gpu_batches: self.gpu_batches.clone(),
+            rect_instances: Arc::new(std::mem::take(&mut self.rect_instances)),
+            mono_text_instances: Arc::new(std::mem::take(&mut self.mono_text_instances)),
+            color_text_instances: Arc::new(std::mem::take(&mut self.color_text_instances)),
+            gpu_batches: Arc::new(std::mem::take(&mut self.gpu_batches)),
             uploaded_buffer_epoch: 0,
         });
     }

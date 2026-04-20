@@ -408,7 +408,7 @@ impl RenderSystem {
             });
 
             let mut current_submit_state = None;
-            for batch in &state
+            for batch in &*state
                 .prepared_frame
                 .as_ref()
                 .expect("prepared frame must exist during submit")

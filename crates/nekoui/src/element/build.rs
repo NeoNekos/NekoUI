@@ -151,7 +151,7 @@ impl<'a> BuildCx<'a> {
         &mut self,
         fragment: &Fragment,
     ) -> Result<SmallVec<[SpecNodeId; 4]>, RuntimeError> {
-        let mut ids = SmallVec::with_capacity(fragment.iter().count());
+        let mut ids = SmallVec::new();
         for child in fragment.iter() {
             ids.push(self.lower_any(child.clone())?);
         }

@@ -220,7 +220,7 @@ impl RetainedTree {
     }
 
     pub fn compile_scene(&mut self) -> CompiledScene {
-        let root_fragment = self.get_or_build_subtree_fragment(self.root, false);
+        let root_fragment = self.get_or_build_subtree_fragment(self.root, false, false);
         let clear_color = self.nodes[self.root]
             .style
             .paint
@@ -572,18 +572,22 @@ impl RetainedTree {
     fn get_or_build_subtree_fragment(
         &mut self,
         node_id: NodeId,
+        ancestor_scene_dirty: bool,
         ancestor_layout_dirty: bool,
     ) -> Arc<CompiledSubtreeFragment> {
-        let subtree_scene_dirty = self.subtree_has_scene_dirty(node_id);
-        let subtree_layout_dirty = ancestor_layout_dirty || self.subtree_has_layout_dirty(node_id);
+        let node = &self.nodes[node_id];
+        let subtree_scene_dirty = ancestor_scene_dirty || node.dirty.needs_scene_compile();
+        let subtree_layout_dirty = ancestor_layout_dirty
+            || node
+                .dirty
+                .intersects(DirtyLaneMask::BUILD | DirtyLaneMask::LAYOUT);
 
-        if !subtree_scene_dirty && let Some(cached) = &self.nodes[node_id].compiled_fragment {
+        if !subtree_scene_dirty && let Some(cached) = &node.compiled_fragment {
             return cached.clone();
         }
 
-        if !subtree_layout_dirty && let Some(cached) = self.nodes[node_id].compiled_fragment.clone()
-        {
-            let primitives = self.rebuild_subtree_primitives_only(node_id);
+        if !subtree_layout_dirty && let Some(cached) = node.compiled_fragment.clone() {
+            let primitives = self.rebuild_subtree_primitives_only(node_id, subtree_scene_dirty);
             let compiled_fragment = Arc::new(CompiledSubtreeFragment {
                 scene_nodes: cached.scene_nodes.clone(),
                 primitives: Arc::from(primitives),
@@ -596,7 +600,8 @@ impl RetainedTree {
             return compiled_fragment;
         }
 
-        let compiled_fragment = Arc::new(self.rebuild_compiled_subtree_fragment(node_id));
+        let compiled_fragment =
+            Arc::new(self.rebuild_compiled_subtree_fragment(node_id, subtree_scene_dirty));
         self.nodes[node_id].compiled_fragment = Some(compiled_fragment.clone());
         if node_id == self.root {
             self.clear_dirty_after_compile();
@@ -604,9 +609,15 @@ impl RetainedTree {
         compiled_fragment
     }
 
-    fn rebuild_compiled_subtree_fragment(&mut self, node_id: NodeId) -> CompiledSubtreeFragment {
+    fn rebuild_compiled_subtree_fragment(
+        &mut self,
+        node_id: NodeId,
+        ancestor_scene_dirty: bool,
+    ) -> CompiledSubtreeFragment {
         let node = &self.nodes[node_id];
         debug_assert_eq!(node.id, node_id);
+        let subtree_scene_dirty = ancestor_scene_dirty || node.dirty.needs_scene_compile();
+
         let bounds = LayoutBox {
             x: 0.0,
             y: 0.0,
@@ -683,7 +694,11 @@ impl RetainedTree {
         let mut first_child = None;
         let mut previous_child: Option<SceneNodeId> = None;
         for child_id in child_ids {
-            let child_fragment = self.get_or_build_subtree_fragment(child_id, true);
+            let child_fragment = self.get_or_build_subtree_fragment(
+                child_id,
+                subtree_scene_dirty || ancestor_scene_dirty,
+                true,
+            );
             let child_root = append_subtree_fragment(
                 &child_fragment,
                 Some(SceneNodeId(0)),
@@ -708,8 +723,22 @@ impl RetainedTree {
         }
     }
 
-    fn rebuild_subtree_primitives_only(&mut self, node_id: NodeId) -> Vec<Primitive> {
+    fn rebuild_subtree_primitives_only(
+        &mut self,
+        node_id: NodeId,
+        ancestor_scene_dirty: bool,
+    ) -> Vec<Primitive> {
         let node = &self.nodes[node_id];
+        let subtree_scene_dirty = ancestor_scene_dirty || node.dirty.needs_scene_compile();
+
+        if !subtree_scene_dirty && node.compiled_fragment.is_some() {
+            return node
+                .compiled_fragment
+                .as_ref()
+                .map(|f| f.primitives.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+        }
+
         let bounds = LayoutBox {
             x: 0.0,
             y: 0.0,
@@ -762,22 +791,33 @@ impl RetainedTree {
 
         let child_ids = self.nodes[node_id].children.clone();
         for child_id in child_ids {
-            if !self.subtree_has_scene_dirty(child_id)
-                && let Some(cached) = &self.nodes[child_id].compiled_fragment
-            {
-                primitives.extend(cached.primitives.iter().cloned());
+            let child_node = &self.nodes[child_id];
+            let child_scene_dirty = subtree_scene_dirty || child_node.dirty.needs_scene_compile();
+            let child_layout_dirty = child_node
+                .dirty
+                .intersects(DirtyLaneMask::BUILD | DirtyLaneMask::LAYOUT);
+
+            if !child_scene_dirty && child_node.compiled_fragment.is_some() {
+                primitives.extend(
+                    child_node
+                        .compiled_fragment
+                        .as_ref()
+                        .map(|f| f.primitives.iter().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                );
                 continue;
             }
 
-            if self.subtree_has_layout_dirty(child_id) {
+            if child_layout_dirty {
                 primitives.extend(
-                    self.get_or_build_subtree_fragment(child_id, true)
+                    self.get_or_build_subtree_fragment(child_id, true, true)
                         .primitives
                         .iter()
                         .cloned(),
                 );
             } else {
-                primitives.extend(self.rebuild_subtree_primitives_only(child_id));
+                primitives
+                    .extend(self.rebuild_subtree_primitives_only(child_id, subtree_scene_dirty));
             }
         }
 
@@ -788,33 +828,6 @@ impl RetainedTree {
         for (_, node) in &mut self.nodes {
             node.dirty = DirtyLaneMask::empty();
         }
-    }
-
-    fn subtree_has_scene_dirty(&self, node_id: NodeId) -> bool {
-        if self.nodes[node_id].dirty.needs_scene_compile() {
-            return true;
-        }
-
-        self.nodes[node_id]
-            .children
-            .iter()
-            .copied()
-            .any(|child_id| self.subtree_has_scene_dirty(child_id))
-    }
-
-    fn subtree_has_layout_dirty(&self, node_id: NodeId) -> bool {
-        if self.nodes[node_id]
-            .dirty
-            .intersects(DirtyLaneMask::BUILD | DirtyLaneMask::LAYOUT)
-        {
-            return true;
-        }
-
-        self.nodes[node_id]
-            .children
-            .iter()
-            .copied()
-            .any(|child_id| self.subtree_has_layout_dirty(child_id))
     }
 }
 

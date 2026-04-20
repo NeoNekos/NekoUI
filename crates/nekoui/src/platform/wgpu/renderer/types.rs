@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -56,10 +57,10 @@ pub(super) struct PreparedFrameKey {
 #[derive(Debug, Clone)]
 pub(super) struct PreparedFrame {
     pub(super) key: PreparedFrameKey,
-    pub(super) rect_instances: Vec<RectInstance>,
-    pub(super) mono_text_instances: Vec<TextInstance>,
-    pub(super) color_text_instances: Vec<ColorTextInstance>,
-    pub(super) gpu_batches: Vec<GpuBatch>,
+    pub(super) rect_instances: Arc<Vec<RectInstance>>,
+    pub(super) mono_text_instances: Arc<Vec<TextInstance>>,
+    pub(super) color_text_instances: Arc<Vec<ColorTextInstance>>,
+    pub(super) gpu_batches: Arc<Vec<GpuBatch>>,
     pub(super) uploaded_buffer_epoch: u64,
 }
 
