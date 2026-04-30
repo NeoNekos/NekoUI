@@ -9,13 +9,20 @@ use super::builder_macros::{
     impl_shared_flex_item_builders, impl_shared_key_size_margin_builders,
     impl_shared_text_style_builders, impl_shared_window_chrome_builders,
 };
-use super::{AnyElement, Fragment, IntoElement, IntoElements, ParentElement, WindowFrameArea};
+use super::{
+    AnyElement, Fragment, InteractionState, IntoElement, IntoElements, ParentElement,
+    WindowFrameArea,
+};
+use crate::input::{FocusPolicy, TextInputPurpose, TextInputState};
+use crate::semantics::{SemanticsRole, SemanticsState};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Div {
     pub(crate) key: Option<u64>,
     pub(crate) style: Style,
     pub(crate) window_frame_area: Option<WindowFrameArea>,
+    pub(crate) interaction: InteractionState,
+    pub(crate) semantics: SemanticsState,
     pub(crate) children: Fragment,
 }
 
@@ -24,6 +31,8 @@ pub fn div() -> Div {
         key: None,
         style: Style::default(),
         window_frame_area: None,
+        interaction: InteractionState::default(),
+        semantics: SemanticsState::default(),
         children: Fragment::new(),
     }
 }
@@ -293,6 +302,47 @@ impl Div {
 
     impl_shared_text_style_builders!();
     impl_shared_window_chrome_builders!();
+
+    pub fn focusable(mut self) -> Self {
+        self.interaction.focus_policy = FocusPolicy::Keyboard;
+        self
+    }
+
+    pub fn text_input(mut self, purpose: TextInputPurpose) -> Self {
+        self.interaction.focus_policy = FocusPolicy::TextInput;
+        self.interaction.text_input = Some(TextInputState {
+            ime_allowed: true,
+            purpose,
+            placeholder: None,
+        });
+        self.semantics.role = SemanticsRole::TextInput;
+        self
+    }
+
+    pub fn semantics_role(mut self, role: SemanticsRole) -> Self {
+        self.semantics.role = role;
+        self
+    }
+
+    pub fn semantics_label(mut self, label: impl Into<crate::SharedString>) -> Self {
+        self.semantics.label = Some(label.into());
+        self
+    }
+
+    pub fn semantics_value(mut self, value: impl Into<crate::SharedString>) -> Self {
+        self.semantics.value = Some(value.into());
+        self
+    }
+
+    pub fn semantics_hidden(mut self, hidden: bool) -> Self {
+        self.semantics.hidden = hidden;
+        self
+    }
+
+    pub fn semantics_disabled(mut self, disabled: bool) -> Self {
+        self.semantics.disabled = disabled;
+        self
+    }
 }
 
 impl ParentElement for Div {

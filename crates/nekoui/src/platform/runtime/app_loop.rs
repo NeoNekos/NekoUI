@@ -4,12 +4,15 @@ use std::time::{Duration, Instant};
 
 use hashbrown::HashMap;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::dpi::PhysicalSize;
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key as WinitKey, NamedKey};
 use winit::window::WindowId as WinitWindowId;
 
 use crate::app::{App, AppContext, LastWindowBehavior};
 use crate::error::{Error, PlatformError};
+use crate::input::{CaretRect, PointerButton, PointerEvent, PointerPhase, TextInputPurpose};
 use crate::platform::wgpu::{RenderFramePackage, RenderOutcome, RenderSystem};
 #[cfg(target_os = "linux")]
 use crate::platform::window::native::linux::{
@@ -183,6 +186,9 @@ impl AppRuntime {
                 frame_scheduler: FrameSchedulerState::new(),
                 generation_state: WindowGenerationState::new_synced(),
                 cursor_position: None,
+                focus_manager: super::input::FocusManager::new(),
+                input_router: super::input::InputRouter::default(),
+                text_input_target: super::input::TextInputTarget::default(),
                 #[cfg(target_os = "linux")]
                 linux_route: linux_route_for(linux_backend_kind(event_loop), &request.options),
                 #[cfg(target_os = "macos")]
@@ -238,12 +244,14 @@ impl AppRuntime {
                 .retained_tree
                 .update_from_spec(&runtime_window.build_scratch, built.root);
             sync_window_frame_hit_test(runtime_window);
+            sync_focus_after_tree_update(runtime_window);
 
             if dirty.needs_layout() {
                 runtime_window
                     .retained_tree
                     .compute_layout(runtime_window.public_window.content_size(), text_system);
                 sync_window_frame_hit_test(runtime_window);
+                sync_focus_after_tree_update(runtime_window);
             }
             if dirty.needs_scene_compile() {
                 runtime_window.compiled_scene = runtime_window.retained_tree.compile_scene();
@@ -441,6 +449,16 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(runtime_window) = self.windows.get_mut(&window_id) {
                     runtime_window.cursor_position = Some(position);
+                    let logical = logical_point_from_cursor(runtime_window, position);
+                    let _ = runtime_window.input_router.pointer_event(
+                        &runtime_window.retained_tree,
+                        PointerEvent {
+                            phase: PointerPhase::Move,
+                            position: logical,
+                            button: None,
+                            delta: None,
+                        },
+                    );
                     #[cfg(target_os = "linux")]
                     {
                         update_client_decorations_cursor(
@@ -455,6 +473,7 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
             WindowEvent::CursorLeft { .. } => {
                 if let Some(runtime_window) = self.windows.get_mut(&window_id) {
                     runtime_window.cursor_position = None;
+                    runtime_window.input_router.last_hit = None;
                     #[cfg(target_os = "linux")]
                     {
                         clear_client_decorations_cursor(
@@ -464,11 +483,39 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
                     }
                 }
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(runtime_window) = self.windows.get_mut(&window_id)
+                    && let Some(cursor_position) = runtime_window.cursor_position
+                {
+                    let logical = logical_point_from_cursor(runtime_window, cursor_position);
+                    let hit = runtime_window.input_router.pointer_event(
+                        &runtime_window.retained_tree,
+                        PointerEvent {
+                            phase: if state == ElementState::Pressed {
+                                PointerPhase::Down
+                            } else {
+                                PointerPhase::Up
+                            },
+                            position: logical,
+                            button: Some(pointer_button(button)),
+                            delta: None,
+                        },
+                    );
+
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        let focused = hit.focusable;
+                        if runtime_window.focus_manager.set_focused(focused) {
+                            sync_text_input_target(runtime_window);
+                            apply_ime_target(runtime_window);
+                            mark_window_pending(runtime_window, FrameReasonMask::USER);
+                        }
+                    }
+                }
+
+                if state != ElementState::Pressed || button != MouseButton::Left {
+                    return;
+                }
+
                 #[cfg(target_os = "linux")]
                 let mut handled_window_area = false;
                 if let Some(runtime_window) = self.windows.get_mut(&window_id)
@@ -549,6 +596,76 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
                             &runtime_window.public_window,
                             runtime_window.cursor_position,
                         );
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(runtime_window) = self.windows.get_mut(&window_id)
+                    && let Some(cursor_position) = runtime_window.cursor_position
+                {
+                    let logical = logical_point_from_cursor(runtime_window, cursor_position);
+                    let delta = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => crate::style::Point::new(
+                            crate::style::px(x * 12.0),
+                            crate::style::px(y * 12.0),
+                        ),
+                        MouseScrollDelta::PixelDelta(position) => crate::style::Point::new(
+                            crate::style::px(position.x as f32),
+                            crate::style::px(position.y as f32),
+                        ),
+                    };
+                    let _ = runtime_window.input_router.pointer_event(
+                        &runtime_window.retained_tree,
+                        PointerEvent {
+                            phase: PointerPhase::Wheel,
+                            position: logical,
+                            button: None,
+                            delta: Some(delta),
+                        },
+                    );
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let Some(runtime_window) = self.windows.get_mut(&window_id)
+                    && event.state == ElementState::Pressed
+                {
+                    match &event.logical_key {
+                        WinitKey::Named(NamedKey::Tab) => {
+                            let next = runtime_window.retained_tree.first_focusable_node();
+                            if runtime_window.focus_manager.set_focused(next) {
+                                sync_text_input_target(runtime_window);
+                                apply_ime_target(runtime_window);
+                                mark_window_pending(runtime_window, FrameReasonMask::USER);
+                            }
+                        }
+                        WinitKey::Named(NamedKey::Escape)
+                            if runtime_window.focus_manager.set_focused(None) =>
+                        {
+                            sync_text_input_target(runtime_window);
+                            apply_ime_target(runtime_window);
+                            mark_window_pending(runtime_window, FrameReasonMask::USER);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            WindowEvent::Ime(event) => {
+                if let Some(runtime_window) = self.windows.get_mut(&window_id) {
+                    match event {
+                        Ime::Enabled => {
+                            runtime_window.text_input_target.ime_allowed = true;
+                        }
+                        Ime::Preedit(text, _) => {
+                            runtime_window.text_input_target.preedit =
+                                if text.is_empty() { None } else { Some(text) };
+                        }
+                        Ime::Commit(_text) => {
+                            runtime_window.text_input_target.preedit = None;
+                        }
+                        Ime::Disabled => {
+                            runtime_window.text_input_target.ime_allowed = false;
+                            runtime_window.text_input_target.preedit = None;
+                        }
                     }
                 }
             }
@@ -779,6 +896,7 @@ fn sync_window_scene_to_latest_metrics(
         .retained_tree
         .compute_layout(runtime_window.public_window.content_size(), text_system);
     sync_window_frame_hit_test(runtime_window);
+    sync_focus_after_tree_update(runtime_window);
     runtime_window.compiled_scene = runtime_window.retained_tree.compile_scene();
     runtime_window.generation_state.mark_scene_compiled();
 }
@@ -797,6 +915,105 @@ fn sync_window_frame_hit_test(runtime_window: &RuntimeWindow) {
             runtime_window.public_window.scale_factor(),
             &areas,
         );
+    }
+}
+
+fn sync_text_input_target(runtime_window: &mut RuntimeWindow) {
+    let focused = runtime_window.focus_manager.focused();
+    let text_input_node = focused.filter(|node| {
+        runtime_window
+            .retained_tree
+            .retained_node(*node)
+            .interaction
+            .text_input
+            .is_some()
+            && !runtime_window
+                .retained_tree
+                .retained_node(*node)
+                .semantics
+                .disabled
+    });
+
+    runtime_window.text_input_target.node = text_input_node;
+    runtime_window.text_input_target.purpose = text_input_node
+        .and_then(|node| {
+            runtime_window
+                .retained_tree
+                .retained_node(node)
+                .interaction
+                .text_input
+                .as_ref()
+                .map(|state| state.purpose)
+        })
+        .unwrap_or(TextInputPurpose::Normal);
+    runtime_window.text_input_target.caret_rect = text_input_node.map(|node| {
+        let layout = runtime_window.retained_tree.absolute_layout_box(node);
+        CaretRect {
+            origin: crate::style::point(crate::style::px(layout.x), crate::style::px(layout.y)),
+            size: crate::style::size(
+                crate::style::px(1.0),
+                crate::style::px(layout.height.max(1.0)),
+            ),
+        }
+    });
+}
+
+fn sync_focus_after_tree_update(runtime_window: &mut RuntimeWindow) {
+    let focused = runtime_window.focus_manager.focused();
+    let next_focused = focused.filter(|node| {
+        runtime_window
+            .retained_tree
+            .try_retained_node(*node)
+            .is_some_and(|retained| {
+                retained.interaction.focus_policy != crate::input::FocusPolicy::None
+                    && !retained.semantics.disabled
+                    && !matches!(retained.style.layout.display, crate::style::Display::None)
+                    && retained.layout.width > 0.0
+                    && retained.layout.height > 0.0
+            })
+    });
+    runtime_window.focus_manager.set_focused(next_focused);
+    sync_text_input_target(runtime_window);
+    apply_ime_target(runtime_window);
+}
+
+fn apply_ime_target(runtime_window: &mut RuntimeWindow) {
+    let allowed = runtime_window.text_input_target.node.is_some();
+    runtime_window.native_window.set_ime_allowed(allowed);
+    if allowed && let Some(caret) = runtime_window.text_input_target.caret_rect {
+        let scale = runtime_window.public_window.scale_factor() as f32;
+        runtime_window.native_window.set_ime_cursor_area(
+            winit::dpi::PhysicalPosition::new(
+                (caret.origin.x.get() * scale).round() as i32,
+                (caret.origin.y.get() * scale).round() as i32,
+            ),
+            PhysicalSize::new(
+                (caret.size.width.get() * scale).round().max(1.0) as u32,
+                (caret.size.height.get() * scale).round().max(1.0) as u32,
+            ),
+        );
+    }
+}
+
+fn logical_point_from_cursor(
+    runtime_window: &RuntimeWindow,
+    position: winit::dpi::PhysicalPosition<f64>,
+) -> crate::style::Point<crate::style::Px> {
+    let scale = runtime_window.public_window.scale_factor() as f32;
+    crate::style::Point::new(
+        crate::style::px(position.x as f32 / scale),
+        crate::style::px(position.y as f32 / scale),
+    )
+}
+
+fn pointer_button(button: MouseButton) -> PointerButton {
+    match button {
+        MouseButton::Left => PointerButton::Primary,
+        MouseButton::Right => PointerButton::Secondary,
+        MouseButton::Middle => PointerButton::Middle,
+        MouseButton::Back => PointerButton::Back,
+        MouseButton::Forward => PointerButton::Forward,
+        MouseButton::Other(value) => PointerButton::Other(value),
     }
 }
 

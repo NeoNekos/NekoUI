@@ -6,6 +6,7 @@ use taffy::prelude::{AvailableSpace, NodeId as TaffyNodeId, Size as TaffySize, T
 
 use crate::SharedString;
 use crate::element::{SpecArena, SpecNode, SpecNodeId, SpecPayload, WindowFrameArea};
+use crate::input::FocusPolicy;
 use crate::style::{Background, ResolvedStyle, ResolvedTextStyle};
 use crate::text_system::{SharedTextLayout, TextBlock, TextMeasureKey, TextSystem, measure_key};
 use crate::window::WindowSize;
@@ -33,8 +34,11 @@ pub(crate) struct RetainedNode {
     pub children: SmallVec<[NodeId; 4]>,
     pub kind: NodeKind,
     pub key: Option<u64>,
+    pub owner_view_id: Option<u64>,
     pub style: ResolvedStyle,
     pub window_frame_area: Option<WindowFrameArea>,
+    pub interaction: crate::element::InteractionState,
+    pub semantics: crate::semantics::SemanticsState,
     pub layout: LayoutBox,
     pub dirty: DirtyLaneMask,
     pub(super) compiled_fragment: Option<Arc<CompiledSubtreeFragment>>,
@@ -286,6 +290,161 @@ impl RetainedTree {
     pub fn collect_window_frame_areas(&self) -> Vec<(WindowFrameArea, LayoutBox)> {
         collect_window_frame_areas(self)
     }
+
+    pub(crate) fn retained_node(&self, node_id: NodeId) -> &RetainedNode {
+        &self.nodes[node_id]
+    }
+
+    pub(crate) fn try_retained_node(&self, node_id: NodeId) -> Option<&RetainedNode> {
+        self.nodes.get(node_id)
+    }
+
+    pub(crate) fn absolute_layout_box(&self, node_id: NodeId) -> LayoutBox {
+        let target = &self.nodes[node_id];
+        let mut current = Some(node_id);
+        let mut x = 0.0;
+        let mut y = 0.0;
+        let width = target.layout.width;
+        let height = target.layout.height;
+
+        while let Some(id) = current {
+            let node = &self.nodes[id];
+            x += node.layout.x;
+            y += node.layout.y;
+            current = node.parent;
+        }
+
+        LayoutBox {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub fn focusable_node_at(
+        &self,
+        point: crate::style::Point<crate::style::Px>,
+    ) -> Option<NodeId> {
+        focusable_node_at(self, self.root, point, [0.0, 0.0])
+    }
+
+    pub fn text_input_node_at(
+        &self,
+        point: crate::style::Point<crate::style::Px>,
+    ) -> Option<NodeId> {
+        text_input_node_at(self, self.root, point, [0.0, 0.0])
+    }
+
+    pub fn first_focusable_node(&self) -> Option<NodeId> {
+        first_focusable_node(self, self.root)
+    }
+}
+
+fn focusable_node_at(
+    tree: &RetainedTree,
+    node_id: NodeId,
+    point: crate::style::Point<crate::style::Px>,
+    offset: [f32; 2],
+) -> Option<NodeId> {
+    let node = &tree.nodes[node_id];
+    if !node_is_rendered(node) {
+        return None;
+    }
+
+    let absolute = LayoutBox {
+        x: offset[0] + node.layout.x,
+        y: offset[1] + node.layout.y,
+        width: node.layout.width,
+        height: node.layout.height,
+    };
+    if !layout_box_contains_point(absolute, point) {
+        return None;
+    }
+
+    let child_offset = [absolute.x, absolute.y];
+    for child_id in node.children.iter().rev().copied() {
+        if let Some(hit) = focusable_node_at(tree, child_id, point, child_offset) {
+            return Some(hit);
+        }
+    }
+
+    match node.interaction.focus_policy {
+        FocusPolicy::Keyboard | FocusPolicy::TextInput if !node.semantics.disabled => Some(node_id),
+        FocusPolicy::None => None,
+        _ => None,
+    }
+}
+
+fn text_input_node_at(
+    tree: &RetainedTree,
+    node_id: NodeId,
+    point: crate::style::Point<crate::style::Px>,
+    offset: [f32; 2],
+) -> Option<NodeId> {
+    let node = &tree.nodes[node_id];
+    if !node_is_rendered(node) {
+        return None;
+    }
+
+    let absolute = LayoutBox {
+        x: offset[0] + node.layout.x,
+        y: offset[1] + node.layout.y,
+        width: node.layout.width,
+        height: node.layout.height,
+    };
+    if !layout_box_contains_point(absolute, point) {
+        return None;
+    }
+
+    let child_offset = [absolute.x, absolute.y];
+    for child_id in node.children.iter().rev().copied() {
+        if let Some(hit) = text_input_node_at(tree, child_id, point, child_offset) {
+            return Some(hit);
+        }
+    }
+
+    matches!(node.interaction.focus_policy, FocusPolicy::TextInput)
+        .then_some(node_id)
+        .filter(|_| !node.semantics.disabled)
+}
+
+fn first_focusable_node(tree: &RetainedTree, node_id: NodeId) -> Option<NodeId> {
+    let node = &tree.nodes[node_id];
+    if !node_is_rendered(node) {
+        return None;
+    }
+
+    if matches!(
+        node.interaction.focus_policy,
+        FocusPolicy::Keyboard | FocusPolicy::TextInput
+    ) && !node.semantics.disabled
+    {
+        return Some(node_id);
+    }
+
+    for child_id in node.children.iter().copied() {
+        if let Some(found) = first_focusable_node(tree, child_id) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+fn layout_box_contains_point(
+    layout: LayoutBox,
+    point: crate::style::Point<crate::style::Px>,
+) -> bool {
+    let x = point.x.get();
+    let y = point.y.get();
+    x >= layout.x && x <= layout.x + layout.width && y >= layout.y && y <= layout.y + layout.height
+}
+
+fn node_is_rendered(node: &RetainedNode) -> bool {
+    node.layout.width > 0.0
+        && node.layout.height > 0.0
+        && !matches!(node.style.layout.display, crate::style::Display::None)
 }
 
 #[cfg(test)]
@@ -391,6 +550,97 @@ mod tests {
             }
             _ => panic!("expected text node"),
         }
+    }
+
+    #[test]
+    fn owner_view_id_and_semantics_propagate_into_retained_nodes() {
+        struct AccessibleView;
+
+        impl Render for AccessibleView {
+            fn render(
+                &mut self,
+                _window: &WindowInfo,
+                _cx: &mut crate::Context<'_, Self>,
+            ) -> impl IntoElement {
+                crate::div()
+                    .focusable()
+                    .semantics_role(crate::SemanticsRole::Button)
+                    .semantics_label("action")
+                    .child(crate::text("press"))
+            }
+        }
+
+        let app = App::new(Vec::new());
+        let view = app.insert_view(AccessibleView);
+        let window = test_window(WindowSize::new(320, 200), WindowSize::new(320, 200), 1.0);
+        let root = crate::div().child(view).into_any_element();
+        let mut arena = SpecArena::new();
+        let built = app.build_root_spec(&window, &root, &mut arena).unwrap();
+        let mut tree = RetainedTree::from_spec(&arena, built.root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+
+        let child = tree.children(tree.root_id())[0];
+        let child_node = tree.node(child);
+        assert_eq!(child_node.owner_view_id, Some(view.id()));
+        assert_eq!(child_node.semantics.role, crate::SemanticsRole::Button);
+        assert_eq!(child_node.semantics.label.as_deref(), Some("action"));
+    }
+
+    #[test]
+    fn pointer_hit_testing_skips_non_rendered_focusable_nodes() {
+        let root = crate::div()
+            .child(
+                crate::div()
+                    .display(crate::style::Display::None)
+                    .focusable()
+                    .text_input(crate::TextInputPurpose::Normal),
+            )
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+
+        let hidden_hit = tree.focusable_node_at(crate::style::point(px(0.0), px(0.0)));
+        let hidden_text_input = tree.text_input_node_at(crate::style::point(px(0.0), px(0.0)));
+        assert!(hidden_hit.is_none());
+        assert!(hidden_text_input.is_none());
+    }
+
+    #[test]
+    fn focusable_and_text_input_hit_testing_follow_interaction_metadata() {
+        let root = crate::div()
+            .child(
+                crate::div()
+                    .w(px(100.0))
+                    .h(px(40.0))
+                    .focusable()
+                    .semantics_role(crate::SemanticsRole::Button),
+            )
+            .child(
+                crate::div()
+                    .w(px(100.0))
+                    .h(px(40.0))
+                    .mt(px(50.0))
+                    .text_input(crate::TextInputPurpose::Normal),
+            )
+            .into_any_element();
+
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(320, 200), &mut text_system);
+
+        let second = tree.children(tree.root_id())[1];
+        let second_layout = tree.node(second).layout;
+        let focusable = tree.focusable_node_at(crate::style::point(px(10.0), px(10.0)));
+        let text_input = tree.text_input_node_at(crate::style::point(
+            px(second_layout.x + 10.0),
+            px(second_layout.y + second_layout.height * 0.5),
+        ));
+        assert!(focusable.is_some());
+        assert!(text_input.is_some());
+        assert_ne!(focusable, text_input);
     }
 
     #[test]

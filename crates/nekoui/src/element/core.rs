@@ -1,6 +1,7 @@
 use smallvec::SmallVec;
 
 use crate::app::View;
+use crate::input::{FocusPolicy, TextInputState};
 
 use super::div::Div;
 use super::text::Text;
@@ -31,6 +32,12 @@ pub(crate) enum WindowFrameArea {
     Close,
     Maximize,
     Minimize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct InteractionState {
+    pub(crate) focus_policy: FocusPolicy,
+    pub(crate) text_input: Option<TextInputState>,
 }
 
 pub trait IntoElement: Sized {

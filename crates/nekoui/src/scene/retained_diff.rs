@@ -63,7 +63,10 @@ fn diff_div(
             .expect("div style patch must succeed");
     }
     tree.nodes[node_id].key = spec.key;
+    tree.nodes[node_id].owner_view_id = spec.owner_view_id;
     tree.nodes[node_id].window_frame_area = spec.window_frame_area;
+    tree.nodes[node_id].interaction = spec.interaction.clone();
+    tree.nodes[node_id].semantics = spec.semantics.clone();
 
     let child_dirty = sync_children(tree, node_id, arena, arena.child_ids(spec_id).as_slice());
     dirty |= child_dirty;
@@ -116,7 +119,10 @@ fn diff_text(
         }
     }
     tree.nodes[node_id].key = spec.key;
+    tree.nodes[node_id].owner_view_id = spec.owner_view_id;
     tree.nodes[node_id].window_frame_area = spec.window_frame_area;
+    tree.nodes[node_id].interaction = spec.interaction.clone();
+    tree.nodes[node_id].semantics = spec.semantics.clone();
 
     if style_change.layout || style_change.text_shape || content_changed {
         tree.taffy

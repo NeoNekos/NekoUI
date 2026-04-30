@@ -12,4 +12,4 @@ pub(crate) use primitive::{
     MaterialClass, Primitive, PrimitiveRange, RectFill, RectPrimitive, SceneNode, SceneNodeId,
     Transform2D,
 };
-pub(crate) use retained::RetainedTree;
+pub(crate) use retained::{NodeId, RetainedTree};

@@ -3,10 +3,11 @@ use smallvec::SmallVec;
 
 use crate::SharedString;
 use crate::error::RuntimeError;
+use crate::semantics::SemanticsState;
 use crate::style::{ResolvedStyle, ResolvedTextStyle};
 use crate::window::WindowInfo;
 
-use super::core::{AnyElement, AnyElementKind, Fragment, WindowFrameArea};
+use super::core::{AnyElement, AnyElementKind, Fragment, InteractionState, WindowFrameArea};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SpecNodeId(usize);
@@ -29,6 +30,9 @@ pub(crate) struct SpecNode {
     pub key: Option<u64>,
     pub style: ResolvedStyle,
     pub window_frame_area: Option<WindowFrameArea>,
+    pub owner_view_id: Option<u64>,
+    pub interaction: InteractionState,
+    pub semantics: SemanticsState,
     pub payload: SpecPayload,
     pub first_child: Option<SpecNodeId>,
     pub next_sibling: Option<SpecNodeId>,
@@ -52,6 +56,7 @@ pub(crate) struct BuildCx<'a> {
     window: &'a WindowInfo,
     view_resolver: &'a mut ViewResolver<'a>,
     referenced_views: HashSet<u64>,
+    current_owner_view: Option<u64>,
 }
 
 impl SpecArena {
@@ -101,6 +106,7 @@ impl<'a> BuildCx<'a> {
             window,
             view_resolver,
             referenced_views: HashSet::new(),
+            current_owner_view: None,
         }
     }
 
@@ -122,8 +128,12 @@ impl<'a> BuildCx<'a> {
             AnyElementKind::Text(text) => self.lower_text(text, inherited_text),
             AnyElementKind::View(view) => {
                 self.referenced_views.insert(view.entity_id);
+                let previous_owner = self.current_owner_view;
+                self.current_owner_view = Some(view.entity_id);
                 let rendered = (self.view_resolver)(view.entity_id, self.window)?;
-                self.lower_any(rendered, inherited_text)
+                let lowered = self.lower_any(rendered, inherited_text);
+                self.current_owner_view = previous_owner;
+                lowered
             }
         }
     }
@@ -141,6 +151,9 @@ impl<'a> BuildCx<'a> {
             key: div.key,
             style: resolved_style,
             window_frame_area: div.window_frame_area,
+            owner_view_id: self.current_owner_view,
+            interaction: div.interaction.clone(),
+            semantics: div.semantics.clone(),
             payload: SpecPayload::None,
             first_child,
             next_sibling: None,
@@ -157,6 +170,15 @@ impl<'a> BuildCx<'a> {
             key: text.key,
             style: text.style.resolve_with_parent(inherited_text),
             window_frame_area: text.window_frame_area,
+            owner_view_id: self.current_owner_view,
+            interaction: text.interaction.clone(),
+            semantics: if text.semantics.label.is_none() {
+                let mut semantics = text.semantics.clone();
+                semantics.label = Some(text.content.clone());
+                semantics
+            } else {
+                text.semantics.clone()
+            },
             payload: SpecPayload::Text(text.content.clone()),
             first_child: None,
             next_sibling: None,

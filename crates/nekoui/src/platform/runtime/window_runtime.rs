@@ -13,6 +13,7 @@ use crate::scene::RetainedTree;
 use crate::window::{Window, WindowSize};
 
 use super::super::wgpu::WindowRenderState;
+use super::input::{FocusManager, InputRouter, TextInputTarget};
 
 pub(crate) struct RuntimeWindow {
     pub(crate) _internal_id: crate::WindowId,
@@ -28,6 +29,9 @@ pub(crate) struct RuntimeWindow {
     pub(crate) frame_scheduler: FrameSchedulerState,
     pub(crate) generation_state: WindowGenerationState,
     pub(crate) cursor_position: Option<PhysicalPosition<f64>>,
+    pub(crate) focus_manager: FocusManager,
+    pub(crate) input_router: InputRouter,
+    pub(crate) text_input_target: TextInputTarget,
     #[cfg(target_os = "linux")]
     pub(crate) linux_route: LinuxWindowRoute,
     #[cfg(target_os = "macos")]
