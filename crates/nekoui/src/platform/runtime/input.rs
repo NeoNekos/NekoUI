@@ -1,4 +1,6 @@
-use crate::input::{CaretRect, PointerButton, PointerEvent, PointerPhase, TextInputPurpose};
+use crate::input::{
+    CaretRect, InputNodeId, PointerButton, PointerEvent, PointerPhase, TextInputPurpose,
+};
 use crate::scene::{NodeId, RetainedTree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +29,7 @@ impl FocusManager {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct TextInputTarget {
     pub(crate) node: Option<NodeId>,
+    pub(crate) input_id: Option<InputNodeId>,
     pub(crate) ime_allowed: bool,
     pub(crate) purpose: TextInputPurpose,
     pub(crate) caret_rect: Option<CaretRect>,

@@ -21,7 +21,7 @@ pub use element::{
 pub use error::{Error, PlatformError, RuntimeError};
 pub use input::{
     CaretRect, FocusPolicy, InputNodeId, PointerButton, PointerEvent, PointerPhase,
-    TextInputPurpose, TextInputState,
+    TextInputEvent, TextInputPurpose, TextInputState,
 };
 pub use semantics::{SemanticsRole, SemanticsState};
 pub use style::{

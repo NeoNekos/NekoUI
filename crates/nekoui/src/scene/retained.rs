@@ -6,8 +6,8 @@ use taffy::prelude::{AvailableSpace, NodeId as TaffyNodeId, Size as TaffySize, T
 
 use crate::SharedString;
 use crate::element::{SpecArena, SpecNode, SpecNodeId, SpecPayload, WindowFrameArea};
-use crate::input::FocusPolicy;
-use crate::style::{Background, ResolvedStyle, ResolvedTextStyle};
+use crate::input::{FocusPolicy, InputNodeId};
+use crate::style::{Background, Overflow, ResolvedStyle, ResolvedTextStyle};
 use crate::text_system::{SharedTextLayout, TextBlock, TextMeasureKey, TextSystem, measure_key};
 use crate::window::WindowSize;
 
@@ -38,6 +38,7 @@ pub(crate) struct RetainedNode {
     pub style: ResolvedStyle,
     pub window_frame_area: Option<WindowFrameArea>,
     pub interaction: crate::element::InteractionState,
+    pub input_id: Option<InputNodeId>,
     pub semantics: crate::semantics::SemanticsState,
     pub layout: LayoutBox,
     pub dirty: DirtyLaneMask,
@@ -326,18 +327,30 @@ impl RetainedTree {
         &self,
         point: crate::style::Point<crate::style::Px>,
     ) -> Option<NodeId> {
-        focusable_node_at(self, self.root, point, [0.0, 0.0])
+        focusable_node_at(self, self.root, point, [0.0, 0.0], &[])
     }
 
     pub fn text_input_node_at(
         &self,
         point: crate::style::Point<crate::style::Px>,
     ) -> Option<NodeId> {
-        text_input_node_at(self, self.root, point, [0.0, 0.0])
+        text_input_node_at(self, self.root, point, [0.0, 0.0], &[])
     }
 
+    #[allow(dead_code)]
     pub fn first_focusable_node(&self) -> Option<NodeId> {
         first_focusable_node(self, self.root)
+    }
+
+    pub fn next_focusable_node(&self, current: Option<NodeId>) -> Option<NodeId> {
+        let first = self.first_focusable_node()?;
+        let mut focusables = Vec::new();
+        collect_focusable_nodes(self, self.root, &mut focusables);
+        match current.and_then(|current| focusables.iter().position(|node| *node == current)) {
+            Some(index) if index + 1 < focusables.len() => Some(focusables[index + 1]),
+            Some(_) => Some(first),
+            None => Some(first),
+        }
     }
 }
 
@@ -346,34 +359,14 @@ fn focusable_node_at(
     node_id: NodeId,
     point: crate::style::Point<crate::style::Px>,
     offset: [f32; 2],
+    clip_stack: &[crate::scene::ClipShape],
 ) -> Option<NodeId> {
-    let node = &tree.nodes[node_id];
-    if !node_is_rendered(node) {
-        return None;
-    }
-
-    let absolute = LayoutBox {
-        x: offset[0] + node.layout.x,
-        y: offset[1] + node.layout.y,
-        width: node.layout.width,
-        height: node.layout.height,
-    };
-    if !layout_box_contains_point(absolute, point) {
-        return None;
-    }
-
-    let child_offset = [absolute.x, absolute.y];
-    for child_id in node.children.iter().rev().copied() {
-        if let Some(hit) = focusable_node_at(tree, child_id, point, child_offset) {
-            return Some(hit);
-        }
-    }
-
-    match node.interaction.focus_policy {
-        FocusPolicy::Keyboard | FocusPolicy::TextInput if !node.semantics.disabled => Some(node_id),
-        FocusPolicy::None => None,
-        _ => None,
-    }
+    hit_test_node(tree, node_id, point, offset, clip_stack, |node| {
+        matches!(
+            node.interaction.focus_policy,
+            FocusPolicy::Keyboard | FocusPolicy::TextInput
+        ) && !node.semantics.disabled
+    })
 }
 
 fn text_input_node_at(
@@ -381,34 +374,14 @@ fn text_input_node_at(
     node_id: NodeId,
     point: crate::style::Point<crate::style::Px>,
     offset: [f32; 2],
+    clip_stack: &[crate::scene::ClipShape],
 ) -> Option<NodeId> {
-    let node = &tree.nodes[node_id];
-    if !node_is_rendered(node) {
-        return None;
-    }
-
-    let absolute = LayoutBox {
-        x: offset[0] + node.layout.x,
-        y: offset[1] + node.layout.y,
-        width: node.layout.width,
-        height: node.layout.height,
-    };
-    if !layout_box_contains_point(absolute, point) {
-        return None;
-    }
-
-    let child_offset = [absolute.x, absolute.y];
-    for child_id in node.children.iter().rev().copied() {
-        if let Some(hit) = text_input_node_at(tree, child_id, point, child_offset) {
-            return Some(hit);
-        }
-    }
-
-    matches!(node.interaction.focus_policy, FocusPolicy::TextInput)
-        .then_some(node_id)
-        .filter(|_| !node.semantics.disabled)
+    hit_test_node(tree, node_id, point, offset, clip_stack, |node| {
+        matches!(node.interaction.focus_policy, FocusPolicy::TextInput) && !node.semantics.disabled
+    })
 }
 
+#[allow(dead_code)]
 fn first_focusable_node(tree: &RetainedTree, node_id: NodeId) -> Option<NodeId> {
     let node = &tree.nodes[node_id];
     if !node_is_rendered(node) {
@@ -432,6 +405,89 @@ fn first_focusable_node(tree: &RetainedTree, node_id: NodeId) -> Option<NodeId> 
     None
 }
 
+fn collect_focusable_nodes(tree: &RetainedTree, node_id: NodeId, out: &mut Vec<NodeId>) {
+    let node = &tree.nodes[node_id];
+    if !node_is_rendered(node) {
+        return;
+    }
+
+    if matches!(
+        node.interaction.focus_policy,
+        FocusPolicy::Keyboard | FocusPolicy::TextInput
+    ) && !node.semantics.disabled
+    {
+        out.push(node_id);
+    }
+
+    for child_id in node.children.iter().copied() {
+        collect_focusable_nodes(tree, child_id, out);
+    }
+}
+
+fn hit_test_node<F>(
+    tree: &RetainedTree,
+    node_id: NodeId,
+    point: crate::style::Point<crate::style::Px>,
+    offset: [f32; 2],
+    clip_stack: &[crate::scene::ClipShape],
+    matches: F,
+) -> Option<NodeId>
+where
+    F: Fn(&RetainedNode) -> bool + Copy,
+{
+    let node = &tree.nodes[node_id];
+    if !node_is_rendered(node) {
+        return None;
+    }
+
+    let absolute = LayoutBox {
+        x: offset[0] + node.layout.x,
+        y: offset[1] + node.layout.y,
+        width: node.layout.width,
+        height: node.layout.height,
+    };
+
+    for clip in clip_stack {
+        if !clip_contains_point(*clip, point) {
+            return None;
+        }
+    }
+
+    let mut next_clip_stack = clip_stack.to_vec();
+    if matches!(node.style.layout.overflow, Overflow::Hidden) {
+        next_clip_stack.push(clip_shape_for_node(
+            node.style.layout.overflow,
+            absolute,
+            &node.style.paint,
+        )?);
+    }
+
+    let child_clip_stack = match node.style.layout.overflow {
+        Overflow::Hidden => next_clip_stack.as_slice(),
+        Overflow::Visible => clip_stack,
+    };
+
+    let child_offset = [absolute.x, absolute.y];
+    for child_id in node.children.iter().rev().copied() {
+        if let Some(hit) = hit_test_node(
+            tree,
+            child_id,
+            point,
+            child_offset,
+            child_clip_stack,
+            matches,
+        ) {
+            return Some(hit);
+        }
+    }
+
+    if layout_box_contains_point(absolute, point) && matches(node) {
+        Some(node_id)
+    } else {
+        None
+    }
+}
+
 fn layout_box_contains_point(
     layout: LayoutBox,
     point: crate::style::Point<crate::style::Px>,
@@ -439,6 +495,89 @@ fn layout_box_contains_point(
     let x = point.x.get();
     let y = point.y.get();
     x >= layout.x && x <= layout.x + layout.width && y >= layout.y && y <= layout.y + layout.height
+}
+
+fn clip_contains_point(clip: crate::scene::ClipShape, point: crate::style::Point<crate::style::Px>) -> bool {
+    match clip {
+        crate::scene::ClipShape::Rect(bounds) => layout_box_contains_point(bounds, point),
+        crate::scene::ClipShape::RoundedRect {
+            bounds,
+            corner_radii,
+        } => rounded_rect_contains_point(bounds, corner_radii, point),
+    }
+}
+
+fn clip_shape_for_node(
+    overflow: Overflow,
+    bounds: LayoutBox,
+    paint: &crate::style::PaintStyle,
+) -> Option<crate::scene::ClipShape> {
+    if overflow != Overflow::Hidden {
+        return None;
+    }
+
+    if has_non_zero_corner_radii(paint.corner_radii) {
+        Some(crate::scene::ClipShape::RoundedRect {
+            bounds,
+            corner_radii: paint.corner_radii,
+        })
+    } else {
+        Some(crate::scene::ClipShape::Rect(bounds))
+    }
+}
+
+fn rounded_rect_contains_point(
+    bounds: LayoutBox,
+    corner_radii: crate::style::CornerRadii,
+    point: crate::style::Point<crate::style::Px>,
+) -> bool {
+    let x = point.x.get();
+    let y = point.y.get();
+    if x < bounds.x || x > bounds.x + bounds.width || y < bounds.y || y > bounds.y + bounds.height
+    {
+        return false;
+    }
+
+    let left = bounds.x;
+    let right = bounds.x + bounds.width;
+    let top = bounds.y;
+    let bottom = bounds.y + bounds.height;
+    let max_radius = 0.5 * bounds.width.min(bounds.height);
+    let tl = corner_radii.top_left.max(0.0).min(max_radius);
+    let tr = corner_radii.top_right.max(0.0).min(max_radius);
+    let br = corner_radii.bottom_right.max(0.0).min(max_radius);
+    let bl = corner_radii.bottom_left.max(0.0).min(max_radius);
+
+    let in_corner = |cx: f32, cy: f32, r: f32| {
+        if r <= 0.0 {
+            return true;
+        }
+        let dx = x - cx;
+        let dy = y - cy;
+        dx * dx + dy * dy <= r * r
+    };
+
+    if x < left + tl && y < top + tl {
+        return in_corner(left + tl, top + tl, tl);
+    }
+    if x > right - tr && y < top + tr {
+        return in_corner(right - tr, top + tr, tr);
+    }
+    if x > right - br && y > bottom - br {
+        return in_corner(right - br, bottom - br, br);
+    }
+    if x < left + bl && y > bottom - bl {
+        return in_corner(left + bl, bottom - bl, bl);
+    }
+
+    true
+}
+
+fn has_non_zero_corner_radii(corner_radii: crate::style::CornerRadii) -> bool {
+    corner_radii.top_left > 0.0
+        || corner_radii.top_right > 0.0
+        || corner_radii.bottom_right > 0.0
+        || corner_radii.bottom_left > 0.0
 }
 
 fn node_is_rendered(node: &RetainedNode) -> bool {
@@ -641,6 +780,108 @@ mod tests {
         assert!(focusable.is_some());
         assert!(text_input.is_some());
         assert_ne!(focusable, text_input);
+    }
+
+    #[test]
+    fn next_focusable_node_advances_in_tree_order() {
+        let root = crate::div()
+            .child(crate::div().w(px(20.0)).h(px(20.0)).focusable())
+            .child(crate::div().w(px(20.0)).h(px(20.0)).focusable())
+            .child(crate::div().w(px(20.0)).h(px(20.0)).focusable())
+            .into_any_element();
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(160, 120), &mut text_system);
+
+        let first = tree.first_focusable_node().unwrap();
+        let second = tree.next_focusable_node(Some(first)).unwrap();
+        let third = tree.next_focusable_node(Some(second)).unwrap();
+        let wrapped = tree.next_focusable_node(Some(third)).unwrap();
+
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert_eq!(wrapped, first);
+    }
+
+    #[test]
+    fn clipped_children_do_not_receive_focus_or_text_hits() {
+        let root = crate::div()
+            .w(px(80.0))
+            .h(px(40.0))
+            .p(px(0.0))
+            .overflow_hidden()
+            .child(
+                crate::div()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .mt(px(50.0))
+                    .focusable()
+                    .text_input(crate::TextInputPurpose::Normal),
+            )
+            .into_any_element();
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(160, 120), &mut text_system);
+
+        assert!(tree
+            .focusable_node_at(crate::style::point(px(10.0), px(10.0)))
+            .is_none());
+        assert!(tree
+            .text_input_node_at(crate::style::point(px(10.0), px(10.0)))
+            .is_none());
+    }
+
+    #[test]
+    fn rounded_clipped_children_do_not_receive_hits_in_cut_corners() {
+        let root = crate::div()
+            .w(px(80.0))
+            .h(px(80.0))
+            .overflow_hidden()
+            .corner_radii(crate::style::CornerRadii::all(24.0))
+            .child(
+                crate::div()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .mt(px(2.0))
+                    .ml(px(2.0))
+                    .focusable()
+                    .text_input(crate::TextInputPurpose::Normal),
+            )
+            .into_any_element();
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(160, 120), &mut text_system);
+
+        assert!(tree
+            .focusable_node_at(crate::style::point(px(1.0), px(1.0)))
+            .is_none());
+        assert!(tree
+            .text_input_node_at(crate::style::point(px(1.0), px(1.0)))
+            .is_none());
+    }
+
+    #[test]
+    fn rounded_clip_hit_testing_clamps_oversized_radii_like_shader() {
+        let root = crate::div()
+            .w(px(80.0))
+            .h(px(20.0))
+            .overflow_hidden()
+            .corner_radii(CornerRadii::all(999.0))
+            .child(
+                crate::div()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .focusable()
+                    .text_input(crate::TextInputPurpose::Normal),
+            )
+            .into_any_element();
+        let mut tree = build_static_tree(root);
+        let mut text_system = TextSystem::new();
+        tree.compute_layout(WindowSize::new(160, 120), &mut text_system);
+
+        let point = crate::style::point(px(5.0), px(10.0));
+        assert!(tree.focusable_node_at(point).is_some());
+        assert!(tree.text_input_node_at(point).is_some());
     }
 
     #[test]

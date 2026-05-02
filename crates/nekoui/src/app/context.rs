@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::{Error, RuntimeError};
+use crate::input::TextInputEvent;
 use crate::scene::DirtyLaneMask;
 use crate::window::{DisplayInfo, WindowHandle, WindowInfo, WindowOptions};
 
@@ -14,7 +15,7 @@ use super::executor::{BackgroundExecutor, UiExecutor};
 use super::handle::{Entity, View};
 use super::runtime::{
     EventSubscription, EventSubscriptionKey, ObserveSubscription, PendingWindowRequest,
-    QueuedEvent, RuntimeState, merge_lane,
+    QueuedEvent, RuntimeState, TextInputSubscription, merge_lane,
 };
 use super::{App, Render};
 
@@ -315,6 +316,93 @@ impl<'a, T: 'static> Context<'a, T> {
                 payload: Box::new(event),
             });
         Ok(())
+    }
+
+    pub fn subscribe_text_input<U>(
+        &mut self,
+        entity: &Entity<U>,
+        f: impl FnMut(&mut T, Entity<U>, &TextInputEvent, &mut Context<'_, T>) + 'static,
+    ) -> Result<Subscription, RuntimeError>
+    where
+        U: 'static,
+    {
+        if !self.registration_target_exists(self.entity.id()) {
+            return Err(RuntimeError::EntityNotFound(self.entity.id()));
+        }
+        let active = Arc::new(AtomicBool::new(true));
+        let mut callback = f;
+        let target_id = self.entity.id();
+        let source_id = entity.id();
+
+        self.runtime
+            .borrow_mut()
+            .text_input_subscriptions
+            .entry(source_id)
+            .or_default()
+            .push(TextInputSubscription {
+                active: active.clone(),
+                callback: Box::new(move |runtime, emitted_by, event| {
+                    let (background_executor, ui_executor) = {
+                        let runtime = runtime.borrow();
+                        (
+                            runtime.background_executor.clone(),
+                            runtime.ui_executor.clone(),
+                        )
+                    };
+                    let boxed = runtime
+                        .borrow_mut()
+                        .entities
+                        .remove(&target_id)
+                        .ok_or(RuntimeError::EntityNotFound(target_id))?;
+                    let mut typed = boxed
+                        .downcast::<T>()
+                        .map_err(|_| RuntimeError::TypeMismatch(target_id))?;
+
+                    {
+                        let mut cx = Context::new(
+                            Entity::from_raw(target_id),
+                            runtime.clone(),
+                            background_executor,
+                            ui_executor,
+                        );
+                        callback(
+                            typed.as_mut(),
+                            Entity::from_raw(emitted_by),
+                            event,
+                            &mut cx,
+                        );
+                    }
+
+                    runtime
+                        .borrow_mut()
+                        .entities
+                        .insert(target_id, typed as Box<dyn Any>);
+                    Ok(())
+                }),
+            });
+
+        Ok(Subscription { active })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscribe_text_input_target<U>(
+        &mut self,
+        entity: &Entity<U>,
+        target: crate::input::InputNodeId,
+        mut f: impl FnMut(&mut T, Entity<U>, &TextInputEvent, &mut Context<'_, T>) + 'static,
+    ) -> Result<Subscription, RuntimeError>
+    where
+        U: 'static,
+    {
+        self.subscribe_text_input(entity, move |state, source, event, cx| {
+            let target_matches = match event {
+                TextInputEvent::Commit { target: event_target, .. }
+                | TextInputEvent::Preedit { target: event_target, .. } => *event_target == target,
+            };
+            if target_matches {
+                f(state, source, event, cx);
+            }
+        })
     }
 
     pub fn background_executor(&self) -> BackgroundExecutor {

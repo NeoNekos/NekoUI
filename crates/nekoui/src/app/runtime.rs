@@ -10,6 +10,7 @@ use hashbrown::HashMap;
 
 use crate::element::{AnyElement, BuildCx, BuildResult, IntoElement, SpecArena};
 use crate::error::{Error, RuntimeError};
+use crate::input::TextInputEvent;
 use crate::platform::window::{WindowCommand, WindowCommandSender};
 use crate::scene::DirtyLaneMask;
 use crate::window::{DisplayId, DisplayInfo, WindowHandle, WindowId, WindowInfo, WindowOptions};
@@ -24,6 +25,8 @@ type ViewRenderer =
 type ObserveCallback = Box<dyn FnMut(&Rc<RefCell<RuntimeState>>, u64) -> Result<(), RuntimeError>>;
 type EventCallback =
     Box<dyn FnMut(&Rc<RefCell<RuntimeState>>, u64, &dyn Any) -> Result<(), RuntimeError>>;
+type TextInputCallback =
+    Box<dyn FnMut(&Rc<RefCell<RuntimeState>>, u64, &TextInputEvent) -> Result<(), RuntimeError>>;
 
 pub(crate) struct App {
     runtime: Rc<RefCell<RuntimeState>>,
@@ -45,6 +48,7 @@ pub(in crate::app) struct RuntimeState {
     pub(in crate::app) view_renderers: HashMap<u64, ViewRenderer>,
     pub(in crate::app) observe_subscriptions: HashMap<u64, Vec<ObserveSubscription>>,
     pub(in crate::app) event_subscriptions: HashMap<EventSubscriptionKey, Vec<EventSubscription>>,
+    pub(in crate::app) text_input_subscriptions: HashMap<u64, Vec<TextInputSubscription>>,
     pub(in crate::app) pending_events: VecDeque<QueuedEvent>,
 }
 
@@ -62,6 +66,11 @@ pub(in crate::app) struct EventSubscriptionKey {
 pub(in crate::app) struct EventSubscription {
     pub(in crate::app) active: Arc<AtomicBool>,
     pub(in crate::app) callback: EventCallback,
+}
+
+pub(in crate::app) struct TextInputSubscription {
+    pub(in crate::app) active: Arc<AtomicBool>,
+    pub(in crate::app) callback: TextInputCallback,
 }
 
 pub(in crate::app) struct QueuedEvent {
@@ -99,6 +108,7 @@ impl App {
                 view_renderers: HashMap::new(),
                 observe_subscriptions: HashMap::new(),
                 event_subscriptions: HashMap::new(),
+                text_input_subscriptions: HashMap::new(),
                 pending_events: VecDeque::new(),
             })),
             pending_windows: VecDeque::new(),
@@ -307,6 +317,35 @@ impl App {
         }
 
         Ok(result)
+    }
+
+    pub(crate) fn dispatch_text_input_event(
+        &self,
+        source_id: u64,
+        event: &TextInputEvent,
+    ) -> Result<(), RuntimeError> {
+        let mut callbacks = {
+            let mut runtime = self.runtime.borrow_mut();
+            std::mem::take(runtime.text_input_subscriptions.entry(source_id).or_default())
+        };
+
+        for subscription in &mut callbacks {
+            if subscription.active.load(Ordering::Relaxed) {
+                (subscription.callback)(&self.runtime, source_id, event)?;
+            }
+        }
+
+        callbacks.retain(|subscription| subscription.active.load(Ordering::Relaxed));
+        if !callbacks.is_empty() {
+            self.runtime
+                .borrow_mut()
+                .text_input_subscriptions
+                .entry(source_id)
+                .or_default()
+                .append(&mut callbacks);
+        }
+
+        Ok(())
     }
 
     pub(crate) fn build_root_spec(

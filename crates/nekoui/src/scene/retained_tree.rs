@@ -3,6 +3,7 @@ use taffy::prelude::NodeId as TaffyNodeId;
 
 use crate::SharedString;
 use crate::element::{SpecArena, SpecKind, SpecNodeId, SpecPayload, WindowFrameArea};
+use crate::input::InputNodeId;
 use crate::style::{ResolvedStyle, ResolvedTextStyle};
 use crate::text_system::{SharedTextLayout, TextMeasureKey};
 
@@ -58,6 +59,11 @@ fn build_div(
         style: spec.style.clone(),
         window_frame_area: spec.window_frame_area,
         interaction: spec.interaction.clone(),
+        input_id: spec
+            .interaction
+            .text_input
+            .as_ref()
+            .map(|_| InputNodeId::new()),
         semantics: spec.semantics.clone(),
         layout: crate::scene::LayoutBox::default(),
         dirty: DirtyLaneMask::BUILD.normalized(),
@@ -105,6 +111,11 @@ fn build_text(
         style: spec.style.clone(),
         window_frame_area: spec.window_frame_area,
         interaction: spec.interaction.clone(),
+        input_id: spec
+            .interaction
+            .text_input
+            .as_ref()
+            .map(|_| InputNodeId::new()),
         semantics: spec.semantics.clone(),
         layout: crate::scene::LayoutBox::default(),
         dirty: DirtyLaneMask::BUILD.normalized(),

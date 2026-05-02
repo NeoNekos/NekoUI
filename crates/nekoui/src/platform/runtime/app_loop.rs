@@ -12,7 +12,7 @@ use winit::window::WindowId as WinitWindowId;
 
 use crate::app::{App, AppContext, LastWindowBehavior};
 use crate::error::{Error, PlatformError};
-use crate::input::{CaretRect, PointerButton, PointerEvent, PointerPhase, TextInputPurpose};
+use crate::input::{CaretRect, PointerButton, PointerEvent, PointerPhase, TextInputEvent, TextInputPurpose};
 use crate::platform::wgpu::{RenderFramePackage, RenderOutcome, RenderSystem};
 #[cfg(target_os = "linux")]
 use crate::platform::window::native::linux::{
@@ -631,42 +631,93 @@ impl ApplicationHandler<RunnerEvent> for AppRuntime {
                 {
                     match &event.logical_key {
                         WinitKey::Named(NamedKey::Tab) => {
-                            let next = runtime_window.retained_tree.first_focusable_node();
+                            let next = runtime_window
+                                .retained_tree
+                                .next_focusable_node(runtime_window.focus_manager.focused());
                             if runtime_window.focus_manager.set_focused(next) {
                                 sync_text_input_target(runtime_window);
                                 apply_ime_target(runtime_window);
                                 mark_window_pending(runtime_window, FrameReasonMask::USER);
                             }
                         }
-                        WinitKey::Named(NamedKey::Escape)
-                            if runtime_window.focus_manager.set_focused(None) =>
-                        {
-                            sync_text_input_target(runtime_window);
-                            apply_ime_target(runtime_window);
-                            mark_window_pending(runtime_window, FrameReasonMask::USER);
+                        WinitKey::Named(NamedKey::Escape) => {
+                            if runtime_window.focus_manager.set_focused(None) {
+                                sync_text_input_target(runtime_window);
+                                apply_ime_target(runtime_window);
+                                mark_window_pending(runtime_window, FrameReasonMask::USER);
+                            }
                         }
                         _ => {}
                     }
                 }
             }
             WindowEvent::Ime(event) => {
+                let mut dispatched = None;
                 if let Some(runtime_window) = self.windows.get_mut(&window_id) {
-                    match event {
-                        Ime::Enabled => {
-                            runtime_window.text_input_target.ime_allowed = true;
-                        }
+                    dispatched = match event {
+                        Ime::Enabled => None,
                         Ime::Preedit(text, _) => {
-                            runtime_window.text_input_target.preedit =
-                                if text.is_empty() { None } else { Some(text) };
+                            let preedit = if text.is_empty() { None } else { Some(text) };
+                            runtime_window.text_input_target.preedit = preedit.clone();
+                            match (
+                                text_input_owner_view_id(runtime_window),
+                                runtime_window.text_input_target.input_id,
+                            ) {
+                                (Some(owner_view_id), Some(target)) => Some((
+                                    owner_view_id,
+                                    TextInputEvent::Preedit {
+                                        source: owner_view_id,
+                                        target,
+                                        text: preedit.map(Into::into),
+                                    },
+                                )),
+                                _ => None,
+                            }
                         }
-                        Ime::Commit(_text) => {
+                        Ime::Commit(text) => {
                             runtime_window.text_input_target.preedit = None;
+                            if text.is_empty() {
+                                None
+                            } else {
+                                match (
+                                    text_input_owner_view_id(runtime_window),
+                                    runtime_window.text_input_target.input_id,
+                                ) {
+                                    (Some(owner_view_id), Some(target)) => Some((
+                                        owner_view_id,
+                                        TextInputEvent::Commit {
+                                            source: owner_view_id,
+                                            target,
+                                            text: text.into(),
+                                        },
+                                    )),
+                                    _ => None,
+                                }
+                            }
                         }
                         Ime::Disabled => {
-                            runtime_window.text_input_target.ime_allowed = false;
                             runtime_window.text_input_target.preedit = None;
+                            match (
+                                text_input_owner_view_id(runtime_window),
+                                runtime_window.text_input_target.input_id,
+                            ) {
+                                (Some(owner_view_id), Some(target)) => Some((
+                                    owner_view_id,
+                                    TextInputEvent::Preedit {
+                                        source: owner_view_id,
+                                        target,
+                                        text: None,
+                                    },
+                                )),
+                                _ => None,
+                            }
                         }
-                    }
+                    };
+                }
+                if let Some((owner_view_id, text_input_event)) = dispatched {
+                    let _ = self
+                        .app
+                        .dispatch_text_input_event(owner_view_id, &text_input_event);
                 }
             }
             WindowEvent::Occluded(occluded) => {
@@ -935,6 +986,12 @@ fn sync_text_input_target(runtime_window: &mut RuntimeWindow) {
     });
 
     runtime_window.text_input_target.node = text_input_node;
+    runtime_window.text_input_target.input_id = text_input_node.and_then(|node| {
+        runtime_window
+            .retained_tree
+            .retained_node(node)
+            .input_id
+    });
     runtime_window.text_input_target.purpose = text_input_node
         .and_then(|node| {
             runtime_window
@@ -956,6 +1013,14 @@ fn sync_text_input_target(runtime_window: &mut RuntimeWindow) {
             ),
         }
     });
+}
+
+fn text_input_owner_view_id(runtime_window: &RuntimeWindow) -> Option<u64> {
+    let focused = runtime_window.focus_manager.focused()?;
+    runtime_window
+        .retained_tree
+        .retained_node(focused)
+        .owner_view_id
 }
 
 fn sync_focus_after_tree_update(runtime_window: &mut RuntimeWindow) {

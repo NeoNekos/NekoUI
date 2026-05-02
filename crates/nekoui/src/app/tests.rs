@@ -6,6 +6,7 @@ use super::{
 };
 use crate::element::SpecArena;
 use crate::element::{IntoElement, ParentElement};
+use crate::input::TextInputEvent;
 use crate::platform::window::WindowInfoSeed;
 use crate::window::{WindowId, WindowInfo, WindowOptions, WindowSize};
 
@@ -138,6 +139,149 @@ fn subscribe_and_emit_deliver_typed_events() {
     assert!(runtime.dirty_views.is_empty());
     let observer_value = app.update(observer, |state, _| state.value).unwrap();
     assert_eq!(observer_value, 7);
+}
+
+#[test]
+fn subscribe_text_input_delivers_commit_events() {
+    #[derive(Default)]
+    struct InputSource;
+    impl EventEmitter<TextInputEvent> for InputSource {}
+
+    #[derive(Default)]
+    struct InputSink {
+        committed: String,
+    }
+
+    let app = test_app();
+    let source: Entity<InputSource> = app.insert_entity(InputSource);
+    let sink = app.insert_entity(InputSink::default());
+
+    let _subscription = app
+        .update(sink, |_state, cx| {
+            cx.subscribe_text_input(&source, |sink_state, _, event, _| {
+                if let TextInputEvent::Commit { text, .. } = event {
+                    sink_state.committed.push_str(text.as_ref());
+                }
+            })
+            .unwrap()
+        })
+        .unwrap();
+
+    app.dispatch_text_input_event(
+        source.id(),
+        &TextInputEvent::Commit {
+            source: source.id(),
+            target: crate::InputNodeId::new(),
+            text: "ok".into(),
+        },
+    )
+        .unwrap();
+
+    let committed = app.update(sink, |state, _| state.committed.clone()).unwrap();
+    assert_eq!(committed, "ok");
+}
+
+#[test]
+fn subscribe_text_input_target_filters_node_id() {
+    #[derive(Default)]
+    struct InputSource;
+    impl EventEmitter<TextInputEvent> for InputSource {}
+
+    #[derive(Default)]
+    struct InputSink {
+        committed: String,
+    }
+
+    let app = test_app();
+    let source: Entity<InputSource> = app.insert_entity(InputSource);
+    let sink = app.insert_entity(InputSink::default());
+    let target = crate::InputNodeId::new();
+    let other = crate::InputNodeId::new();
+
+    let _subscription = app
+        .update(sink, |_state, cx| {
+            cx.subscribe_text_input_target(&source, target, |sink_state, _, event, _| {
+                if let TextInputEvent::Commit { text, .. } = event {
+                    sink_state.committed.push_str(text.as_ref());
+                }
+            })
+            .unwrap()
+        })
+        .unwrap();
+
+    app.dispatch_text_input_event(
+        source.id(),
+        &TextInputEvent::Commit {
+            source: source.id(),
+            target: other,
+            text: "no".into(),
+        },
+    )
+    .unwrap();
+    app.dispatch_text_input_event(
+        source.id(),
+        &TextInputEvent::Commit {
+            source: source.id(),
+            target,
+            text: "ok".into(),
+        },
+    )
+    .unwrap();
+
+    let committed = app.update(sink, |state, _| state.committed.clone()).unwrap();
+    assert_eq!(committed, "ok");
+}
+
+#[test]
+fn view_can_subscribe_to_its_own_text_input() {
+    #[derive(Default)]
+    struct InputView {
+        subscription: Option<super::Subscription>,
+        committed: String,
+    }
+
+    impl Render for InputView {
+        fn render(
+            &mut self,
+            _window: &WindowInfo,
+            cx: &mut super::Context<'_, Self>,
+        ) -> impl IntoElement {
+            let view = cx.entity();
+            if self.subscription.is_none() {
+                self.subscription = cx
+                    .subscribe_text_input(&view, |state, _, event, _| {
+                        if let TextInputEvent::Commit { text, .. } = event {
+                            state.committed.push_str(text.as_ref());
+                        }
+                    })
+                    .ok();
+            }
+            crate::div()
+                .child(crate::text("input").text_input(crate::TextInputPurpose::Normal))
+        }
+    }
+
+    let app = test_app();
+    let view = app.insert_view(InputView::default());
+    let root = crate::div().child(view).into_any_element();
+    let window = test_window(WindowSize::new(320, 200), WindowSize::new(320, 200), 1.0);
+    let mut arena = SpecArena::new();
+    let _ = app.build_root_spec(&window, &root, &mut arena).unwrap();
+
+    app.dispatch_text_input_event(
+        view.id(),
+        &TextInputEvent::Commit {
+            source: view.id(),
+            target: crate::InputNodeId::new(),
+            text: "ok".into(),
+        },
+    )
+    .unwrap();
+
+    let committed = app
+        .update(view.entity(), |state, _| state.committed.clone())
+        .unwrap();
+    assert_eq!(committed, "ok");
 }
 
 #[test]
