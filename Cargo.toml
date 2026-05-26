@@ -1,11 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/nekoui"]
+members = [
+    "crates/nekoui",
+]
 default-members = ["crates/nekoui"]
 
 [workspace.package]
-publish = false
-version = "0.0.7"
+version = "0.0.71"
 edition = "2024"
 authors = ["Yamrc <yamrci@outlook.com>"]
 license = "MPL-2.0"
@@ -13,29 +14,60 @@ license = "MPL-2.0"
 [workspace.dependencies]
 accesskit = { version = "0.24.0", default-features = false }
 accesskit_winit = { version = "0.32.2", default-features = false, features = ["rwh_06", "accesskit_unix", "async-io"] }
+arboard = { version = "3.6.1", default-features = false }
+ash = { version = "0.38.0", default-features = false, features = ["loaded"] }
 bitflags = { version = "2.6.0", default-features = false }
 bytemuck = { version = "1.25.0", default-features = false, features = ["derive"] }
 crossbeam-channel = { version = "0.5.15", default-features = false, features = ["std"] }
 cosmic-text = { version = "0.18.2", default-features = false, features = ["std", "swash"] }
 etagere = "0.2.15"
+fontdb = { version = "0.23.0", default-features = false, features = ["std", "fs", "memmap"] }
 hashbrown = { version = "0.15.2", default-features = false, features = ["default-hasher", "inline-more"] }
-log = "0.4.29"
-objc2 = "0.5.2"
-objc2-app-kit = { version = "0.2.2", features = ["NSButton", "NSResponder", "NSView", "NSWindow"] }
-objc2-foundation = { version = "0.2.2", features = ["NSDictionary", "NSGeometry", "NSString", "NSUserDefaults"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+lyon_path = { version = "1.0.16", default-features = false, features = ["std"] }
+lyon_tessellation = { version = "1.0.20", default-features = false, features = ["std"] }
+naga = { version = "29.0.3", default-features = false, features = ["wgsl-in", "hlsl-out", "spv-out", "msl-out"] }
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
 parking_lot = "0.12.5"
-pollster = { version = "0.4.0" }
-ropey = { version = "1.6.1", default-features = false, features = ["simd", "unicode_lines"] }
+raw-window-handle = "0.6.2"
+resvg = { version = "0.47.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 rustc-hash = "2.1.1"
 slotmap = { version = "1.1.1", default-features = false, features = ["std"] }
 smallvec = { version = "1.15.1", features = ["union", "const_new"] }
 swash = "0.2.7"
-taffy = { version = "0.10.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "block_layout", "content_size"] }
+taffy = { version = "0.10.1", default-features = false, features = ["std", "taffy_tree", "flexbox", "block_layout", "content_size"] }
 thiserror = "2.0.18"
+tracing = "0.1.44"
 unicode-segmentation = "1.12.0"
-wgpu = { version = "29.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "wgsl"] }
+usvg = { version = "0.47.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+wesl = { version = "0.3.2", default-features = false }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Hlsl",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
-windows-sys = { version = "0.61.2", features = [ "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging", ] }
+zbus = { version = "5.15.0", default-features = false, features = ["async-io"] }
+
 
 [profile.dev]
 split-debuginfo = "unpacked"

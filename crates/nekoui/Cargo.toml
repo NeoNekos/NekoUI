@@ -3,48 +3,76 @@ name = "nekoui"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "GPU-accelerated UI framework"
+description = "GPU-native UI framework"
 keywords = ["desktop", "gui"]
 categories = ["gui"]
-repository = "https://github.com/NeoNekos/NekoUI"
+repository = "https://github.com/Yamrc/NekoUI"
 license.workspace = true
-publish.workspace = true
+publish = true
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-# accesskit = { workspace = true, optional = true }
-# accesskit_winit = { workspace = true, optional = true }
+accesskit.workspace = true
 bitflags.workspace = true
 bytemuck.workspace = true
 crossbeam-channel.workspace = true
 cosmic-text.workspace = true
 etagere.workspace = true
-hashbrown.workspace = true
-log.workspace = true
+fontdb.workspace = true
+image.workspace = true
+lyon_path.workspace = true
+lyon_tessellation.workspace = true
 parking_lot.workspace = true
-pollster.workspace = true
-rustc-hash.workspace = true
+raw-window-handle.workspace = true
+resvg.workspace = true
 slotmap.workspace = true
 smallvec.workspace = true
 swash.workspace = true
 taffy.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 unicode-segmentation.workspace = true
-wgpu.workspace = true
+usvg.workspace = true
 winit.workspace = true
 
-# [features]
-# a11y = ["dep:accesskit", "dep:accesskit_winit"]
-
-[dev-dependencies]
-env_logger = "0.11.10"
+accesskit_winit = { workspace = true, optional = true }
+arboard = { workspace = true, optional = true }
+rfd = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+windows.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash.workspace = true
+zbus = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
+objc2-metal.workspace = true
+
+[features]
+default = []
+advanced = []
+canvas = []
+canvas-precompiled-shaders = ["canvas"]
+canvas-debug-shaders = ["canvas"]
+clipboard = ["dep:arboard"]
+dialogs = ["dep:rfd"]
+prompt = []
+drag-drop = []
+menus = []
+tray = []
+notifications = ["dep:zbus"]
+tooltips = []
+accessibility = ["dep:accesskit_winit"]
+diagnostics-export = []
+animated-image = []
+image-formats-extra = []
+video = [] # TODO
+
+[dev-dependencies]
+env_logger = "0.11.10"
