@@ -1,7 +1,7 @@
-pub use crate::platform::window::{
-    DisplayId, DisplayInfo, DisplaySelector, WindowAppearance, WindowBehavior, WindowGeometry,
-    WindowGeometryPatch, WindowHandle, WindowId, WindowInfo, WindowOptions, WindowPlacement,
-    WindowSize, WindowStartPosition,
-};
+mod handle;
+mod options;
+mod record;
 
-pub(crate) use crate::platform::window::WindowInfo as Window;
+pub use handle::{AnyWindowHandle, WindowGeneration, WindowId};
+pub use options::WindowOptions;
+pub use record::{WindowLifecycle, WindowRecord};
