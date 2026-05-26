@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct WindowId(u64);
 
@@ -39,5 +41,46 @@ impl AnyWindowHandle {
 
     pub fn generation(self) -> WindowGeneration {
         self.generation
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, Hash)]
+pub struct WindowHandle<T: 'static> {
+    any: AnyWindowHandle,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T: 'static> Clone for WindowHandle<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: 'static> Copy for WindowHandle<T> {}
+
+impl<T: 'static> WindowHandle<T> {
+    pub(crate) fn new(any: AnyWindowHandle) -> Self {
+        Self {
+            any,
+            marker: PhantomData,
+        }
+    }
+
+    pub fn id(self) -> WindowId {
+        self.any.id()
+    }
+
+    pub fn generation(self) -> WindowGeneration {
+        self.any.generation()
+    }
+
+    pub fn any(self) -> AnyWindowHandle {
+        self.any
+    }
+}
+
+impl<T: 'static> From<WindowHandle<T>> for AnyWindowHandle {
+    fn from(handle: WindowHandle<T>) -> Self {
+        handle.any()
     }
 }
