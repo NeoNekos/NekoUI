@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::diagnostic::{Diagnostics, DirtyLane, DirtyLanes};
+use crate::diagnostic::{DirtyLane, DirtyLanes};
 use crate::window::WindowId;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -20,6 +20,12 @@ impl WindowSchedulerState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RedrawRequestOutcome {
+    Requested,
+    Coalesced,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Scheduler {
     windows: BTreeMap<WindowId, WindowSchedulerState>,
@@ -37,15 +43,27 @@ impl Scheduler {
         }
     }
 
-    pub fn request_redraw(&mut self, window: WindowId, diagnostics: &mut Diagnostics) {
+    pub fn take_dirty_lanes(&mut self, window: WindowId, lanes: DirtyLanes) -> DirtyLanes {
         self.ensure_window(window);
-        if let Some(state) = self.windows.get_mut(&window) {
-            if state.pending_redraw {
-                diagnostics.increment("runtime.redraw_coalesced");
-            } else {
-                state.pending_redraw = true;
-                diagnostics.increment("runtime.redraw_requested");
-            }
+        let Some(state) = self.windows.get_mut(&window) else {
+            return DirtyLanes::empty();
+        };
+        let taken = state.dirty_lanes & lanes;
+        state.dirty_lanes.remove(taken);
+        taken
+    }
+
+    pub(crate) fn request_redraw(&mut self, window: WindowId) -> RedrawRequestOutcome {
+        self.ensure_window(window);
+        let state = self
+            .windows
+            .get_mut(&window)
+            .expect("window state should exist after ensure_window");
+        if state.pending_redraw {
+            RedrawRequestOutcome::Coalesced
+        } else {
+            state.pending_redraw = true;
+            RedrawRequestOutcome::Requested
         }
     }
 
@@ -61,7 +79,6 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
-    use crate::diagnostic::Diagnostics;
     use crate::diagnostic::DirtyLane;
     use crate::window::WindowId;
 
@@ -83,19 +100,28 @@ mod tests {
     #[test]
     fn redraw_requests_are_coalesced_per_window() {
         let mut scheduler = Scheduler::default();
-        let mut diagnostics = Diagnostics::default();
         let window = WindowId::new(1);
 
-        scheduler.request_redraw(window, &mut diagnostics);
-        scheduler.request_redraw(window, &mut diagnostics);
+        let first = scheduler.request_redraw(window);
+        let second = scheduler.request_redraw(window);
 
-        assert_eq!(
-            diagnostics.snapshot().counter("runtime.redraw_requested"),
-            1
-        );
-        assert_eq!(
-            diagnostics.snapshot().counter("runtime.redraw_coalesced"),
-            1
-        );
+        assert_eq!(first, super::RedrawRequestOutcome::Requested);
+        assert_eq!(second, super::RedrawRequestOutcome::Coalesced);
+    }
+
+    #[test]
+    fn dirty_lanes_can_be_taken_and_cleared_by_lane() {
+        let mut scheduler = Scheduler::default();
+        let window = WindowId::new(1);
+
+        scheduler.mark_dirty(window, DirtyLane::Layout);
+        scheduler.mark_dirty(window, DirtyLane::Paint);
+
+        let taken = scheduler.take_dirty_lanes(window, DirtyLane::Layout.flag());
+        let state = scheduler.window_state(window).unwrap();
+
+        assert!(taken.contains(DirtyLane::Layout.flag()));
+        assert!(!state.dirty_lanes().contains(DirtyLane::Layout.flag()));
+        assert!(state.dirty_lanes().contains(DirtyLane::Paint.flag()));
     }
 }

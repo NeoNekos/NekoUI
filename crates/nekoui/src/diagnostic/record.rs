@@ -9,6 +9,11 @@ pub enum DiagnosticArea {
     Runtime,
     Window,
     Retained,
+    Style,
+    Layout,
+    Scene,
+    Input,
+    Text,
     Scheduler,
     Diagnostic,
 }

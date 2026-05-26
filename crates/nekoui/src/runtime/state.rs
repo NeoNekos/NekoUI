@@ -1,8 +1,17 @@
 use std::collections::BTreeMap;
 
 use crate::error::{NekoError, NekoResult};
-use crate::retained::{DirtyCause, IdentitySeed, RetainedDirty, RetainedIdentity};
+use crate::interaction::InteractionState;
+use crate::layout::{LayoutPassStats, LayoutSize, LayoutTreeSnapshot};
+use crate::retained::{
+    DirtyCause, RetainedDiffStats, RetainedDirty, RetainedIdentity, RetainedTree,
+    RetainedTreeSnapshot,
+};
+use crate::runtime::entity_store::EntityStore;
 use crate::runtime::scheduler::Scheduler;
+use crate::runtime::subscription_store::SubscriptionStore;
+use crate::scene::{PaintScene, SceneCompileStats};
+use crate::text::FontManager;
 use crate::window::{AnyWindowHandle, WindowGeneration, WindowId, WindowOptions, WindowRecord};
 
 #[derive(Debug)]
@@ -10,8 +19,18 @@ pub struct RuntimeState {
     next_window_id: u64,
     windows: BTreeMap<WindowId, WindowRecord>,
     scheduler: Scheduler,
-    retained_seed: IdentitySeed,
+    retained_trees: BTreeMap<WindowId, RetainedTree>,
+    layout_snapshots: BTreeMap<WindowId, LayoutTreeSnapshot>,
+    scene_snapshots: BTreeMap<WindowId, PaintScene>,
     retained_dirty: Vec<RetainedDirty>,
+    last_retained_diff: RetainedDiffStats,
+    consumed_dirty_lanes: BTreeMap<WindowId, crate::diagnostic::DirtyLanes>,
+    last_layout_pass: LayoutPassStats,
+    last_scene_compile: SceneCompileStats,
+    font_manager: FontManager,
+    entity_store: EntityStore,
+    subscription_store: SubscriptionStore,
+    interaction: BTreeMap<WindowId, InteractionState>,
 }
 
 impl Default for RuntimeState {
@@ -20,8 +39,18 @@ impl Default for RuntimeState {
             next_window_id: 1,
             windows: BTreeMap::new(),
             scheduler: Scheduler::default(),
-            retained_seed: IdentitySeed::default(),
+            retained_trees: BTreeMap::new(),
+            layout_snapshots: BTreeMap::new(),
+            scene_snapshots: BTreeMap::new(),
             retained_dirty: Vec::new(),
+            last_retained_diff: RetainedDiffStats::default(),
+            consumed_dirty_lanes: BTreeMap::new(),
+            last_layout_pass: LayoutPassStats::default(),
+            last_scene_compile: SceneCompileStats::default(),
+            font_manager: FontManager::default(),
+            entity_store: EntityStore::default(),
+            subscription_store: SubscriptionStore::default(),
+            interaction: BTreeMap::new(),
         }
     }
 }
@@ -43,6 +72,10 @@ impl RuntimeState {
         }
 
         self.scheduler.ensure_window(handle.id());
+        self.retained_trees.entry(handle.id()).or_default();
+        self.interaction.entry(handle.id()).or_default();
+        self.layout_snapshots.remove(&handle.id());
+        self.scene_snapshots.remove(&handle.id());
         self.windows
             .insert(handle.id(), WindowRecord::new(handle, options));
         Ok(())
@@ -57,6 +90,20 @@ impl RuntimeState {
     pub fn close_window(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
         let window = self.window_mut(handle)?;
         window.close();
+        self.retained_trees.remove(&handle.id());
+        self.layout_snapshots.remove(&handle.id());
+        self.scene_snapshots.remove(&handle.id());
+        self.interaction.remove(&handle.id());
+        Ok(())
+    }
+
+    pub fn resize_window(
+        &mut self,
+        handle: AnyWindowHandle,
+        logical_size: LayoutSize,
+    ) -> NekoResult<()> {
+        let window = self.window_mut(handle)?;
+        window.resize(logical_size);
         Ok(())
     }
 
@@ -71,6 +118,16 @@ impl RuntimeState {
             .ok_or_else(|| NekoError::stale("window id is not registered"))?;
         window.ensure_live(handle)?;
         Ok(window)
+    }
+
+    pub fn window_by_id(&self, id: WindowId) -> NekoResult<&WindowRecord> {
+        self.windows
+            .get(&id)
+            .ok_or_else(|| NekoError::stale("window id is not registered"))
+            .and_then(|window| {
+                window.ensure_live(window.handle())?;
+                Ok(window)
+            })
     }
 
     pub fn window_mut(&mut self, handle: AnyWindowHandle) -> NekoResult<&mut WindowRecord> {
@@ -106,9 +163,157 @@ impl RuntimeState {
         &mut self.scheduler
     }
 
-    pub fn emit_retained_dirty(&mut self, identity: Option<RetainedIdentity>, cause: DirtyCause) {
-        let identity = identity.or_else(|| Some(self.retained_seed.allocate()));
-        self.retained_dirty.push(RetainedDirty { identity, cause });
+    pub fn font_manager(&self) -> &FontManager {
+        &self.font_manager
+    }
+
+    pub(crate) fn entity_store(&self) -> &EntityStore {
+        &self.entity_store
+    }
+
+    pub(crate) fn entity_store_mut(&mut self) -> &mut EntityStore {
+        &mut self.entity_store
+    }
+
+    pub(crate) fn subscription_store(&self) -> &SubscriptionStore {
+        &self.subscription_store
+    }
+
+    pub(crate) fn subscription_store_mut(&mut self) -> &mut SubscriptionStore {
+        &mut self.subscription_store
+    }
+
+    #[cfg(test)]
+    pub(crate) fn font_manager_mut(&mut self) -> &mut FontManager {
+        &mut self.font_manager
+    }
+
+    pub fn retained_tree_mut(&mut self, window: WindowId) -> Option<&mut RetainedTree> {
+        self.retained_trees.get_mut(&window)
+    }
+
+    pub fn retained_tree(&self, window: WindowId) -> Option<&RetainedTree> {
+        self.retained_trees.get(&window)
+    }
+
+    pub fn retained_snapshot(&self, window: WindowId) -> Option<RetainedTreeSnapshot> {
+        self.retained_trees.get(&window).map(RetainedTree::snapshot)
+    }
+
+    pub fn style_snapshot(&self, window: WindowId) -> Option<crate::style::StyleTreeSnapshot> {
+        self.retained_trees
+            .get(&window)
+            .map(RetainedTree::style_snapshot)
+    }
+
+    pub fn layout_snapshot(&self, window: WindowId) -> Option<LayoutTreeSnapshot> {
+        self.layout_snapshots.get(&window).cloned()
+    }
+
+    pub fn scene_snapshot(&self, window: WindowId) -> Option<PaintScene> {
+        self.scene_snapshots.get(&window).cloned()
+    }
+
+    pub(crate) fn interaction(&self, window: WindowId) -> Option<&InteractionState> {
+        self.interaction.get(&window)
+    }
+
+    pub(crate) fn interaction_mut(&mut self, window: WindowId) -> &mut InteractionState {
+        self.interaction.entry(window).or_default()
+    }
+
+    pub fn layout_node_count(&self) -> usize {
+        self.layout_snapshots
+            .values()
+            .map(LayoutTreeSnapshot::node_count)
+            .sum()
+    }
+
+    pub fn set_layout_snapshot(&mut self, window: WindowId, snapshot: LayoutTreeSnapshot) {
+        self.layout_snapshots.insert(window, snapshot);
+    }
+
+    pub fn set_scene_snapshot(&mut self, window: WindowId, snapshot: PaintScene) {
+        self.scene_snapshots.insert(window, snapshot);
+    }
+
+    pub fn scene_node_count(&self) -> usize {
+        self.scene_snapshots
+            .values()
+            .map(|scene| scene.stats().node_count)
+            .sum()
+    }
+
+    pub fn set_last_layout_pass(&mut self, stats: LayoutPassStats) {
+        self.last_layout_pass = stats;
+    }
+
+    pub fn last_layout_pass(&self) -> &LayoutPassStats {
+        &self.last_layout_pass
+    }
+
+    pub fn set_last_scene_compile(&mut self, stats: SceneCompileStats) {
+        self.last_scene_compile = stats;
+    }
+
+    pub fn last_scene_compile(&self) -> &SceneCompileStats {
+        &self.last_scene_compile
+    }
+
+    pub fn record_consumed_dirty_lanes(
+        &mut self,
+        window: WindowId,
+        lanes: crate::diagnostic::DirtyLanes,
+    ) {
+        self.consumed_dirty_lanes
+            .entry(window)
+            .or_default()
+            .insert(lanes);
+    }
+
+    pub fn reported_dirty_lanes(&self, window: WindowId) -> crate::diagnostic::DirtyLanes {
+        let current = self
+            .scheduler
+            .window_states()
+            .get(&window)
+            .map_or(crate::diagnostic::DirtyLanes::empty(), |state| {
+                state.dirty_lanes()
+            });
+        current
+            | self
+                .consumed_dirty_lanes
+                .get(&window)
+                .copied()
+                .unwrap_or_default()
+    }
+
+    pub fn retained_node_count(&self) -> usize {
+        self.retained_trees
+            .values()
+            .map(|tree| tree.snapshot().node_count())
+            .sum()
+    }
+
+    pub fn set_last_retained_diff(&mut self, stats: RetainedDiffStats) {
+        self.last_retained_diff = stats;
+    }
+
+    pub fn last_retained_diff(&self) -> &RetainedDiffStats {
+        &self.last_retained_diff
+    }
+
+    pub fn emit_retained_dirty(
+        &mut self,
+        identity: Option<RetainedIdentity>,
+        cause: DirtyCause,
+        lanes: crate::diagnostic::DirtyLanes,
+    ) {
+        self.retained_dirty
+            .push(RetainedDirty::new(identity, cause, lanes));
+    }
+
+    pub fn extend_retained_dirty(&mut self, dirty: impl IntoIterator<Item = RetainedDirty>) {
+        self.retained_dirty.extend(dirty);
     }
 
     #[cfg(test)]

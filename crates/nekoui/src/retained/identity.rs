@@ -68,7 +68,7 @@ impl RetainedIdentity {
 }
 
 #[derive(Clone, Debug)]
-pub struct IdentitySeed {
+pub(crate) struct IdentitySeed {
     next_id: u64,
     tree_generation: RetainedTreeGeneration,
 }
@@ -83,18 +83,18 @@ impl Default for IdentitySeed {
 }
 
 impl IdentitySeed {
-    pub fn allocate(&mut self) -> RetainedIdentity {
+    pub(crate) fn allocate(&mut self) -> RetainedIdentity {
         let identity =
             RetainedIdentity::new(RetainedNodeId::new(self.next_id), NodeGeneration::INITIAL);
         self.next_id += 1;
         identity
     }
 
-    pub fn tree_generation(&self) -> RetainedTreeGeneration {
+    pub(crate) fn tree_generation(&self) -> RetainedTreeGeneration {
         self.tree_generation
     }
 
-    pub fn mark_tree_changed(&mut self) -> RetainedTreeGeneration {
+    pub(crate) fn mark_tree_changed(&mut self) -> RetainedTreeGeneration {
         self.tree_generation = self.tree_generation.next();
         self.tree_generation
     }
@@ -103,7 +103,9 @@ impl IdentitySeed {
 #[cfg(test)]
 mod tests {
     use crate::error::ErrorKind;
-    use crate::retained::{IdentitySeed, NodeGeneration, RetainedIdentity, RetainedNodeId};
+    use crate::retained::{NodeGeneration, RetainedIdentity, RetainedNodeId};
+
+    use super::IdentitySeed;
 
     #[test]
     fn identity_seed_allocates_unique_stable_ids() {

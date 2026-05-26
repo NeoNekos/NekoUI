@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use crate::error::{NekoError, NekoResult};
+use crate::layout::{LayoutSize, Viewport};
 use crate::window::{AnyWindowHandle, WindowOptions};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -10,10 +11,11 @@ pub enum WindowLifecycle {
     Closed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WindowRecord {
     handle: AnyWindowHandle,
     title: Cow<'static, str>,
+    viewport: Viewport,
     lifecycle: WindowLifecycle,
 }
 
@@ -22,6 +24,7 @@ impl WindowRecord {
         Self {
             handle,
             title: options.title,
+            viewport: options.viewport,
             lifecycle: WindowLifecycle::Live,
         }
     }
@@ -36,6 +39,16 @@ impl WindowRecord {
 
     pub fn lifecycle(&self) -> WindowLifecycle {
         self.lifecycle
+    }
+
+    pub fn viewport(&self) -> Viewport {
+        self.viewport
+    }
+
+    pub(crate) fn resize(&mut self, logical_size: LayoutSize) {
+        self.viewport = self
+            .viewport
+            .next_generation(logical_size, self.viewport.scale_factor());
     }
 
     pub(crate) fn request_close(&mut self) {
