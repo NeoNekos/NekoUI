@@ -1,13 +1,15 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-use unicode_segmentation::UnicodeSegmentation;
-
 use crate::retained::{NodeGeneration, RetainedNodeId};
 use crate::style::{ResolvedTextStyle, TextOverflow};
-use crate::text::{FontFallbackSnapshot, FontGeneration, FontManager};
+use crate::text::{
+    FontGeneration, FontManager, GlyphDemand, GlyphInstance, GlyphKey, TextLayoutData,
+    TextLayoutGeneration, TextLayoutKey, TextLayoutRef,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct TextGeneration(u64);
@@ -160,11 +162,74 @@ impl TextMeasureError {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TextMeasureResult {
     Ready(TextMetrics),
     Deferred(TextMeasureDependency),
     Failed(TextMeasureError),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TextLayoutResult {
+    Ready(TextLayoutRef),
+    Deferred(TextMeasureDependency),
+    Failed(TextMeasureError),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TextMeasureReady {
+    layout: TextLayoutRef,
+}
+
+impl TextMeasureReady {
+    fn layout(self) -> TextLayoutRef {
+        self.layout
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TextMeasureOutcome {
+    Ready(TextMeasureReady),
+    Deferred(TextMeasureDependency),
+    Failed(TextMeasureError),
+}
+
+impl TextMeasureOutcome {
+    fn map_ready<T>(self, map: impl FnOnce(TextMeasureReady) -> T) -> TextReadyResult<T> {
+        match self {
+            Self::Ready(ready) => TextReadyResult::Ready(map(ready)),
+            Self::Deferred(dependency) => TextReadyResult::Deferred(dependency),
+            Self::Failed(error) => TextReadyResult::Failed(error),
+        }
+    }
+}
+
+enum TextReadyResult<T> {
+    Ready(T),
+    Deferred(TextMeasureDependency),
+    Failed(TextMeasureError),
+}
+
+#[cfg(test)]
+impl From<TextReadyResult<TextMetrics>> for TextMeasureResult {
+    fn from(value: TextReadyResult<TextMetrics>) -> Self {
+        match value {
+            TextReadyResult::Ready(metrics) => Self::Ready(metrics),
+            TextReadyResult::Deferred(dependency) => Self::Deferred(dependency),
+            TextReadyResult::Failed(error) => Self::Failed(error),
+        }
+    }
+}
+
+impl From<TextReadyResult<TextLayoutRef>> for TextLayoutResult {
+    fn from(value: TextReadyResult<TextLayoutRef>) -> Self {
+        match value {
+            TextReadyResult::Ready(layout) => Self::Ready(layout),
+            TextReadyResult::Deferred(dependency) => Self::Deferred(dependency),
+            TextReadyResult::Failed(error) => Self::Failed(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -178,6 +243,7 @@ pub(crate) struct TextMeasureQuery<'a> {
     pub(crate) available_inline_width: Option<f32>,
     pub(crate) font_generation: FontGeneration,
     pub(crate) scale_generation: u64,
+    pub(crate) scale_factor: f32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -231,6 +297,7 @@ struct MemoKey {
     text_overflow: TextOverflow,
     font_generation: FontGeneration,
     scale_generation: u64,
+    scale_factor_bits: u32,
 }
 
 impl Eq for MemoKey {}
@@ -264,6 +331,7 @@ impl Ord for MemoKey {
             })
             .then_with(|| self.font_generation.cmp(&other.font_generation))
             .then_with(|| self.scale_generation.cmp(&other.scale_generation))
+            .then_with(|| self.scale_factor_bits.cmp(&other.scale_factor_bits))
     }
 }
 
@@ -276,8 +344,8 @@ impl PartialOrd for MemoKey {
 #[derive(Debug)]
 pub(crate) struct TextMeasureSession<'a> {
     font_manager: &'a FontManager,
-    fallback_snapshot: FontFallbackSnapshot,
-    memo: BTreeMap<MemoKey, TextMetrics>,
+    font_generation: FontGeneration,
+    memo: BTreeMap<MemoKey, TextLayoutRef>,
     stats: TextMeasureStats,
 }
 
@@ -287,21 +355,36 @@ impl<'a> TextMeasureSession<'a> {
         let _ = TextMeasureErrorKind::ALL;
         Self {
             font_manager,
-            fallback_snapshot: font_manager.fallback_snapshot(),
+            font_generation: font_manager.generation(),
             memo: BTreeMap::new(),
             stats: TextMeasureStats::default(),
         }
     }
 
     pub(crate) fn font_generation(&self) -> FontGeneration {
-        self.fallback_snapshot.generation()
+        self.font_generation
     }
 
+    pub(crate) fn layout(&mut self, query: TextMeasureQuery<'_>) -> TextLayoutResult {
+        TextLayoutResult::from(
+            self.measure_inner(query)
+                .map_ready(TextMeasureReady::layout),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn measure(&mut self, query: TextMeasureQuery<'_>) -> TextMeasureResult {
+        TextMeasureResult::from(
+            self.measure_inner(query)
+                .map_ready(|ready| ready.layout.metrics()),
+        )
+    }
+
+    fn measure_inner(&mut self, query: TextMeasureQuery<'_>) -> TextMeasureOutcome {
         let started = std::time::Instant::now();
         self.stats.query_count += 1;
         if query.font_generation != self.font_manager.generation()
-            || query.font_generation != self.fallback_snapshot.generation()
+            || query.font_generation != self.font_generation
         {
             let dependency = TextMeasureDependency::new(
                 TextMeasureDependencyKind::FontGenerationStale,
@@ -309,7 +392,7 @@ impl<'a> TextMeasureSession<'a> {
             );
             return self.record_deferred(query.node_id, dependency, started.elapsed());
         }
-        if self.fallback_snapshot.metadata_count() == 0 {
+        if self.font_manager.fallback_snapshot().metadata_count() == 0 {
             let dependency = TextMeasureDependency::new(
                 TextMeasureDependencyKind::FontFallbackUnavailable,
                 "font fallback snapshot has no entries",
@@ -323,23 +406,40 @@ impl<'a> TextMeasureSession<'a> {
             );
             return self.record_failed(query.node_id, error, started.elapsed());
         }
+        if !(query.scale_factor.is_finite() && query.scale_factor > 0.0) {
+            let error = TextMeasureError::new(
+                TextMeasureErrorKind::InvalidStyle,
+                "scale factor must be finite and positive for text measurement",
+            );
+            return self.record_failed(query.node_id, error, started.elapsed());
+        }
         let key = MemoKey::from_query(&query);
-        if let Some(metrics) = self.memo.get(&key).copied() {
+        if let Some(layout) = self.memo.get(&key).cloned() {
             let duration = started.elapsed();
             self.stats.cache_hits += 1;
             self.stats.total_duration += duration;
-            self.record_event(query.node_id, "ready", "hit", duration, Some(metrics));
-            return TextMeasureResult::Ready(metrics);
+            self.record_event(
+                query.node_id,
+                "ready",
+                "hit",
+                duration,
+                Some(layout.metrics()),
+            );
+            return TextMeasureOutcome::Ready(TextMeasureReady { layout });
         }
 
         self.stats.cache_misses += 1;
-        let metrics = measure_uncached(&query, &self.fallback_snapshot);
-        self.memo.insert(key, metrics);
+        let layout = match layout_uncached(&query, self.font_manager) {
+            Ok(layout) => layout,
+            Err(error) => return self.record_failed(query.node_id, error, started.elapsed()),
+        };
+        let metrics = layout.metrics();
+        self.memo.insert(key, layout.clone());
         self.stats.measured_count += 1;
         let duration = started.elapsed();
         self.stats.total_duration += duration;
         self.record_event(query.node_id, "ready", "miss", duration, Some(metrics));
-        TextMeasureResult::Ready(metrics)
+        TextMeasureOutcome::Ready(TextMeasureReady { layout })
     }
 
     pub(crate) fn stats(&self) -> TextMeasureStats {
@@ -351,7 +451,7 @@ impl<'a> TextMeasureSession<'a> {
         node_id: RetainedNodeId,
         dependency: TextMeasureDependency,
         duration: Duration,
-    ) -> TextMeasureResult {
+    ) -> TextMeasureOutcome {
         self.stats.deferred_count += 1;
         self.stats.blocked_count += 1;
         self.stats.total_duration += duration;
@@ -363,7 +463,7 @@ impl<'a> TextMeasureSession<'a> {
             duration,
         });
         self.record_event(node_id, "deferred", "none", duration, None);
-        TextMeasureResult::Deferred(dependency)
+        TextMeasureOutcome::Deferred(dependency)
     }
 
     fn record_failed(
@@ -371,7 +471,7 @@ impl<'a> TextMeasureSession<'a> {
         node_id: RetainedNodeId,
         error: TextMeasureError,
         duration: Duration,
-    ) -> TextMeasureResult {
+    ) -> TextMeasureOutcome {
         self.stats.failed_count += 1;
         self.stats.blocked_count += 1;
         self.stats.total_duration += duration;
@@ -383,7 +483,7 @@ impl<'a> TextMeasureSession<'a> {
             duration,
         });
         self.record_event(node_id, "failed", "none", duration, None);
-        TextMeasureResult::Failed(error)
+        TextMeasureOutcome::Failed(error)
     }
 
     fn record_blocker(&mut self, blocker: TextMeasureBlocker) {
@@ -431,131 +531,114 @@ impl MemoKey {
             text_overflow: query.style.text_overflow(),
             font_generation: query.font_generation,
             scale_generation: query.scale_generation,
+            scale_factor_bits: query.scale_factor.to_bits(),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct TextAnalysis {
-    clusters: Arc<[TextCluster]>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct TextCluster {
-    advance: f32,
-    break_after: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct ShapedParagraph {
-    clusters: Arc<[TextCluster]>,
-    natural_width: f32,
-    min_content_width: f32,
-    line_height: f32,
-    baseline: f32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct LineLayout {
-    width: f32,
-    height: f32,
-    baseline: f32,
-    line_count: usize,
-}
-
-fn measure_uncached(query: &TextMeasureQuery<'_>, snapshot: &FontFallbackSnapshot) -> TextMetrics {
-    let analysis = analyze_text(query);
-    let shaped = shape_paragraph(query, snapshot, analysis);
-    let lines = layout_lines(query, &shaped);
-    TextMetrics {
-        width: lines.width,
-        min_content_width: shaped.min_content_width,
-        max_content_width: shaped.natural_width,
-        height: lines.height,
-        baseline: lines.baseline,
-        line_count: lines.line_count,
-    }
-}
-
-fn analyze_text(query: &TextMeasureQuery<'_>) -> TextAnalysis {
-    let font_size = query.style.font_size().as_px();
-    let advance = font_size * 0.5;
-    let clusters = UnicodeSegmentation::graphemes(query.text, true)
-        .map(|cluster| TextCluster {
-            advance,
-            break_after: cluster.chars().all(char::is_whitespace),
-        })
-        .collect::<Vec<_>>();
-    TextAnalysis {
-        clusters: Arc::from(clusters),
-    }
-}
-
-fn shape_paragraph(
+fn layout_uncached(
     query: &TextMeasureQuery<'_>,
-    snapshot: &FontFallbackSnapshot,
-    analysis: TextAnalysis,
-) -> ShapedParagraph {
+    font_manager: &FontManager,
+) -> Result<TextLayoutRef, TextMeasureError> {
     let font_size = query.style.font_size().as_px();
     let line_height = font_size * 1.2;
-    let baseline = font_size * 0.8;
-    let natural_width = analysis
-        .clusters
-        .iter()
-        .map(|cluster| cluster.advance)
-        .sum::<f32>();
-    let fallback_marker = snapshot.default_family().len() as f32 * 0.0;
-    let min_content_width = analysis
-        .clusters
-        .iter()
-        .map(|cluster| cluster.advance)
-        .fold(0.0_f32, f32::max)
-        + fallback_marker;
-    ShapedParagraph {
-        clusters: analysis.clusters,
-        natural_width,
-        min_content_width,
-        line_height,
-        baseline,
-    }
-}
+    let metrics = cosmic_text::Metrics::new(font_size, line_height);
+    let buffer = font_manager.with_font_system(|font_system| {
+        let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
+        buffer.set_size(font_system, query.available_inline_width, None);
+        buffer.set_text(
+            font_system,
+            query.text,
+            &cosmic_text::Attrs::new().weight(cosmic_text::Weight::NORMAL),
+            cosmic_text::Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(font_system, true);
+        buffer
+    });
 
-fn layout_lines(query: &TextMeasureQuery<'_>, shaped: &ShapedParagraph) -> LineLayout {
-    let measured_width = match query.available_inline_width {
-        Some(width) if width.is_finite() && width > 0.0 => shaped.natural_width.min(width),
-        Some(_) => 0.0,
-        None => shaped.natural_width,
-    };
-    let mut line_count = line_count_for_width(shaped, measured_width);
+    let mut glyphs = Vec::new();
+    let mut demands = Vec::new();
+    let mut demanded_keys = BTreeSet::new();
+    let mut width = 0.0_f32;
+    let mut max_content_width = 0.0_f32;
+    let mut min_content_width = 0.0_f32;
+    let mut height = 0.0_f32;
+    let mut baseline = 0.0_f32;
+    let mut line_count = 0_usize;
+
+    for run in buffer.layout_runs() {
+        line_count += 1;
+        if line_count == 1 {
+            baseline = run.line_y;
+        }
+        width = width.max(run.line_w);
+        max_content_width = max_content_width.max(run.line_w);
+        min_content_width = min_content_width.max(min_run_width(run.glyphs));
+        height = height.max(run.line_top + run.line_height);
+        for glyph in run.glyphs {
+            let physical = glyph.physical((0.0, run.line_y), query.scale_factor);
+            let key = GlyphKey::new(physical.cache_key, query.scale_factor);
+            glyphs.push(GlyphInstance::new(key, physical.x, physical.y));
+            if demanded_keys.insert(key) {
+                demands.push(GlyphDemand::new(key));
+            }
+        }
+    }
+
+    let mut line_count = line_count.max(1);
     if let Some(max_lines) = query.style.max_lines() {
-        line_count = line_count.min(max_lines.max(1));
+        let max_lines = max_lines.max(1);
+        if line_count > max_lines {
+            line_count = max_lines;
+            height = line_height * max_lines as f32;
+        }
     }
-    LineLayout {
-        width: measured_width,
-        height: shaped.line_height * line_count as f32,
-        baseline: shaped.baseline,
+    if query.text.is_empty() {
+        height = line_height;
+        baseline = font_size * 0.8;
+    }
+
+    let layout_key = TextLayoutKey {
+        node_id: query.node_id,
+        node_generation: query.node_generation,
+        text_generation: query.text_generation,
+        style_generation: query.style_generation,
+        text_hash: stable_text_hash(query.text),
+        available_inline_width_bits: query.available_inline_width.map(f32::to_bits),
+        font_size_bits: query.style.font_size().as_px().to_bits(),
+        max_lines: query.style.max_lines(),
+        text_overflow: query.style.text_overflow(),
+        font_generation: query.font_generation,
+        scale_generation: query.scale_generation,
+        scale_factor_bits: query.scale_factor.to_bits(),
+    };
+    let generation = TextLayoutGeneration::from_layout_key(&layout_key);
+    let metrics = TextMetrics {
+        width,
+        min_content_width,
+        max_content_width,
+        height,
+        baseline,
         line_count,
-    }
+    };
+    Ok(TextLayoutRef::new(TextLayoutData::new(
+        generation,
+        layout_key,
+        metrics,
+        Arc::from(glyphs),
+        Arc::from(demands),
+    )))
 }
 
-fn line_count_for_width(shaped: &ShapedParagraph, width: f32) -> usize {
-    if width <= 0.0 || shaped.natural_width <= width {
-        return 1;
-    }
-    let mut line_count = 1;
-    let mut line_width = 0.0;
-    for cluster in shaped.clusters.iter() {
-        if line_width > 0.0 && line_width + cluster.advance > width {
-            line_count += 1;
-            line_width = 0.0;
-        }
-        line_width += cluster.advance;
-        if cluster.break_after && line_width > width {
-            line_count += 1;
-            line_width = 0.0;
-        }
-    }
-    line_count
+fn min_run_width(glyphs: &[cosmic_text::LayoutGlyph]) -> f32 {
+    glyphs.iter().map(|glyph| glyph.w).fold(0.0_f32, f32::max)
+}
+
+fn stable_text_hash(text: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 const fn text_overflow_rank(value: TextOverflow) -> u8 {

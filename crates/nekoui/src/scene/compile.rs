@@ -11,6 +11,7 @@ use crate::scene::{
 };
 use crate::style::StyleTreeSnapshot;
 use crate::style::{Color, Display, TextOverflow};
+use crate::text::TextGlyphDemand;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SceneCompileInput<'a> {
@@ -165,25 +166,32 @@ impl SceneCompiler {
             }
 
             if retained.kind() == ElementKind::Text && retained.text().is_some() {
+                let Some(text_layout) = layout.text_layout().cloned() else {
+                    self.emit_unsupported(retained, layout.content_rect(), "text.layout_missing");
+                    return;
+                };
                 let order = self.next_order();
-                self.fragments.push(PaintFragment::new(
-                    retained.id(),
-                    retained.generation(),
-                    order,
-                    layout.content_rect(),
-                    PaintFragmentKind::Text {
-                        text_generation: self.text_generation.clone(),
-                        text_metrics_generation: self
-                            .generation
-                            .layout_generation()
-                            .map_or(0, |generation| generation.raw()),
-                        color: retained.resolved_style().text().text_color(),
-                    },
-                ));
-                self.demands.push(SceneResourceDemand::new(
-                    ResourceDemandKind::Glyph,
+                self.fragments.push(
+                    PaintFragment::new(
+                        retained.id(),
+                        retained.generation(),
+                        order,
+                        layout.content_rect(),
+                        PaintFragmentKind::Text {
+                            text_generation: self.text_generation.clone(),
+                            text_metrics_generation: self
+                                .generation
+                                .layout_generation()
+                                .map_or(0, |generation| generation.raw()),
+                            color: retained.resolved_style().text().text_color(),
+                        },
+                    )
+                    .with_text_layout(text_layout.clone()),
+                );
+                self.demands.push(SceneResourceDemand::glyph(
                     retained.id().raw(),
                     self.text_generation.clone(),
+                    TextGlyphDemand::new(text_layout),
                 ));
             }
         }

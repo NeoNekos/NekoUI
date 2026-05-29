@@ -1,6 +1,7 @@
 use crate::element::{ElementKey, ElementKind};
 use crate::layout::{LayoutRect, LayoutSize, Viewport};
 use crate::retained::{RetainedNodeId, RetainedTreeGeneration};
+use crate::text::TextLayoutRef;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct LayoutGeneration(u64);
@@ -27,6 +28,7 @@ pub struct LayoutNodeSnapshot {
     padding_rect: LayoutRect,
     content_rect: LayoutRect,
     content_size: LayoutSize,
+    text_layout: Option<TextLayoutRef>,
     children: Vec<LayoutNodeSnapshot>,
 }
 
@@ -47,6 +49,7 @@ impl LayoutNodeSnapshot {
             padding_rect: boxes.padding_rect,
             content_rect: boxes.content_rect,
             content_size: boxes.content_size,
+            text_layout: boxes.text_layout,
             children,
         }
     }
@@ -81,6 +84,10 @@ impl LayoutNodeSnapshot {
 
     pub fn content_size(&self) -> LayoutSize {
         self.content_size
+    }
+
+    pub(crate) fn text_layout(&self) -> Option<&TextLayoutRef> {
+        self.text_layout.as_ref()
     }
 
     pub fn children(&self) -> &[LayoutNodeSnapshot] {
@@ -118,13 +125,14 @@ impl LayoutNodeSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LayoutBoxes {
     pub margin_rect: LayoutRect,
     pub border_rect: LayoutRect,
     pub padding_rect: LayoutRect,
     pub content_rect: LayoutRect,
     pub content_size: LayoutSize,
+    pub text_layout: Option<TextLayoutRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -8,7 +8,7 @@ use crate::style::StyleTreeSnapshot;
 use crate::window::{AnyWindowHandle, WindowRecord};
 
 #[derive(Debug)]
-pub struct TestRun {
+pub(crate) struct TestRun {
     runtime: Runtime,
 }
 
@@ -17,44 +17,47 @@ impl TestRun {
         Self { runtime }
     }
 
-    pub fn diagnostics(&self) -> DiagnosticSnapshot {
+    pub(crate) fn diagnostics(&self) -> DiagnosticSnapshot {
         self.runtime.diagnostics().snapshot()
     }
 
-    pub fn performance_report(&self) -> PerformanceReport {
+    pub(crate) fn performance_report(&self) -> PerformanceReport {
         self.runtime.performance_report()
     }
 
-    pub fn probe_snapshot(&self) -> ProbeSnapshot {
+    pub(crate) fn probe_snapshot(&self) -> ProbeSnapshot {
         ProbeSnapshot::new(self.diagnostics(), self.performance_report())
     }
 
-    pub fn windows(&self) -> Vec<&WindowRecord> {
+    pub(crate) fn windows(&self) -> Vec<&WindowRecord> {
         self.runtime.state().windows().collect()
     }
 
-    pub fn retained_snapshot(
+    pub(crate) fn retained_snapshot(
         &self,
         handle: impl Into<AnyWindowHandle>,
     ) -> NekoResult<RetainedTreeSnapshot> {
         self.runtime.retained_snapshot(handle.into())
     }
 
-    pub fn style_snapshot(
+    pub(crate) fn style_snapshot(
         &self,
         handle: impl Into<AnyWindowHandle>,
     ) -> NekoResult<StyleTreeSnapshot> {
         self.runtime.style_snapshot(handle.into())
     }
 
-    pub fn layout_snapshot(
+    pub(crate) fn layout_snapshot(
         &self,
         handle: impl Into<AnyWindowHandle>,
     ) -> NekoResult<LayoutTreeSnapshot> {
         self.runtime.layout_snapshot(handle.into())
     }
 
-    pub fn scene_snapshot(&self, handle: impl Into<AnyWindowHandle>) -> NekoResult<PaintScene> {
+    pub(crate) fn scene_snapshot(
+        &self,
+        handle: impl Into<AnyWindowHandle>,
+    ) -> NekoResult<PaintScene> {
         self.runtime.scene_snapshot(handle.into())
     }
 }

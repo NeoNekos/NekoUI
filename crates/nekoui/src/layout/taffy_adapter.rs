@@ -12,8 +12,8 @@ use crate::layout::{LayoutNodeSnapshot, LayoutRect, LayoutSize, Viewport};
 use crate::retained::{RetainedIdentity, RetainedLayoutInput, RetainedLayoutNode};
 use crate::style::{Dimension, Display, Length, ResolvedLayoutStyle, ResolvedTextStyle};
 use crate::text::{
-    FontManager, TextGeneration, TextMeasureQuery, TextMeasureResult, TextMeasureSession,
-    TextMeasureStats,
+    FontManager, TextGeneration, TextLayoutRef, TextLayoutResult, TextMeasureQuery,
+    TextMeasureSession, TextMeasureStats,
 };
 
 use super::snapshot::LayoutBoxes;
@@ -41,6 +41,8 @@ enum MeasureContext {
         text: std::sync::Arc<str>,
         style: std::sync::Arc<ResolvedTextStyle>,
         scale_generation: u64,
+        scale_factor: f32,
+        text_layout: Option<TextLayoutRef>,
     },
 }
 
@@ -250,6 +252,8 @@ fn text_measure_context(node: RetainedLayoutNode<'_>, viewport: Viewport) -> Mea
         text: std::sync::Arc::<str>::from(node.text().unwrap_or_default()),
         style: std::sync::Arc::new(node.resolved_style().text().clone()),
         scale_generation: viewport.generation().raw(),
+        scale_factor: viewport.scale_factor(),
+        text_layout: None,
     }
 }
 
@@ -277,13 +281,15 @@ fn measure_content(
             text,
             style,
             scale_generation,
+            scale_factor,
+            text_layout,
         }) => {
             let available_inline_width = match available_space.width {
                 AvailableSpace::Definite(available) => Some(available),
                 AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
             };
             let font_generation = text_session.font_generation();
-            match text_session.measure(TextMeasureQuery {
+            let query = TextMeasureQuery {
                 node_id: *node_id,
                 node_generation: *node_generation,
                 text_generation: TextGeneration::INITIAL,
@@ -293,8 +299,12 @@ fn measure_content(
                 available_inline_width,
                 font_generation,
                 scale_generation: *scale_generation,
-            }) {
-                TextMeasureResult::Ready(metrics) => {
+                scale_factor: *scale_factor,
+            };
+            match text_session.layout(query) {
+                TextLayoutResult::Ready(layout) => {
+                    let metrics = layout.metrics();
+                    *text_layout = Some(layout.clone());
                     let width =
                         known_dimensions
                             .width
@@ -306,7 +316,7 @@ fn measure_content(
                     let height = known_dimensions.height.unwrap_or(metrics.height);
                     TaffySize { width, height }
                 }
-                TextMeasureResult::Deferred(dependency) => {
+                TextLayoutResult::Deferred(dependency) => {
                     text_measure_error.get_or_insert_with(|| {
                         NekoError::diagnostic(format!(
                             "text measurement deferred during synchronous layout: {} ({})",
@@ -319,7 +329,7 @@ fn measure_content(
                         height: known_dimensions.height.unwrap_or(0.0),
                     }
                 }
-                TextMeasureResult::Failed(error) => {
+                TextLayoutResult::Failed(error) => {
                     text_measure_error.get_or_insert_with(|| {
                         NekoError::diagnostic(format!(
                             "text measurement failed during synchronous layout: {} ({})",
@@ -404,6 +414,11 @@ fn materialize_node(
             )
         })
         .collect::<NekoResult<Vec<_>>>()?;
+    let text_layout = tree
+        .get_node_context(built.taffy_id)
+        .and_then(|context| match context {
+            MeasureContext::Text { text_layout, .. } => text_layout.clone(),
+        });
 
     Ok(LayoutNodeSnapshot::new(
         built.identity.id(),
@@ -415,6 +430,7 @@ fn materialize_node(
             padding_rect,
             content_rect,
             content_size: LayoutSize::new(layout.content_size.width, layout.content_size.height),
+            text_layout,
         },
         children,
     ))

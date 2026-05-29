@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::retained::{NodeGeneration, RetainedNodeId};
@@ -7,11 +8,12 @@ use crate::text::measure::{
     TextMeasureErrorKind,
 };
 use crate::text::{
-    FontManager, TextGeneration, TextMeasureQuery, TextMeasureResult, TextMeasureSession,
+    FontManager, TextGeneration, TextLayoutResult, TextMeasureQuery, TextMeasureResult,
+    TextMeasureSession,
 };
 
 #[test]
-fn measurement_uses_grapheme_clusters_not_scalar_count() {
+fn measurement_uses_shaped_layout_not_scalar_count_estimates() {
     let style = ResolvedStyle::resolve(&StyleDeclaration::default().font_size(px(10.0)), None);
     let font_manager = FontManager::default();
     let mut session = TextMeasureSession::new(&font_manager);
@@ -25,17 +27,149 @@ fn measurement_uses_grapheme_clusters_not_scalar_count() {
         available_inline_width: None,
         font_generation: session.font_generation(),
         scale_generation: 1,
+        scale_factor: 1.0,
     });
 
     match result {
         TextMeasureResult::Ready(metrics) => {
-            assert_eq!(metrics.width, 10.0);
-            assert_eq!(metrics.min_content_width, 5.0);
-            assert_eq!(metrics.max_content_width, 10.0);
+            assert!(metrics.width > 10.0);
+            assert_eq!(metrics.width, metrics.max_content_width);
+            assert!(metrics.min_content_width > 0.0);
+            assert!(metrics.min_content_width <= metrics.max_content_width);
             assert_eq!(metrics.line_count, 1);
         }
         TextMeasureResult::Deferred(_) | TextMeasureResult::Failed(_) => unreachable!(),
     }
+}
+
+#[test]
+fn layout_uses_shaped_glyph_positions_and_stable_generation() {
+    let style = ResolvedStyle::resolve(&StyleDeclaration::default().font_size(px(18.0)), None);
+    let font_manager = FontManager::default();
+    let mut session = TextMeasureSession::new(&font_manager);
+    let query = TextMeasureQuery {
+        node_id: RetainedNodeId::new(31),
+        node_generation: NodeGeneration::INITIAL,
+        text_generation: TextGeneration::INITIAL,
+        style_generation: TextGeneration::INITIAL,
+        text: "AV",
+        style: style.text(),
+        available_inline_width: None,
+        font_generation: session.font_generation(),
+        scale_generation: 1,
+        scale_factor: 1.0,
+    };
+
+    let first = match session.layout(query.clone()) {
+        TextLayoutResult::Ready(layout) => layout,
+        TextLayoutResult::Deferred(_) | TextLayoutResult::Failed(_) => unreachable!(),
+    };
+    let second = match session.layout(query) {
+        TextLayoutResult::Ready(layout) => layout,
+        TextLayoutResult::Deferred(_) | TextLayoutResult::Failed(_) => unreachable!(),
+    };
+
+    assert_eq!(first.generation(), second.generation());
+    assert_eq!(first.key(), second.key());
+    assert!(first.glyph_demands().len() <= first.glyphs().len());
+    assert!(!first.glyphs().is_empty());
+    assert!(
+        first
+            .glyphs()
+            .iter()
+            .any(|glyph| glyph.x() != 0 || glyph.y() != 0)
+    );
+    assert_eq!(session.stats().cache_hits, 1);
+}
+
+#[test]
+fn layout_deduplicates_glyph_demands_by_key_while_preserving_instances() {
+    let style = ResolvedStyle::resolve(&StyleDeclaration::default().font_size(px(18.0)), None);
+    let font_manager = FontManager::default();
+    let mut session = TextMeasureSession::new(&font_manager);
+    let layout = match session.layout(TextMeasureQuery {
+        node_id: RetainedNodeId::new(32),
+        node_generation: NodeGeneration::INITIAL,
+        text_generation: TextGeneration::INITIAL,
+        style_generation: TextGeneration::INITIAL,
+        text: "AAAAAA",
+        style: style.text(),
+        available_inline_width: None,
+        font_generation: session.font_generation(),
+        scale_generation: 1,
+        scale_factor: 1.0,
+    }) {
+        TextLayoutResult::Ready(layout) => layout,
+        TextLayoutResult::Deferred(_) | TextLayoutResult::Failed(_) => unreachable!(),
+    };
+
+    let glyph_keys = layout
+        .glyphs()
+        .iter()
+        .copied()
+        .map(|glyph| glyph.key())
+        .collect::<BTreeSet<_>>();
+    let demand_keys = layout
+        .glyph_demands()
+        .iter()
+        .copied()
+        .map(|demand| demand.key())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(demand_keys, glyph_keys);
+    assert_eq!(layout.glyph_demands().len(), demand_keys.len());
+    assert!(layout.glyphs().len() >= layout.glyph_demands().len());
+}
+
+#[test]
+fn scale_factor_participates_in_layout_key_and_glyph_demands() {
+    let style = ResolvedStyle::resolve(&StyleDeclaration::default().font_size(px(18.0)), None);
+    let font_manager = FontManager::default();
+    let mut session = TextMeasureSession::new(&font_manager);
+    let query = TextMeasureQuery {
+        node_id: RetainedNodeId::new(33),
+        node_generation: NodeGeneration::INITIAL,
+        text_generation: TextGeneration::INITIAL,
+        style_generation: TextGeneration::INITIAL,
+        text: "AA",
+        style: style.text(),
+        available_inline_width: None,
+        font_generation: session.font_generation(),
+        scale_generation: 1,
+        scale_factor: 1.0,
+    };
+
+    let scale_one = match session.layout(query.clone()) {
+        TextLayoutResult::Ready(layout) => layout,
+        TextLayoutResult::Deferred(_) | TextLayoutResult::Failed(_) => unreachable!(),
+    };
+    let scale_two = match session.layout(TextMeasureQuery {
+        scale_factor: 2.0,
+        ..query
+    }) {
+        TextLayoutResult::Ready(layout) => layout,
+        TextLayoutResult::Deferred(_) | TextLayoutResult::Failed(_) => unreachable!(),
+    };
+
+    let scale_one_keys = scale_one
+        .glyph_demands()
+        .iter()
+        .copied()
+        .map(|demand| demand.key())
+        .collect::<BTreeSet<_>>();
+    let scale_two_keys = scale_two
+        .glyph_demands()
+        .iter()
+        .copied()
+        .map(|demand| demand.key())
+        .collect::<BTreeSet<_>>();
+
+    assert_ne!(scale_one.key(), scale_two.key());
+    assert_eq!(scale_one.scale_factor(), 1.0);
+    assert_eq!(scale_two.scale_factor(), 2.0);
+    assert!(!scale_one_keys.is_empty());
+    assert_ne!(scale_one_keys, scale_two_keys);
+    assert_eq!(session.stats().cache_misses, 2);
 }
 
 #[test]
@@ -56,6 +190,7 @@ fn pass_local_memo_hits_repeated_queries() {
             available_inline_width: Some(50.0),
             font_generation,
             scale_generation: 1,
+            scale_factor: 1.0,
         });
     }
 
@@ -84,6 +219,7 @@ fn font_generation_participates_in_memo_key() {
         available_inline_width: None,
         font_generation: generation,
         scale_generation: 1,
+        scale_factor: 1.0,
     });
 
     assert_eq!(generation.raw(), 2);
@@ -136,6 +272,7 @@ fn stale_font_generation_defers_and_counts_blocker() {
         available_inline_width: None,
         font_generation: crate::text::FontGeneration::INITIAL.next(),
         scale_generation: 1,
+        scale_factor: 1.0,
     });
 
     match result {
@@ -182,6 +319,7 @@ fn memo_key_tracks_policy_dimensions() {
             available_inline_width: Some(18.0),
             font_generation: session.font_generation(),
             scale_generation: 1,
+            scale_factor: 1.0,
         });
     }
 
@@ -221,6 +359,7 @@ fn ready_event_samples_are_bounded_but_counters_are_exact() {
             available_inline_width: Some(80.0),
             font_generation: session.font_generation(),
             scale_generation: 1,
+            scale_factor: 1.0,
         });
     }
 
@@ -250,6 +389,7 @@ fn blocker_samples_are_bounded_but_deferred_counters_are_exact() {
             available_inline_width: None,
             font_generation: crate::text::FontGeneration::INITIAL.next(),
             scale_generation: 1,
+            scale_factor: 1.0,
         });
     }
 

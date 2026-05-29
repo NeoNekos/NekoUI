@@ -1,5 +1,6 @@
 use crate::interaction::PointerInput;
 use crate::layout::LayoutSize;
+use crate::platform::PlatformFact;
 use crate::runtime::subscription_store::SubscriptionKey;
 use crate::window::AnyWindowHandle;
 
@@ -27,6 +28,7 @@ pub enum RuntimeCommand {
         handle: AnyWindowHandle,
         input: PointerInput,
     },
+    PlatformFact(PlatformFact),
     Window(WindowCommand),
 }
 

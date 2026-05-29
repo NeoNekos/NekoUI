@@ -2,11 +2,13 @@
 resolver = "2"
 members = [
     "crates/nekoui",
+    "crates/nekoui-shader-types",
+    "crates/nekoui-shader-build",
 ]
 default-members = ["crates/nekoui"]
 
 [workspace.package]
-version = "0.0.72"
+version = "0.0.73"
 edition = "2024"
 authors = ["Yamrc <yamrci@outlook.com>"]
 license = "MPL-2.0"
@@ -27,6 +29,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 lyon_path = { version = "1.0.16", default-features = false, features = ["std"] }
 lyon_tessellation = { version = "1.0.20", default-features = false, features = ["std"] }
 naga = { version = "29.0.3", default-features = false, features = ["wgsl-in", "hlsl-out", "spv-out", "msl-out"] }
+nekoui-shader-types = { path = "crates/nekoui-shader-types" }
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
@@ -36,6 +39,7 @@ raw-window-handle = "0.6.2"
 resvg = { version = "0.47.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 rustc-hash = "2.1.1"
+sha2 = { version = "0.10.9", default-features = false }
 slotmap = { version = "1.1.1", default-features = false, features = ["std"] }
 smallvec = { version = "1.15.1", features = ["union", "const_new"] }
 swash = "0.2.7"

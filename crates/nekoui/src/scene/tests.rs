@@ -145,6 +145,30 @@ fn hit_test_skips_display_none_but_keeps_opacity_zero() {
 }
 
 #[test]
+fn opacity_zero_parent_suppresses_subtree_paint_but_keeps_hit_test_entries() {
+    let scene = compile_root(
+        div().key("root").child(
+            div()
+                .key("transparent-parent")
+                .bg(Color::rgb(1, 2, 3))
+                .opacity(opacity(0.0))
+                .child(text("transparent child").key("transparent-child")),
+        ),
+    );
+
+    let entries = scene.hit_test().entries();
+
+    assert_eq!(scene.fragments().len(), 0);
+    assert_eq!(entries.len(), 3);
+    assert!(entries[1].order().raw() < entries[2].order().raw());
+    let point =
+        crate::layout::LayoutPoint::new(entries[2].rect().x() + 1.0, entries[2].rect().y() + 1.0);
+    let target = scene.hit_test().hit_test(point).unwrap();
+
+    assert_eq!(target.order(), entries[2].order());
+}
+
+#[test]
 fn generation_key_matches_input_generations() {
     let mut runtime = Runtime::new();
     let window = runtime
@@ -187,6 +211,13 @@ fn text_glyph_demands_match_scene_text_generation() {
         glyph_demand.expected_generation(),
         scene.generation().text_generation()
     );
+    assert!(glyph_demand.glyphs().is_some());
+    let text_fragment = scene
+        .fragments()
+        .iter()
+        .find(|fragment| matches!(fragment.kind(), PaintFragmentKind::Text { .. }))
+        .unwrap();
+    assert!(text_fragment.text_layout().is_some());
 }
 
 #[test]
