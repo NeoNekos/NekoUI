@@ -1,14 +1,18 @@
+use crate::scene::SceneInputSignature;
+use crate::text::TextGlyphDemand;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ResourceDemandKind {
     Glyph,
     Unsupported,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SceneResourceDemand {
     kind: ResourceDemandKind,
     owner_node_id: u64,
     expected_generation: SceneInputSignature,
+    glyphs: Option<TextGlyphDemand>,
 }
 
 impl SceneResourceDemand {
@@ -21,6 +25,20 @@ impl SceneResourceDemand {
             kind,
             owner_node_id,
             expected_generation,
+            glyphs: None,
+        }
+    }
+
+    pub(crate) fn glyph(
+        owner_node_id: u64,
+        expected_generation: SceneInputSignature,
+        glyphs: TextGlyphDemand,
+    ) -> Self {
+        Self {
+            kind: ResourceDemandKind::Glyph,
+            owner_node_id,
+            expected_generation,
+            glyphs: Some(glyphs),
         }
     }
 
@@ -35,9 +53,13 @@ impl SceneResourceDemand {
     pub fn expected_generation(&self) -> &SceneInputSignature {
         &self.expected_generation
     }
+
+    pub(crate) fn glyphs(&self) -> Option<&TextGlyphDemand> {
+        self.glyphs.as_ref()
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SceneDiagnostic {
     message: &'static str,
     count: u64,
@@ -68,4 +90,3 @@ pub struct SceneCompileStats {
     pub stale_drop_count: u64,
     pub duration: std::time::Duration,
 }
-use crate::scene::SceneInputSignature;

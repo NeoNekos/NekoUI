@@ -199,6 +199,7 @@ mod tests {
                 padding_rect: rect,
                 content_rect: rect,
                 content_size: LayoutSize::new(rect.width(), rect.height()),
+                text_layout: None,
             },
             children,
         )

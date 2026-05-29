@@ -35,6 +35,11 @@ impl AnyWindowHandle {
         Self { id, generation }
     }
 
+    #[cfg(all(test, target_os = "windows"))]
+    pub(crate) fn new_for_tests(id: WindowId) -> Self {
+        Self::new(id, WindowGeneration::INITIAL)
+    }
+
     pub fn id(self) -> WindowId {
         self.id
     }

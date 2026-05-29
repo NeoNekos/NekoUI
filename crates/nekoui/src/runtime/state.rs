@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use crate::error::{NekoError, NekoResult};
 use crate::interaction::InteractionState;
 use crate::layout::{LayoutPassStats, LayoutSize, LayoutTreeSnapshot};
+use crate::platform::{PhysicalSize, Renderability};
+use crate::render::{FrameGraphStats, PreparedFrame};
 use crate::retained::{
     DirtyCause, RetainedDiffStats, RetainedDirty, RetainedIdentity, RetainedTree,
     RetainedTreeSnapshot,
@@ -12,7 +14,9 @@ use crate::runtime::scheduler::Scheduler;
 use crate::runtime::subscription_store::SubscriptionStore;
 use crate::scene::{PaintScene, SceneCompileStats};
 use crate::text::FontManager;
-use crate::window::{AnyWindowHandle, WindowGeneration, WindowId, WindowOptions, WindowRecord};
+use crate::window::{
+    AnyWindowHandle, WindowGeneration, WindowId, WindowLifecycle, WindowOptions, WindowRecord,
+};
 
 #[derive(Debug)]
 pub struct RuntimeState {
@@ -22,11 +26,13 @@ pub struct RuntimeState {
     retained_trees: BTreeMap<WindowId, RetainedTree>,
     layout_snapshots: BTreeMap<WindowId, LayoutTreeSnapshot>,
     scene_snapshots: BTreeMap<WindowId, PaintScene>,
+    prepared_frame_snapshots: BTreeMap<WindowId, PreparedFrame>,
     retained_dirty: Vec<RetainedDirty>,
     last_retained_diff: RetainedDiffStats,
     consumed_dirty_lanes: BTreeMap<WindowId, crate::diagnostic::DirtyLanes>,
     last_layout_pass: LayoutPassStats,
     last_scene_compile: SceneCompileStats,
+    last_frame_graph: FrameGraphStats,
     font_manager: FontManager,
     entity_store: EntityStore,
     subscription_store: SubscriptionStore,
@@ -42,11 +48,13 @@ impl Default for RuntimeState {
             retained_trees: BTreeMap::new(),
             layout_snapshots: BTreeMap::new(),
             scene_snapshots: BTreeMap::new(),
+            prepared_frame_snapshots: BTreeMap::new(),
             retained_dirty: Vec::new(),
             last_retained_diff: RetainedDiffStats::default(),
             consumed_dirty_lanes: BTreeMap::new(),
             last_layout_pass: LayoutPassStats::default(),
             last_scene_compile: SceneCompileStats::default(),
+            last_frame_graph: FrameGraphStats::default(),
             font_manager: FontManager::default(),
             entity_store: EntityStore::default(),
             subscription_store: SubscriptionStore::default(),
@@ -76,6 +84,7 @@ impl RuntimeState {
         self.interaction.entry(handle.id()).or_default();
         self.layout_snapshots.remove(&handle.id());
         self.scene_snapshots.remove(&handle.id());
+        self.prepared_frame_snapshots.remove(&handle.id());
         self.windows
             .insert(handle.id(), WindowRecord::new(handle, options));
         Ok(())
@@ -87,12 +96,23 @@ impl RuntimeState {
         Ok(())
     }
 
+    pub fn confirm_close_window(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
+        let window = self.window_mut(handle)?;
+        window.confirm_close();
+        self.scheduler
+            .set_renderability(handle.id(), Renderability::Closing);
+        Ok(())
+    }
+
     pub fn close_window(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
         let window = self.window_mut(handle)?;
         window.close();
+        self.scheduler
+            .set_renderability(handle.id(), Renderability::Destroyed);
         self.retained_trees.remove(&handle.id());
         self.layout_snapshots.remove(&handle.id());
         self.scene_snapshots.remove(&handle.id());
+        self.prepared_frame_snapshots.remove(&handle.id());
         self.interaction.remove(&handle.id());
         Ok(())
     }
@@ -105,6 +125,68 @@ impl RuntimeState {
         let window = self.window_mut(handle)?;
         window.resize(logical_size);
         Ok(())
+    }
+
+    pub fn rescale_window(
+        &mut self,
+        handle: AnyWindowHandle,
+        scale_factor: f32,
+    ) -> NekoResult<bool> {
+        let window = self.window_mut(handle)?;
+        window.rescale(scale_factor)
+    }
+
+    pub fn mark_native_window_created(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
+        let window = self.window_mut(handle)?;
+        window.mark_native_created();
+        self.scheduler.ensure_window(handle.id());
+        Ok(())
+    }
+
+    pub fn show_window(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
+        let window = self.window_mut(handle)?;
+        window.show();
+        Ok(())
+    }
+
+    pub fn minimize_window(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
+        let window = self.window_mut(handle)?;
+        window.minimize();
+        self.scheduler
+            .set_renderability(handle.id(), Renderability::Minimized);
+        Ok(())
+    }
+
+    pub fn restore_window(&mut self, handle: AnyWindowHandle) -> NekoResult<bool> {
+        let renderability = {
+            let window = self.window_mut(handle)?;
+            window.restore();
+            window.renderability()
+        };
+        let outcome = self.scheduler.set_renderability(handle.id(), renderability);
+        Ok(matches!(
+            outcome,
+            crate::runtime::scheduler::RedrawRequestOutcome::Requested
+        ))
+    }
+
+    pub fn set_window_physical_size(
+        &mut self,
+        handle: AnyWindowHandle,
+        physical_size: PhysicalSize,
+    ) -> NekoResult<bool> {
+        let window = self.window_mut(handle)?;
+        Ok(window.set_physical_size(physical_size))
+    }
+
+    pub fn set_window_renderability(
+        &mut self,
+        handle: AnyWindowHandle,
+        renderability: Renderability,
+    ) -> NekoResult<crate::runtime::scheduler::RedrawRequestOutcome> {
+        let window = self.window_mut(handle)?;
+        window.set_renderability(renderability);
+        Ok(self.scheduler.set_renderability(handle.id(), renderability))
     }
 
     pub fn validate_window(&self, handle: AnyWindowHandle) -> NekoResult<()> {
@@ -139,6 +221,7 @@ impl RuntimeState {
         Ok(window)
     }
 
+    #[cfg(test)]
     pub fn windows(&self) -> impl Iterator<Item = &WindowRecord> {
         self.windows.values()
     }
@@ -151,6 +234,31 @@ impl RuntimeState {
             .collect()
     }
 
+    pub(crate) fn windows_needing_native_creation(&self) -> Vec<WindowRecord> {
+        self.windows
+            .values()
+            .filter(|window| {
+                self.validate_window(window.handle()).is_ok() && !window.native_created()
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn live_windows(&self) -> Vec<WindowRecord> {
+        self.windows
+            .values()
+            .filter(|window| self.validate_window(window.handle()).is_ok())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn closing_windows_for_platform(&self) -> Vec<AnyWindowHandle> {
+        self.windows
+            .values()
+            .filter(|window| window.lifecycle() == WindowLifecycle::Closing)
+            .map(WindowRecord::handle)
+            .collect()
+    }
     pub fn live_window_count(&self) -> usize {
         self.live_window_ids().len()
     }
@@ -214,6 +322,11 @@ impl RuntimeState {
         self.scene_snapshots.get(&window).cloned()
     }
 
+    #[cfg(any(test, target_os = "windows"))]
+    pub(crate) fn prepared_frame_snapshot(&self, window: WindowId) -> Option<PreparedFrame> {
+        self.prepared_frame_snapshots.get(&window).cloned()
+    }
+
     pub(crate) fn interaction(&self, window: WindowId) -> Option<&InteractionState> {
         self.interaction.get(&window)
     }
@@ -237,6 +350,18 @@ impl RuntimeState {
         self.scene_snapshots.insert(window, snapshot);
     }
 
+    pub(crate) fn set_prepared_frame_snapshot(
+        &mut self,
+        window: WindowId,
+        snapshot: PreparedFrame,
+    ) {
+        self.prepared_frame_snapshots.insert(window, snapshot);
+    }
+
+    pub(crate) fn prepared_frame_count(&self) -> usize {
+        self.prepared_frame_snapshots.len()
+    }
+
     pub fn scene_node_count(&self) -> usize {
         self.scene_snapshots
             .values()
@@ -258,6 +383,14 @@ impl RuntimeState {
 
     pub fn last_scene_compile(&self) -> &SceneCompileStats {
         &self.last_scene_compile
+    }
+
+    pub(crate) fn set_last_frame_graph(&mut self, stats: FrameGraphStats) {
+        self.last_frame_graph = stats;
+    }
+
+    pub(crate) fn last_frame_graph(&self) -> &FrameGraphStats {
+        &self.last_frame_graph
     }
 
     pub fn record_consumed_dirty_lanes(

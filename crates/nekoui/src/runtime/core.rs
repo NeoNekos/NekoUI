@@ -8,8 +8,8 @@ use crate::diagnostic::signal::SignalId;
 use crate::diagnostic::{
     CommandIngressReport, DiagnosticArea, DiagnosticRecord, DiagnosticSeverity, Diagnostics,
     DirtyLane, DirtyLaneReport, DirtyLanes, LayoutPassReport, LayoutPerformanceReport,
-    PerformanceReport, RetainedPerformanceReport, ScenePerformanceReport, StylePerformanceReport,
-    TextPerformanceReport,
+    PerformanceReport, RenderFrameGraphReport, RenderPerformanceReport, RetainedPerformanceReport,
+    ScenePerformanceReport, StylePerformanceReport, TextPerformanceReport,
 };
 use crate::element::{Element, IntoElement};
 use crate::error::{ErrorKind, NekoError, NekoResult};
@@ -17,6 +17,10 @@ use crate::interaction::{
     ClickEvent, InteractionTarget, PointerEvent, PointerInput, PointerInputKind,
 };
 use crate::layout::{LayoutPassStats, LayoutSize, compute_layout};
+#[cfg(target_os = "windows")]
+use crate::platform::NativeRenderer;
+use crate::platform::{PlatformFact, Renderability};
+use crate::render::{FrameGraphStats, PreparedFrameContext, prepare_frame_graph_for_surface};
 use crate::retained::{DirtyCause, RetainedNodeSnapshot, RetainedTreeDiff, RetainedTreeSnapshot};
 use crate::runtime::command::{CommandId, RuntimeCommand, SequencedCommand, WindowCommand};
 use crate::runtime::entity_store::EntityKey;
@@ -40,6 +44,7 @@ pub(crate) struct Runtime {
     style_resolve_duration: Duration,
     layout_duration: Duration,
     scene_compile_duration: Duration,
+    render_prepare_duration: Duration,
     transaction_depth: usize,
     drain_depth: usize,
 }
@@ -58,6 +63,7 @@ impl std::fmt::Debug for Runtime {
             .field("style_resolve_duration", &self.style_resolve_duration)
             .field("layout_duration", &self.layout_duration)
             .field("scene_compile_duration", &self.scene_compile_duration)
+            .field("render_prepare_duration", &self.render_prepare_duration)
             .field("transaction_depth", &self.transaction_depth)
             .field("drain_depth", &self.drain_depth)
             .finish()
@@ -124,6 +130,7 @@ impl Runtime {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(crate) fn state(&self) -> &RuntimeState {
         &self.state
     }
@@ -137,9 +144,18 @@ impl Runtime {
         &self.diagnostics
     }
 
+    #[cfg(target_os = "windows")]
+    pub(crate) fn diagnostics_mut(&mut self) -> &mut Diagnostics {
+        &mut self.diagnostics
+    }
+
     pub(crate) fn enqueue(&mut self, command: RuntimeCommand) -> CommandId {
         self.next_sequence += 1;
         let id = CommandId::new(self.next_sequence);
+        if matches!(command, RuntimeCommand::PlatformFact(_)) {
+            self.diagnostics
+                .increment_signal(SignalId::PlatformFactQueued);
+        }
         self.queue.push_back(SequencedCommand::new(id, command));
         self.diagnostics
             .increment_signal(SignalId::RuntimeCommandQueued);
@@ -292,6 +308,9 @@ impl Runtime {
         let view = build(&mut cx);
         let entity = self.insert_reserved_entity(key, view);
         self.state.open_window(any, options)?;
+        #[cfg(test)]
+        self.state
+            .set_window_renderability(any, Renderability::Renderable)?;
         self.root_views
             .insert(any.id(), Box::new(TypedRootView { entity }));
         self.mount_root_view(any, true)?;
@@ -359,6 +378,13 @@ impl Runtime {
         self.enqueue(RuntimeCommand::PointerInput { handle, input });
         self.drain_if_idle()?;
         Ok(())
+    }
+
+    pub(crate) fn ingest_platform_fact(&mut self, fact: PlatformFact) -> NekoResult<CommandId> {
+        self.validate_platform_fact(&fact)?;
+        let id = self.enqueue(RuntimeCommand::PlatformFact(fact));
+        self.drain_if_idle()?;
+        Ok(id)
     }
 
     pub(crate) fn validate_window(&mut self, handle: impl Into<AnyWindowHandle>) -> NekoResult<()> {
@@ -550,14 +576,100 @@ impl Runtime {
                     .last_scene_compile()
                     .unsupported_fragment_count,
             },
+            render: RenderPerformanceReport {
+                frame_graph_count: snapshot.counter("render.frame_graph"),
+                pass_count: snapshot.counter("render.pass"),
+                upload_plan_count: snapshot.counter("render.upload.plan"),
+                layer_count: snapshot.counter("render.layer"),
+                stale_drop_count: snapshot.counter("render.stale_drop"),
+                unsupported_count: snapshot.counter("render.unsupported"),
+                prepared_frame_count: self.state.prepared_frame_count(),
+                last_frame_graph: RenderFrameGraphReport {
+                    surface_generation: self.state.last_frame_graph().surface_generation,
+                    pass_count: self.state.last_frame_graph().pass_count,
+                    draw_item_count: self.state.last_frame_graph().draw_item_count,
+                    upload_intent_count: self.state.last_frame_graph().upload_intent_count,
+                    layer_count: self.state.last_frame_graph().layer_count,
+                    unsupported_fragment_count: self
+                        .state
+                        .last_frame_graph()
+                        .unsupported_fragment_count,
+                    stale_drop_count: self.state.last_frame_graph().stale_drop_count,
+                    duration: self.state.last_frame_graph().duration,
+                },
+            },
+            gpu: crate::diagnostic::GpuPerformanceReport {
+                backend_selected_count: snapshot.counter("gpu.backend.selected"),
+                surface_state_count: snapshot.counter("gpu.surface.state"),
+                frame_phase_count: snapshot.counter("gpu.frame.phase"),
+                presented_count: snapshot.counter("gpu.frame.presented"),
+                not_renderable_count: snapshot.counter("gpu.frame.not_renderable"),
+                stale_drop_count: snapshot.counter("gpu.frame.stale_drop"),
+                unsupported_count: snapshot.counter("gpu.unsupported"),
+                recovery_count: snapshot.counter("gpu.recovery"),
+            },
             dirty_lanes,
             phase_durations: BTreeMap::from([
                 ("retained.diff", self.retained_diff_duration),
                 ("style.resolve", self.style_resolve_duration),
                 ("layout.pass", self.layout_duration),
                 ("scene.compile", self.scene_compile_duration),
+                ("render.frame_graph", self.render_prepare_duration),
             ]),
         }
+    }
+
+    pub(crate) fn take_platform_redraw_requests(&mut self) -> Vec<AnyWindowHandle> {
+        self.state
+            .scheduler_mut()
+            .take_platform_redraw_requests()
+            .into_iter()
+            .filter_map(|window| {
+                self.state
+                    .window_by_id(window)
+                    .ok()
+                    .map(|record| record.handle())
+            })
+            .collect()
+    }
+
+    pub(crate) fn take_platform_close_requests(&self) -> Vec<AnyWindowHandle> {
+        self.state.closing_windows_for_platform()
+    }
+    pub(crate) fn live_windows_for_platform(&self) -> Vec<crate::window::WindowRecord> {
+        self.state.live_windows()
+    }
+
+    pub(crate) fn windows_needing_native_creation(&self) -> Vec<crate::window::WindowRecord> {
+        self.state.windows_needing_native_creation()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn window_record_for_platform(
+        &self,
+        handle: AnyWindowHandle,
+    ) -> NekoResult<crate::window::WindowRecord> {
+        self.state.window(handle).cloned()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn render_prepared_frame_for_platform(
+        &mut self,
+        renderer: &mut NativeRenderer,
+        handle: AnyWindowHandle,
+    ) -> NekoResult<Option<crate::platform::BackendFrameReceipt>> {
+        let record = self.state.window(handle)?.clone();
+        let Some(prepared) = self.state.prepared_frame_snapshot(handle.id()) else {
+            return Ok(None);
+        };
+        let receipt = renderer.render_prepared_frame(
+            handle,
+            &prepared,
+            self.state.font_manager(),
+            record.renderability(),
+            &mut self.diagnostics,
+        )?;
+        Ok(Some(receipt))
     }
 
     fn request_redraw(&mut self, window: crate::window::WindowId) {
@@ -568,6 +680,12 @@ impl Runtime {
             RedrawRequestOutcome::Coalesced => self
                 .diagnostics
                 .increment_signal(SignalId::RuntimeRedrawCoalesced),
+            RedrawRequestOutcome::SuppressedNotRenderable => {
+                self.diagnostics
+                    .increment_signal(SignalId::RuntimeRedrawSuppressed);
+                self.diagnostics
+                    .increment_signal(SignalId::RuntimeNotRenderable);
+            }
         }
     }
 
@@ -583,7 +701,127 @@ impl Runtime {
             RuntimeCommand::PointerInput { handle, input } => {
                 self.process_pointer_input(handle, input)
             }
+            RuntimeCommand::PlatformFact(fact) => self.process_platform_fact(fact),
             RuntimeCommand::Window(window_command) => self.process_window(window_command),
+        }
+    }
+
+    fn process_platform_fact(&mut self, fact: PlatformFact) -> NekoResult<()> {
+        self.diagnostics
+            .increment_signal(SignalId::PlatformFactProcessed);
+        match fact {
+            PlatformFact::WindowCreated { handle } => {
+                self.state.mark_native_window_created(handle)?;
+                self.diagnostics
+                    .increment_signal(SignalId::PlatformWindowCreated);
+                self.diagnostics
+                    .increment_signal(SignalId::WindowLifecycleTransition);
+                Ok(())
+            }
+            PlatformFact::WindowShown { handle } => {
+                self.state.show_window(handle)?;
+                self.diagnostics
+                    .increment_signal(SignalId::WindowLifecycleTransition);
+                Ok(())
+            }
+            PlatformFact::CloseRequested { handle } => {
+                self.state.request_close_window(handle)?;
+                self.state
+                    .scheduler_mut()
+                    .mark_dirty(handle.id(), DirtyLane::Semantics);
+                self.diagnostics
+                    .increment_signal(SignalId::WindowLifecycleTransition);
+                self.enqueue(RuntimeCommand::PlatformFact(PlatformFact::CloseConfirmed {
+                    handle,
+                }));
+                Ok(())
+            }
+            PlatformFact::CloseConfirmed { handle } => {
+                self.state.confirm_close_window(handle)?;
+                self.diagnostics
+                    .increment_signal(SignalId::WindowLifecycleTransition);
+                Ok(())
+            }
+            PlatformFact::Destroyed { handle } => {
+                self.diagnostics
+                    .increment_signal(SignalId::PlatformWindowDestroyed);
+                self.destroy_window(handle)
+            }
+            PlatformFact::LogicalSizeChanged {
+                handle,
+                logical_size,
+            } => {
+                logical_size.validate_viewport()?;
+                self.apply_window_resize(handle, logical_size, true)
+            }
+            PlatformFact::PhysicalSizeChanged {
+                handle,
+                physical_size,
+            } => {
+                let changed = self.state.set_window_physical_size(handle, physical_size)?;
+                let renderability = if physical_size.is_zero() {
+                    Renderability::ZeroSize
+                } else {
+                    Renderability::Renderable
+                };
+                self.apply_renderability(handle, renderability)?;
+                if changed {
+                    self.diagnostics
+                        .increment_signal(SignalId::SurfaceGenerationBumped);
+                    self.mark_size_or_scale_changed(handle);
+                }
+                Ok(())
+            }
+            PlatformFact::ScaleFactorChanged {
+                handle,
+                scale_factor,
+            } => {
+                let changed = self.state.rescale_window(handle, scale_factor)?;
+                if changed {
+                    self.diagnostics
+                        .increment_signal(SignalId::SurfaceGenerationBumped);
+                    self.mark_size_or_scale_changed(handle);
+                }
+                Ok(())
+            }
+            PlatformFact::Minimized { handle } => {
+                self.state.minimize_window(handle)?;
+                self.diagnostics
+                    .increment_signal(SignalId::WindowLifecycleTransition);
+                self.diagnostics
+                    .increment_signal(SignalId::RuntimeNotRenderable);
+                Ok(())
+            }
+            PlatformFact::Restored { handle } => {
+                let requested = self.state.restore_window(handle)?;
+                self.diagnostics
+                    .increment_signal(SignalId::WindowLifecycleTransition);
+                if requested {
+                    self.diagnostics
+                        .increment_signal(SignalId::RuntimeRedrawRequested);
+                }
+                Ok(())
+            }
+            PlatformFact::RenderabilityChanged {
+                handle,
+                renderability,
+            } => self.apply_renderability(handle, renderability),
+            PlatformFact::RedrawRequested { handle } => {
+                self.state.validate_window(handle)?;
+                if self
+                    .state
+                    .scheduler_mut()
+                    .consume_pending_redraw(handle.id())
+                {
+                    self.execute_layout_if_dirty(handle)?;
+                    self.execute_scene_if_dirty(handle)?;
+                }
+                Ok(())
+            }
+            PlatformFact::Wake | PlatformFact::Exit => Ok(()),
+            PlatformFact::PointerInput { handle, input } => {
+                self.process_pointer_input(handle, input)
+            }
         }
     }
 
@@ -675,34 +913,132 @@ impl Runtime {
                 Ok(())
             }
             WindowCommand::Close { handle } => {
-                self.state.close_window(handle)?;
-                self.root_views.remove(&handle.id());
-                self.state
-                    .scheduler_mut()
-                    .mark_dirty(handle.id(), DirtyLane::Semantics);
-                self.state
-                    .emit_retained_dirty(None, DirtyCause::WindowClosed, initial_lanes());
-                Ok(())
+                self.process_platform_fact(PlatformFact::CloseConfirmed { handle })?;
+                self.process_platform_fact(PlatformFact::Destroyed { handle })
             }
             WindowCommand::Resize {
                 handle,
                 logical_size,
+            } => self.apply_window_resize(handle, logical_size, false),
+        }
+    }
+
+    fn apply_window_resize(
+        &mut self,
+        handle: AnyWindowHandle,
+        logical_size: LayoutSize,
+        defer_frame_work: bool,
+    ) -> NekoResult<()> {
+        self.state.resize_window(handle, logical_size)?;
+        self.diagnostics
+            .increment_signal(SignalId::SurfaceGenerationBumped);
+        self.mark_size_or_scale_changed(handle);
+        if !defer_frame_work {
+            self.execute_layout_if_dirty(handle)?;
+            self.execute_scene_if_dirty(handle)?;
+        }
+        Ok(())
+    }
+
+    fn mark_size_or_scale_changed(&mut self, handle: AnyWindowHandle) {
+        self.state
+            .scheduler_mut()
+            .mark_dirty(handle.id(), DirtyLane::Layout);
+        self.state
+            .scheduler_mut()
+            .mark_dirty(handle.id(), DirtyLane::Surface);
+        self.state
+            .scheduler_mut()
+            .mark_dirty(handle.id(), DirtyLane::Paint);
+        self.request_redraw(handle.id());
+    }
+
+    fn destroy_window(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
+        let _ = self.state.confirm_close_window(handle);
+        self.state.close_window(handle)?;
+        self.root_views.remove(&handle.id());
+        self.state
+            .scheduler_mut()
+            .mark_dirty(handle.id(), DirtyLane::Semantics);
+        self.state
+            .emit_retained_dirty(None, DirtyCause::WindowClosed, initial_lanes());
+        self.diagnostics
+            .increment_signal(SignalId::WindowLifecycleTransition);
+        Ok(())
+    }
+
+    fn apply_renderability(
+        &mut self,
+        handle: AnyWindowHandle,
+        renderability: Renderability,
+    ) -> NekoResult<()> {
+        let outcome = self.state.set_window_renderability(handle, renderability)?;
+        self.diagnostics
+            .increment_signal(SignalId::PlatformRenderabilityChanged);
+        if !renderability.is_renderable() {
+            self.diagnostics
+                .increment_signal(SignalId::RuntimeNotRenderable);
+        }
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Runtime,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "renderability.changed",
+                "window renderability changed",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("renderability", renderability.name()),
+        );
+        match outcome {
+            RedrawRequestOutcome::Requested => self
+                .diagnostics
+                .increment_signal(SignalId::RuntimeRedrawRequested),
+            RedrawRequestOutcome::Coalesced => {}
+            RedrawRequestOutcome::SuppressedNotRenderable => self
+                .diagnostics
+                .increment_signal(SignalId::RuntimeRedrawSuppressed),
+        }
+        Ok(())
+    }
+
+    fn validate_platform_fact(&mut self, fact: &PlatformFact) -> NekoResult<()> {
+        match *fact {
+            PlatformFact::WindowCreated { handle }
+            | PlatformFact::WindowShown { handle }
+            | PlatformFact::CloseRequested { handle }
+            | PlatformFact::CloseConfirmed { handle }
+            | PlatformFact::Destroyed { handle }
+            | PlatformFact::RedrawRequested { handle } => self.validate_window(handle),
+            PlatformFact::LogicalSizeChanged {
+                handle,
+                logical_size,
             } => {
-                self.state.resize_window(handle, logical_size)?;
-                self.state
-                    .scheduler_mut()
-                    .mark_dirty(handle.id(), DirtyLane::Layout);
-                self.state
-                    .scheduler_mut()
-                    .mark_dirty(handle.id(), DirtyLane::Surface);
-                self.state
-                    .scheduler_mut()
-                    .mark_dirty(handle.id(), DirtyLane::Paint);
-                self.request_redraw(handle.id());
-                self.execute_layout_if_dirty(handle)?;
-                self.execute_scene_if_dirty(handle)?;
-                Ok(())
+                self.validate_window(handle)?;
+                logical_size.validate_viewport()
             }
+            PlatformFact::PhysicalSizeChanged { handle, .. } => self.validate_window(handle),
+            PlatformFact::ScaleFactorChanged {
+                handle,
+                scale_factor,
+            } => {
+                self.validate_window(handle)?;
+                if scale_factor.is_finite() && scale_factor > 0.0 {
+                    Ok(())
+                } else {
+                    Err(NekoError::invalid_input(
+                        "viewport scale factor must be finite and positive",
+                    ))
+                }
+            }
+            PlatformFact::Minimized { handle }
+            | PlatformFact::Restored { handle }
+            | PlatformFact::RenderabilityChanged { handle, .. } => self.validate_window(handle),
+            PlatformFact::PointerInput { handle, input } => {
+                self.validate_window(handle)?;
+                validate_pointer_input_position(input)
+            }
+            PlatformFact::Wake | PlatformFact::Exit => Ok(()),
         }
     }
 
@@ -1015,6 +1351,11 @@ impl Runtime {
 
     fn execute_scene_if_dirty(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
         self.state.validate_window(handle)?;
+        if !self.state.window(handle)?.renderability().is_renderable() {
+            self.diagnostics
+                .increment_signal(SignalId::RuntimeNotRenderable);
+            return Ok(());
+        }
         let taken = self
             .state
             .scheduler_mut()
@@ -1056,8 +1397,84 @@ impl Runtime {
         }
         self.record_scene_compile(handle, &output.stats, "published");
         self.state.set_last_scene_compile(output.stats);
-        self.state.set_scene_snapshot(handle.id(), output.scene);
+        self.state
+            .set_scene_snapshot(handle.id(), output.scene.clone());
+        let record = self.state.window(handle)?.clone();
+        let expected_surface_generation = record.surface_generation();
+        let frame_context = PreparedFrameContext::for_surface(
+            record.viewport(),
+            record.physical_size(),
+            expected_surface_generation,
+        );
+        let prepared_frame = prepare_frame_graph_for_surface(&output.scene, frame_context);
+        let current_surface_generation = self.state.window(handle)?.surface_generation();
+        if !prepared_frame
+            .is_current_for_scene_and_surface(&output.scene, current_surface_generation)
+        {
+            let mut stats = prepared_frame.stats().clone();
+            stats.stale_drop_count = stats.stale_drop_count.saturating_add(1);
+            self.record_render_frame_graph(handle, &stats, "stale_drop");
+            self.state.set_last_frame_graph(stats);
+            self.state
+                .scheduler_mut()
+                .mark_dirty(handle.id(), DirtyLane::Paint);
+            return Ok(());
+        }
+        let stats = prepared_frame.stats().clone();
+        self.record_render_frame_graph(handle, &stats, "prepared");
+        self.state.set_last_frame_graph(stats);
+        self.state
+            .set_prepared_frame_snapshot(handle.id(), prepared_frame);
         Ok(())
+    }
+
+    fn record_render_frame_graph(
+        &mut self,
+        handle: AnyWindowHandle,
+        stats: &FrameGraphStats,
+        result: &'static str,
+    ) {
+        self.render_prepare_duration += stats.duration;
+        self.diagnostics
+            .increment_signal(SignalId::RenderFrameGraph);
+        self.diagnostics
+            .add_signal(SignalId::RenderPass, stats.pass_count as u64);
+        self.diagnostics
+            .add_signal(SignalId::RenderUploadPlan, stats.upload_intent_count as u64);
+        self.diagnostics
+            .add_signal(SignalId::RenderLayer, stats.layer_count as u64);
+        self.diagnostics
+            .add_signal(SignalId::RenderStaleDrop, stats.stale_drop_count);
+        self.diagnostics.add_signal(
+            SignalId::RenderUnsupported,
+            stats.unsupported_fragment_count as u64,
+        );
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Render,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "render.frame_graph",
+                "render frame graph prepared",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("result", result)
+            .with_field(
+                "surface_generation",
+                stats
+                    .surface_generation
+                    .map_or_else(|| "none".to_owned(), |generation| generation.to_string()),
+            )
+            .with_field("pass_count", stats.pass_count.to_string())
+            .with_field("draw_item_count", stats.draw_item_count.to_string())
+            .with_field("upload_intent_count", stats.upload_intent_count.to_string())
+            .with_field("layer_count", stats.layer_count.to_string())
+            .with_field(
+                "unsupported_fragment_count",
+                stats.unsupported_fragment_count.to_string(),
+            )
+            .with_field("duration_micros", stats.duration.as_micros().to_string()),
+        );
     }
 
     fn record_scene_compile(

@@ -12,6 +12,8 @@ pub enum DiagnosticArea {
     Style,
     Layout,
     Scene,
+    Render,
+    Gpu,
     Input,
     Text,
     Scheduler,

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fmt;
 use std::sync::Arc;
 
@@ -34,10 +35,6 @@ impl FontMetadata {
             family: "NekoUI deterministic fallback",
         }
     }
-
-    pub(crate) fn family(&self) -> &'static str {
-        self.family
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,15 +63,9 @@ pub(crate) struct FontFallbackSnapshot {
 }
 
 impl FontFallbackSnapshot {
+    #[cfg(test)]
     pub(crate) fn generation(&self) -> FontGeneration {
         self.generation
-    }
-
-    pub(crate) fn default_family(&self) -> &'static str {
-        self.entries
-            .first()
-            .map(FontMetadata::family)
-            .unwrap_or("NekoUI deterministic fallback")
     }
 
     pub(crate) fn metadata_count(&self) -> usize {
@@ -91,6 +82,9 @@ pub(crate) struct FontManager {
     generation: FontGeneration,
     fallback_snapshot: FontFallbackSnapshot,
     _database: fontdb::Database,
+    font_system: RefCell<cosmic_text::FontSystem>,
+    #[cfg(target_os = "windows")]
+    swash_cache: RefCell<cosmic_text::SwashCache>,
 }
 
 impl fmt::Debug for FontManager {
@@ -114,6 +108,9 @@ impl Default for FontManager {
                 blobs: Arc::from([]),
             },
             _database: fontdb::Database::new(),
+            font_system: RefCell::new(cosmic_text::FontSystem::new()),
+            #[cfg(target_os = "windows")]
+            swash_cache: RefCell::new(cosmic_text::SwashCache::new()),
         }
     }
 }
@@ -125,6 +122,47 @@ impl FontManager {
 
     pub(crate) fn fallback_snapshot(&self) -> FontFallbackSnapshot {
         self.fallback_snapshot.clone()
+    }
+
+    pub(crate) fn with_font_system<R>(
+        &self,
+        f: impl FnOnce(&mut cosmic_text::FontSystem) -> R,
+    ) -> R {
+        f(&mut self.font_system.borrow_mut())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn rasterize_glyph(
+        &self,
+        key: crate::text::GlyphKey,
+    ) -> Result<crate::text::GlyphBitmap, crate::text::GlyphRasterError> {
+        use cosmic_text::SwashContent;
+
+        let mut font_system = self.font_system.borrow_mut();
+        let mut swash_cache = self.swash_cache.borrow_mut();
+        let Some(image) = swash_cache
+            .get_image(&mut font_system, key.cache_key())
+            .as_ref()
+        else {
+            return Err(crate::text::GlyphRasterError::MissingGlyph);
+        };
+        if image.content != SwashContent::Mask {
+            return Err(crate::text::GlyphRasterError::UnsupportedContent(
+                match image.content {
+                    SwashContent::Mask => "mask",
+                    SwashContent::SubpixelMask => "subpixel_mask",
+                    SwashContent::Color => "color_glyph",
+                },
+            ));
+        }
+        Ok(crate::text::GlyphBitmap::new(
+            key,
+            image.placement.width,
+            image.placement.height,
+            image.placement.left,
+            image.placement.top,
+            Arc::from(image.data.as_slice()),
+        ))
     }
 
     #[cfg(test)]

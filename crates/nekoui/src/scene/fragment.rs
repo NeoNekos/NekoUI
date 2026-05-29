@@ -2,6 +2,7 @@ use crate::layout::LayoutRect;
 use crate::retained::{NodeGeneration, RetainedNodeId};
 use crate::scene::SceneInputSignature;
 use crate::style::Color;
+use crate::text::TextLayoutRef;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct SceneOrder(u64);
@@ -42,6 +43,7 @@ pub struct PaintFragment {
     order: SceneOrder,
     rect: LayoutRect,
     kind: PaintFragmentKind,
+    text_layout: Option<TextLayoutRef>,
 }
 
 impl PaintFragment {
@@ -58,7 +60,13 @@ impl PaintFragment {
             order,
             rect,
             kind,
+            text_layout: None,
         }
+    }
+
+    pub(crate) fn with_text_layout(mut self, layout: TextLayoutRef) -> Self {
+        self.text_layout = Some(layout);
+        self
     }
 
     pub fn node_id(&self) -> RetainedNodeId {
@@ -79,5 +87,9 @@ impl PaintFragment {
 
     pub fn kind(&self) -> &PaintFragmentKind {
         &self.kind
+    }
+
+    pub(crate) fn text_layout(&self) -> Option<&TextLayoutRef> {
+        self.text_layout.as_ref()
     }
 }
