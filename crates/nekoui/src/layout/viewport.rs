@@ -59,6 +59,13 @@ impl LayoutPoint {
     pub fn y(self) -> f32 {
         self.y
     }
+
+    pub const fn translate(self, dx: f32, dy: f32) -> Self {
+        Self {
+            x: self.x + dx,
+            y: self.y + dy,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -109,6 +116,25 @@ impl LayoutRect {
             && point.y() >= self.y()
             && point.x() < self.x() + self.width()
             && point.y() < self.y() + self.height()
+    }
+
+    pub fn translate(self, dx: f32, dy: f32) -> Self {
+        Self {
+            origin: self.origin.translate(dx, dy),
+            size: self.size,
+        }
+    }
+
+    pub fn intersect(self, other: Self) -> Option<Self> {
+        let left = self.x().max(other.x());
+        let top = self.y().max(other.y());
+        let right = (self.x() + self.width()).min(other.x() + other.width());
+        let bottom = (self.y() + self.height()).min(other.y() + other.height());
+        if right > left && bottom > top {
+            Some(Self::new(left, top, right - left, bottom - top))
+        } else {
+            None
+        }
     }
 }
 

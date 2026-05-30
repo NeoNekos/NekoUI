@@ -1,6 +1,7 @@
 use crate::element::{ElementKey, ElementKind};
-use crate::layout::{LayoutRect, LayoutSize, Viewport};
+use crate::layout::{LayoutPoint, LayoutRect, LayoutSize, Viewport};
 use crate::retained::{RetainedNodeId, RetainedTreeGeneration};
+use crate::style::Overflow;
 use crate::text::TextLayoutRef;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -28,6 +29,7 @@ pub struct LayoutNodeSnapshot {
     padding_rect: LayoutRect,
     content_rect: LayoutRect,
     content_size: LayoutSize,
+    scroll: ScrollGeometry,
     text_layout: Option<TextLayoutRef>,
     children: Vec<LayoutNodeSnapshot>,
 }
@@ -49,6 +51,7 @@ impl LayoutNodeSnapshot {
             padding_rect: boxes.padding_rect,
             content_rect: boxes.content_rect,
             content_size: boxes.content_size,
+            scroll: boxes.scroll,
             text_layout: boxes.text_layout,
             children,
         }
@@ -86,6 +89,10 @@ impl LayoutNodeSnapshot {
         self.content_size
     }
 
+    pub fn scroll(&self) -> ScrollGeometry {
+        self.scroll
+    }
+
     pub(crate) fn text_layout(&self) -> Option<&TextLayoutRef> {
         self.text_layout.as_ref()
     }
@@ -117,6 +124,7 @@ impl LayoutNodeSnapshot {
                 padding_rect: self.padding_rect,
                 content_rect: self.content_rect,
                 content_size: self.content_size,
+                scroll: self.scroll,
             },
         ));
         for child in &self.children {
@@ -132,7 +140,53 @@ pub(crate) struct LayoutBoxes {
     pub padding_rect: LayoutRect,
     pub content_rect: LayoutRect,
     pub content_size: LayoutSize,
+    pub scroll: ScrollGeometry,
     pub text_layout: Option<TextLayoutRef>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollGeometry {
+    overflow: Overflow,
+    viewport: LayoutRect,
+    content_extent: LayoutSize,
+}
+
+impl ScrollGeometry {
+    pub const fn new(overflow: Overflow, viewport: LayoutRect, content_extent: LayoutSize) -> Self {
+        Self {
+            overflow,
+            viewport,
+            content_extent,
+        }
+    }
+
+    pub fn overflow(self) -> Overflow {
+        self.overflow
+    }
+
+    pub fn viewport(self) -> LayoutRect {
+        self.viewport
+    }
+
+    pub fn content_extent(self) -> LayoutSize {
+        self.content_extent
+    }
+
+    pub fn scrollable(self) -> bool {
+        self.overflow == Overflow::Scroll
+            && (self.max_offset().x() > 0.0 || self.max_offset().y() > 0.0)
+    }
+
+    pub fn clips(self) -> bool {
+        matches!(self.overflow, Overflow::Hidden | Overflow::Scroll)
+    }
+
+    pub fn max_offset(self) -> LayoutPoint {
+        LayoutPoint::new(
+            (self.content_extent.width() - self.viewport.width()).max(0.0),
+            (self.content_extent.height() - self.viewport.height()).max(0.0),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -142,6 +196,7 @@ pub(crate) struct GeometryKey {
     padding_rect: LayoutRect,
     content_rect: LayoutRect,
     content_size: LayoutSize,
+    scroll: ScrollGeometry,
 }
 
 #[derive(Clone, Debug, PartialEq)]

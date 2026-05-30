@@ -1,6 +1,6 @@
 use crate::diagnostic::{DirtyLane, DirtyLanes};
 use crate::style::{
-    Color, Dimension, Display, Edges, Length, Opacity, StyleDeclaration, TextOverflow,
+    Color, Dimension, Display, Edges, Length, Opacity, Overflow, StyleDeclaration, TextOverflow,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -11,6 +11,7 @@ pub struct ResolvedLayoutStyle {
     padding: Edges<Length>,
     margin: Edges<Length>,
     gap: Length,
+    overflow: Overflow,
 }
 
 impl Default for ResolvedLayoutStyle {
@@ -22,6 +23,7 @@ impl Default for ResolvedLayoutStyle {
             padding: Edges::all(Length::ZERO),
             margin: Edges::all(Length::ZERO),
             gap: Length::ZERO,
+            overflow: Overflow::Visible,
         }
     }
 }
@@ -49,6 +51,10 @@ impl ResolvedLayoutStyle {
 
     pub fn gap(&self) -> Length {
         self.gap
+    }
+
+    pub fn overflow(&self) -> Overflow {
+        self.overflow
     }
 }
 
@@ -140,6 +146,7 @@ impl ResolvedStyle {
                     left: margin.left.unwrap_or(Length::ZERO),
                 },
                 gap: layout_declaration.gap().unwrap_or(Length::ZERO),
+                overflow: layout_declaration.overflow().unwrap_or(Overflow::Visible),
             },
             visual: ResolvedVisualStyle {
                 background: visual_declaration.background(),
@@ -212,7 +219,7 @@ impl ResolvedStyle {
 #[cfg(test)]
 mod tests {
     use crate::diagnostic::DirtyLane;
-    use crate::style::{Color, ResolvedStyle, StyleDeclaration, px};
+    use crate::style::{Color, Overflow, ResolvedStyle, StyleDeclaration, px};
 
     #[test]
     fn text_style_inherits_but_box_geometry_defaults() {
@@ -230,6 +237,7 @@ mod tests {
         assert_eq!(child.text().text_color(), Color::rgb(20, 30, 40));
         assert_eq!(child.layout().padding().left, px(0.0));
         assert_eq!(child.layout().gap(), px(0.0));
+        assert_eq!(child.layout().overflow(), Overflow::Visible);
     }
 
     #[test]
@@ -242,6 +250,10 @@ mod tests {
         let text_geometry =
             ResolvedStyle::resolve(&StyleDeclaration::default().font_size(px(20.0)), None);
         let layout = ResolvedStyle::resolve(&StyleDeclaration::default().padding(px(4.0)), None);
+        let overflow = ResolvedStyle::resolve(
+            &StyleDeclaration::default().overflow(Overflow::Scroll),
+            None,
+        );
 
         let text_color_lanes = text_color.dirty_lanes_since(&base);
         assert!(text_color_lanes.contains(DirtyLane::Paint.flag()));
@@ -254,5 +266,10 @@ mod tests {
         let layout_lanes = layout.dirty_lanes_since(&base);
         assert!(layout_lanes.contains(DirtyLane::Layout.flag()));
         assert!(layout_lanes.contains(DirtyLane::Semantics.flag()));
+
+        let overflow_lanes = overflow.dirty_lanes_since(&base);
+        assert!(overflow_lanes.contains(DirtyLane::Layout.flag()));
+        assert!(overflow_lanes.contains(DirtyLane::Semantics.flag()));
+        assert!(overflow_lanes.contains(DirtyLane::Paint.flag()));
     }
 }

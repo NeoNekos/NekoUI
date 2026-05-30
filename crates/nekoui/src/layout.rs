@@ -3,7 +3,7 @@ mod snapshot;
 mod taffy_adapter;
 mod viewport;
 
-pub use snapshot::{LayoutGeneration, LayoutNodeSnapshot, LayoutTreeSnapshot};
+pub use snapshot::{LayoutGeneration, LayoutNodeSnapshot, LayoutTreeSnapshot, ScrollGeometry};
 pub use viewport::{LayoutPoint, LayoutRect, LayoutSize, Viewport, ViewportGeneration};
 
 pub(crate) use engine::{LayoutPassStats, compute_layout};

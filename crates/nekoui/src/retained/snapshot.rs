@@ -12,6 +12,7 @@ pub struct RetainedNodeSnapshot {
     pub(crate) kind: ElementKind,
     pub(crate) key: Option<ElementKey>,
     pub(crate) style: StyleDeclaration,
+    pub(crate) focusable: bool,
     pub(crate) handlers: InteractionHandlers,
     pub(crate) resolved_style: ResolvedStyle,
     pub(crate) participation: OutputParticipation,
@@ -38,6 +39,10 @@ impl RetainedNodeSnapshot {
 
     pub fn style(&self) -> &StyleDeclaration {
         &self.style
+    }
+
+    pub(crate) fn focusable(&self) -> bool {
+        self.focusable
     }
 
     pub(crate) fn handlers(&self) -> &InteractionHandlers {

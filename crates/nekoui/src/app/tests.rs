@@ -394,6 +394,7 @@ mod internal_harness_public_api_tests {
         let retained = run.retained_snapshot(window).unwrap();
         let style = run.style_snapshot(window).unwrap();
         let layout = run.layout_snapshot(window).unwrap();
+        let semantics = run.semantic_snapshot(window).unwrap();
         let scene = run.scene_snapshot(window).unwrap();
 
         assert_eq!(retained.node_count(), 2);
@@ -403,9 +404,15 @@ mod internal_harness_public_api_tests {
             layout.viewport().logical_size(),
             LayoutSize::new(320.0, 240.0)
         );
+        assert_eq!(semantics.node_count(), 2);
+        assert_eq!(
+            semantics.find_by_key("label").unwrap().name(),
+            Some("Hello")
+        );
         assert_eq!(scene.stats().node_count, 2);
         assert_eq!(run.probe_snapshot().performance().retained.node_count, 2);
         assert!(run.performance_report().retained.node_count >= 2);
+        assert!(run.diagnostics().counter("semantics.build") >= 1);
         assert!(run.diagnostics().counter("scene.compile") >= 1);
     }
 

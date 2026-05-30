@@ -2,15 +2,15 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use crate::element::ElementKind;
-use crate::layout::{LayoutNodeSnapshot, LayoutRect, LayoutTreeSnapshot};
+use crate::interaction::InteractionState;
+use crate::layout::{LayoutNodeSnapshot, LayoutPoint, LayoutRect, LayoutTreeSnapshot};
 use crate::retained::{RetainedNodeSnapshot, RetainedTreeSnapshot};
 use crate::scene::{
-    DamageRegion, HitTestEntry, HitTestScene, PaintFragment, PaintFragmentKind, PaintScene,
-    ResourceDemandKind, SceneCompileStats, SceneDiagnostic, SceneGeneration, SceneInputSignature,
-    SceneOrder, SceneResourceDemand, SceneSignatureFact,
+    DamageRegion, HitTestEntry, HitTestPathNode, HitTestScene, PaintFragment, PaintFragmentKind,
+    PaintScene, ResourceDemandKind, SceneCompileStats, SceneDiagnostic, SceneGeneration,
+    SceneInputSignature, SceneOrder, SceneResourceDemand, SceneSignatureFact,
 };
-use crate::style::StyleTreeSnapshot;
-use crate::style::{Color, Display, TextOverflow};
+use crate::style::{Color, Display, Overflow, StyleTreeSnapshot, TextOverflow};
 use crate::text::TextGlyphDemand;
 
 #[derive(Clone, Copy, Debug)]
@@ -18,6 +18,7 @@ pub(crate) struct SceneCompileInput<'a> {
     pub retained: &'a RetainedTreeSnapshot,
     pub style: &'a StyleTreeSnapshot,
     pub layout: &'a LayoutTreeSnapshot,
+    pub interaction: Option<&'a InteractionState>,
     pub previous: Option<&'a PaintScene>,
 }
 
@@ -29,12 +30,13 @@ pub(crate) struct SceneCompileOutput {
 
 pub(crate) fn compile_scene(input: SceneCompileInput<'_>) -> SceneCompileOutput {
     let started = Instant::now();
-    let generation = SceneGeneration::new(
+    let generation = SceneGeneration::new_with_scroll(
         input.retained.generation(),
         input.layout.generation(),
         style_signature(input.style),
         input.layout.viewport().generation().raw(),
         text_signature(input.retained),
+        scroll_signature(input.interaction),
     );
     let damage = input.previous.map_or_else(
         || DamageRegion::initial(viewport_rect(input.layout)),
@@ -52,11 +54,12 @@ pub(crate) fn compile_scene(input: SceneCompileInput<'_>) -> SceneCompileOutput 
 
     let mut compiler = SceneCompiler::new(generation, damage);
     if let (Some(retained), Some(layout)) = (input.retained.root(), input.layout.root()) {
-        compiler.visit(retained, layout, true);
+        compiler.visit(retained, layout, true, VisitContext::new(input.interaction));
     }
     compiler.finish(started)
 }
 
+#[cfg(test)]
 pub(crate) fn scene_generation_for_inputs(
     retained: &RetainedTreeSnapshot,
     style: &StyleTreeSnapshot,
@@ -71,6 +74,23 @@ pub(crate) fn scene_generation_for_inputs(
     )
 }
 
+pub(crate) fn scene_generation_for_inputs_with_interaction(
+    retained: &RetainedTreeSnapshot,
+    style: &StyleTreeSnapshot,
+    layout: &LayoutTreeSnapshot,
+    interaction: Option<&InteractionState>,
+) -> SceneGeneration {
+    SceneGeneration::new_with_scroll(
+        retained.generation(),
+        layout.generation(),
+        style_signature(style),
+        layout.viewport().generation().raw(),
+        text_signature(retained),
+        scroll_signature(interaction),
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn scene_matches_inputs(
     generation: SceneGeneration,
     retained: &RetainedTreeSnapshot,
@@ -80,6 +100,7 @@ pub(crate) fn scene_matches_inputs(
     generation == scene_generation_for_inputs(retained, style, layout)
 }
 
+#[cfg(test)]
 pub(crate) fn scene_publish_is_current(
     expected: SceneGeneration,
     output: SceneGeneration,
@@ -88,6 +109,19 @@ pub(crate) fn scene_publish_is_current(
     layout: &LayoutTreeSnapshot,
 ) -> bool {
     output == expected && scene_matches_inputs(expected, retained, style, layout)
+}
+
+pub(crate) fn scene_publish_is_current_with_interaction(
+    expected: SceneGeneration,
+    output: SceneGeneration,
+    retained: &RetainedTreeSnapshot,
+    style: &StyleTreeSnapshot,
+    layout: &LayoutTreeSnapshot,
+    interaction: Option<&InteractionState>,
+) -> bool {
+    output == expected
+        && expected
+            == scene_generation_for_inputs_with_interaction(retained, style, layout, interaction)
 }
 
 struct SceneCompiler {
@@ -132,10 +166,20 @@ impl SceneCompiler {
         retained: &RetainedNodeSnapshot,
         layout: &LayoutNodeSnapshot,
         ancestors_visually_emitted: bool,
+        context: VisitContext,
     ) {
         if retained.id() != layout.node_id() || !retained.participation().layout() {
             return;
         }
+
+        let scroll_offset = context.scroll_offset(retained, layout);
+        let local_clip = if layout.scroll().clips() {
+            Some(context.map_rect(layout.scroll().viewport()))
+        } else {
+            None
+        };
+        let child_clip = combine_clip(context.clip, local_clip);
+        let path = context.path_with(retained);
 
         let opacity = retained.resolved_style().visual().opacity().as_f32();
         let visual_allowed = ancestors_visually_emitted && opacity > 0.0;
@@ -148,7 +192,9 @@ impl SceneCompiler {
             self.hit_entries.push(HitTestEntry::new(
                 retained.id(),
                 retained.generation(),
-                layout.border_rect(),
+                context.map_rect(layout.border_rect()),
+                context.clip,
+                path.clone(),
                 order,
             ));
         }
@@ -160,7 +206,7 @@ impl SceneCompiler {
                     retained.id(),
                     retained.generation(),
                     order,
-                    layout.border_rect(),
+                    context.map_rect(layout.border_rect()),
                     PaintFragmentKind::Rect { color },
                 ));
             }
@@ -176,7 +222,7 @@ impl SceneCompiler {
                         retained.id(),
                         retained.generation(),
                         order,
-                        layout.content_rect(),
+                        context.map_rect(layout.content_rect()),
                         PaintFragmentKind::Text {
                             text_generation: self.text_generation.clone(),
                             text_metrics_generation: self
@@ -196,14 +242,47 @@ impl SceneCompiler {
             }
         }
 
+        let emits_clip_fragments =
+            visual_allowed && retained.participation().paint() && layout.scroll().clips();
+        if emits_clip_fragments {
+            let order = self.next_order();
+            let viewport = context.map_rect(layout.scroll().viewport());
+            self.fragments.push(PaintFragment::new(
+                retained.id(),
+                retained.generation(),
+                order,
+                viewport,
+                PaintFragmentKind::ClipPush { clip: viewport },
+            ));
+        }
+
+        let child_context = VisitContext {
+            interaction: context.interaction,
+            clip: child_clip,
+            path,
+            dx: context.dx - scroll_offset.x(),
+            dy: context.dy - scroll_offset.y(),
+        };
         let mut children_by_id = BTreeMap::new();
         for child in layout.children() {
             children_by_id.insert(child.node_id(), child);
         }
         for child in retained.children() {
             if let Some(layout_child) = children_by_id.get(&child.id()) {
-                self.visit(child, layout_child, visual_allowed);
+                self.visit(child, layout_child, visual_allowed, child_context.clone());
             }
+        }
+
+        if emits_clip_fragments {
+            let order = self.next_order();
+            let viewport = context.map_rect(layout.scroll().viewport());
+            self.fragments.push(PaintFragment::new(
+                retained.id(),
+                retained.generation(),
+                order,
+                viewport,
+                PaintFragmentKind::ClipPop,
+            ));
         }
     }
 
@@ -260,6 +339,62 @@ impl SceneCompiler {
     }
 }
 
+#[derive(Clone)]
+struct VisitContext<'a> {
+    interaction: Option<&'a InteractionState>,
+    clip: Option<LayoutRect>,
+    path: Vec<HitTestPathNode>,
+    dx: f32,
+    dy: f32,
+}
+
+impl<'a> VisitContext<'a> {
+    fn new(interaction: Option<&'a InteractionState>) -> Self {
+        Self {
+            interaction,
+            clip: None,
+            path: Vec::new(),
+            dx: 0.0,
+            dy: 0.0,
+        }
+    }
+
+    fn map_rect(&self, rect: LayoutRect) -> LayoutRect {
+        rect.translate(self.dx, self.dy)
+    }
+
+    fn scroll_offset(
+        &self,
+        retained: &RetainedNodeSnapshot,
+        layout: &LayoutNodeSnapshot,
+    ) -> LayoutPoint {
+        if layout.scroll().overflow() != Overflow::Scroll {
+            return LayoutPoint::ZERO;
+        }
+        self.interaction.map_or(LayoutPoint::ZERO, |state| {
+            state.scroll_offset(crate::interaction::InteractionTarget::new(
+                retained.id(),
+                retained.generation(),
+            ))
+        })
+    }
+
+    fn path_with(&self, retained: &RetainedNodeSnapshot) -> Vec<HitTestPathNode> {
+        let mut path = self.path.clone();
+        path.push(HitTestPathNode::new(retained.id(), retained.generation()));
+        path
+    }
+}
+
+fn combine_clip(parent: Option<LayoutRect>, local: Option<LayoutRect>) -> Option<LayoutRect> {
+    match (parent, local) {
+        (Some(parent), Some(local)) => parent.intersect(local).or(Some(LayoutRect::ZERO)),
+        (Some(parent), None) => Some(parent),
+        (None, Some(local)) => Some(local),
+        (None, None) => None,
+    }
+}
+
 fn viewport_rect(layout: &LayoutTreeSnapshot) -> LayoutRect {
     let size = layout.viewport().logical_size();
     LayoutRect::new(0.0, 0.0, size.width(), size.height())
@@ -282,6 +417,29 @@ fn text_signature(retained: &RetainedTreeSnapshot) -> SceneInputSignature {
     SceneInputSignature::new(facts)
 }
 
+fn scroll_signature(interaction: Option<&InteractionState>) -> SceneInputSignature {
+    let Some(interaction) = interaction else {
+        return SceneInputSignature::default();
+    };
+    let facts = interaction
+        .scroll_offsets()
+        .map(|(target, offset)| SceneSignatureFact::ScrollOffset {
+            target: scroll_target_signature(target),
+            x: offset.x().to_bits(),
+            y: offset.y().to_bits(),
+        })
+        .collect();
+    SceneInputSignature::new(facts)
+}
+
+fn scroll_target_signature(target: crate::interaction::InteractionTarget) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for value in [target.node_id().raw(), target.node_generation().raw()] {
+        hash ^= value;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
 fn collect_text_node(node: &RetainedNodeSnapshot, facts: &mut Vec<SceneSignatureFact>) {
     facts.push(SceneSignatureFact::Node {
         node_id: node.id().raw(),
@@ -330,6 +488,9 @@ fn collect_style_node(node: &crate::style::StyleNodeSnapshot, facts: &mut Vec<Sc
     facts.push(SceneSignatureFact::Display(display_fact(
         node.resolved().layout().display(),
     )));
+    facts.push(SceneSignatureFact::Overflow(overflow_fact(
+        node.resolved().layout().overflow(),
+    )));
     for child in node.children() {
         collect_style_node(child, facts);
     }
@@ -373,6 +534,14 @@ fn display_fact(display: Display) -> u8 {
         Display::None => 0_u8,
         Display::Block => 1,
         Display::Flex => 2,
+    }
+}
+
+fn overflow_fact(overflow: Overflow) -> u8 {
+    match overflow {
+        Overflow::Visible => 0,
+        Overflow::Hidden => 1,
+        Overflow::Scroll => 2,
     }
 }
 

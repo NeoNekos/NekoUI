@@ -19,7 +19,7 @@ impl Render for HelloWorld {
                     .w(px(300.))
                     .h(px(50.))
                     .m(px(20.))
-                    .bg(Color::rgb(0x00, 0x1F, 0xFF)),
+                    .bg(Color::rgb(0x00, 0xFA, 0xFF)),
             )
             .child(text("Hello NekoUI").font_size(px(18.0)))
     }

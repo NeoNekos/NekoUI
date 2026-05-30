@@ -1,7 +1,9 @@
 use crate::app::{Context, Entity, Render};
 use crate::error::NekoResult;
 use crate::interaction::PointerInput;
-use crate::layout::LayoutSize;
+#[cfg(test)]
+use crate::interaction::{KeyInput, WheelInput, WindowFocusInput};
+use crate::layout::{LayoutPoint, LayoutSize};
 use crate::retained::RetainedTreeSnapshot;
 use crate::runtime::Runtime;
 use crate::scene::PaintScene;
@@ -79,9 +81,36 @@ impl<'a> WindowService<'a> {
     pub fn pointer_cancel(
         &mut self,
         handle: impl Into<AnyWindowHandle>,
-        position: crate::layout::LayoutPoint,
+        position: LayoutPoint,
     ) -> NekoResult<()> {
         self.pointer_input(handle, PointerInput::cancel(position))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wheel_input(
+        &mut self,
+        handle: impl Into<AnyWindowHandle>,
+        input: WheelInput,
+    ) -> NekoResult<()> {
+        self.runtime.wheel_input(handle, input)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn key_input(
+        &mut self,
+        handle: impl Into<AnyWindowHandle>,
+        input: KeyInput,
+    ) -> NekoResult<()> {
+        self.runtime.key_input(handle, input)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn window_focus_changed(
+        &mut self,
+        handle: impl Into<AnyWindowHandle>,
+        input: WindowFocusInput,
+    ) -> NekoResult<()> {
+        self.runtime.window_focus_changed(handle, input)
     }
 
     pub fn validate(&mut self, handle: impl Into<AnyWindowHandle>) -> NekoResult<()> {

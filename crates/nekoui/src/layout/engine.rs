@@ -167,6 +167,7 @@ mod tests {
     use crate::layout::snapshot::LayoutBoxes;
     use crate::layout::{LayoutNodeSnapshot, LayoutRect, LayoutSize, LayoutTreeSnapshot, Viewport};
     use crate::retained::{RetainedNodeId, RetainedTreeGeneration};
+    use crate::style::Overflow;
 
     use super::changed_geometry_count;
 
@@ -199,6 +200,11 @@ mod tests {
                 padding_rect: rect,
                 content_rect: rect,
                 content_size: LayoutSize::new(rect.width(), rect.height()),
+                scroll: crate::layout::ScrollGeometry::new(
+                    Overflow::Visible,
+                    rect,
+                    LayoutSize::new(rect.width(), rect.height()),
+                ),
                 text_layout: None,
             },
             children,

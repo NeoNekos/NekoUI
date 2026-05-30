@@ -45,8 +45,7 @@ impl WindowSchedulerState {
         self.suppressed_redraw_count
     }
 
-    #[cfg(test)]
-    pub fn pending_redraw(&self) -> bool {
+    pub(crate) fn pending_redraw(&self) -> bool {
         self.pending_redraw
     }
 }
@@ -156,8 +155,7 @@ impl Scheduler {
             .collect()
     }
 
-    #[cfg(test)]
-    pub fn window_state(&self, window: WindowId) -> Option<&WindowSchedulerState> {
+    pub(crate) fn window_state(&self, window: WindowId) -> Option<&WindowSchedulerState> {
         self.windows.get(&window)
     }
 

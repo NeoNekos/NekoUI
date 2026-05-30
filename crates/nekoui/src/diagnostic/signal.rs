@@ -56,6 +56,11 @@ pub(crate) enum SignalId {
     SceneDamage,
     SceneResourceDemand,
     SceneStaleDrop,
+    SemanticsBuild,
+    SemanticsNodeCount,
+    SemanticsDiagnostic,
+    SemanticsStaleDrop,
+    SemanticsDurationMicros,
     RenderFrameGraph,
     RenderPass,
     RenderUploadPlan,
@@ -71,15 +76,23 @@ pub(crate) enum SignalId {
     GpuUnsupported,
     GpuRecovery,
     InputPointerFact,
+    InputKeyFact,
+    InputModifiersFact,
+    InputWheelFact,
+    WindowFocusFact,
     InputHit,
     InputMiss,
     InputDispatch,
     InputClickDerived,
     InputStaleTarget,
+    FocusTransition,
+    ScrollIntent,
+    ScrollOffset,
+    ScrollClamp,
 }
 
 impl SignalId {
-    pub(crate) const COUNT: usize = 76;
+    pub(crate) const COUNT: usize = 89;
 
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::RuntimeCommandQueued,
@@ -138,6 +151,11 @@ impl SignalId {
         Self::SceneDamage,
         Self::SceneResourceDemand,
         Self::SceneStaleDrop,
+        Self::SemanticsBuild,
+        Self::SemanticsNodeCount,
+        Self::SemanticsDiagnostic,
+        Self::SemanticsStaleDrop,
+        Self::SemanticsDurationMicros,
         Self::RenderFrameGraph,
         Self::RenderPass,
         Self::RenderUploadPlan,
@@ -153,11 +171,19 @@ impl SignalId {
         Self::GpuUnsupported,
         Self::GpuRecovery,
         Self::InputPointerFact,
+        Self::InputKeyFact,
+        Self::InputModifiersFact,
+        Self::InputWheelFact,
+        Self::WindowFocusFact,
         Self::InputHit,
         Self::InputMiss,
         Self::InputDispatch,
         Self::InputClickDerived,
         Self::InputStaleTarget,
+        Self::FocusTransition,
+        Self::ScrollIntent,
+        Self::ScrollOffset,
+        Self::ScrollClamp,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -218,6 +244,11 @@ impl SignalId {
             Self::SceneDamage => "scene.damage",
             Self::SceneResourceDemand => "scene.resource_demand",
             Self::SceneStaleDrop => "scene.stale_drop",
+            Self::SemanticsBuild => "semantics.build",
+            Self::SemanticsNodeCount => "semantics.node_count",
+            Self::SemanticsDiagnostic => "semantics.diagnostic",
+            Self::SemanticsStaleDrop => "semantics.stale_drop",
+            Self::SemanticsDurationMicros => "semantics.duration_micros",
             Self::RenderFrameGraph => "render.frame_graph",
             Self::RenderPass => "render.pass",
             Self::RenderUploadPlan => "render.upload.plan",
@@ -233,11 +264,19 @@ impl SignalId {
             Self::GpuUnsupported => "gpu.unsupported",
             Self::GpuRecovery => "gpu.recovery",
             Self::InputPointerFact => "input.pointer_fact",
+            Self::InputKeyFact => "input.key_fact",
+            Self::InputModifiersFact => "input.modifiers_fact",
+            Self::InputWheelFact => "input.wheel_fact",
+            Self::WindowFocusFact => "window.focus_fact",
             Self::InputHit => "input.hit",
             Self::InputMiss => "input.miss",
             Self::InputDispatch => "input.dispatch",
             Self::InputClickDerived => "input.click_derived",
             Self::InputStaleTarget => "input.stale_target",
+            Self::FocusTransition => "focus.transition",
+            Self::ScrollIntent => "scroll.intent",
+            Self::ScrollOffset => "scroll.offset",
+            Self::ScrollClamp => "scroll.clamp",
         }
     }
 
@@ -247,5 +286,25 @@ impl SignalId {
 
     pub(crate) fn from_name(name: &'static str) -> Option<Self> {
         Self::ALL.into_iter().find(|signal| signal.name() == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::SignalId;
+
+    #[test]
+    fn signal_ids_are_dense_and_round_trip_names() {
+        let mut names = BTreeSet::new();
+
+        for (index, signal) in SignalId::ALL.into_iter().enumerate() {
+            assert_eq!(signal.index(), index);
+            assert!(names.insert(signal.name()));
+            assert_eq!(SignalId::from_name(signal.name()), Some(signal));
+        }
+
+        assert_eq!(names.len(), SignalId::COUNT);
     }
 }

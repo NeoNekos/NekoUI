@@ -13,6 +13,7 @@ use crate::runtime::entity_store::EntityStore;
 use crate::runtime::scheduler::Scheduler;
 use crate::runtime::subscription_store::SubscriptionStore;
 use crate::scene::{PaintScene, SceneCompileStats};
+use crate::semantics::{SemanticBuildStats, SemanticTreeSnapshot};
 use crate::text::FontManager;
 use crate::window::{
     AnyWindowHandle, WindowGeneration, WindowId, WindowLifecycle, WindowOptions, WindowRecord,
@@ -25,12 +26,14 @@ pub struct RuntimeState {
     scheduler: Scheduler,
     retained_trees: BTreeMap<WindowId, RetainedTree>,
     layout_snapshots: BTreeMap<WindowId, LayoutTreeSnapshot>,
+    semantic_snapshots: BTreeMap<WindowId, SemanticTreeSnapshot>,
     scene_snapshots: BTreeMap<WindowId, PaintScene>,
     prepared_frame_snapshots: BTreeMap<WindowId, PreparedFrame>,
     retained_dirty: Vec<RetainedDirty>,
     last_retained_diff: RetainedDiffStats,
     consumed_dirty_lanes: BTreeMap<WindowId, crate::diagnostic::DirtyLanes>,
     last_layout_pass: LayoutPassStats,
+    last_semantic_build: SemanticBuildStats,
     last_scene_compile: SceneCompileStats,
     last_frame_graph: FrameGraphStats,
     font_manager: FontManager,
@@ -47,12 +50,14 @@ impl Default for RuntimeState {
             scheduler: Scheduler::default(),
             retained_trees: BTreeMap::new(),
             layout_snapshots: BTreeMap::new(),
+            semantic_snapshots: BTreeMap::new(),
             scene_snapshots: BTreeMap::new(),
             prepared_frame_snapshots: BTreeMap::new(),
             retained_dirty: Vec::new(),
             last_retained_diff: RetainedDiffStats::default(),
             consumed_dirty_lanes: BTreeMap::new(),
             last_layout_pass: LayoutPassStats::default(),
+            last_semantic_build: SemanticBuildStats::default(),
             last_scene_compile: SceneCompileStats::default(),
             last_frame_graph: FrameGraphStats::default(),
             font_manager: FontManager::default(),
@@ -83,6 +88,7 @@ impl RuntimeState {
         self.retained_trees.entry(handle.id()).or_default();
         self.interaction.entry(handle.id()).or_default();
         self.layout_snapshots.remove(&handle.id());
+        self.semantic_snapshots.remove(&handle.id());
         self.scene_snapshots.remove(&handle.id());
         self.prepared_frame_snapshots.remove(&handle.id());
         self.windows
@@ -111,6 +117,7 @@ impl RuntimeState {
             .set_renderability(handle.id(), Renderability::Destroyed);
         self.retained_trees.remove(&handle.id());
         self.layout_snapshots.remove(&handle.id());
+        self.semantic_snapshots.remove(&handle.id());
         self.scene_snapshots.remove(&handle.id());
         self.prepared_frame_snapshots.remove(&handle.id());
         self.interaction.remove(&handle.id());
@@ -318,6 +325,11 @@ impl RuntimeState {
         self.layout_snapshots.get(&window).cloned()
     }
 
+    #[cfg(test)]
+    pub fn semantic_snapshot(&self, window: WindowId) -> Option<SemanticTreeSnapshot> {
+        self.semantic_snapshots.get(&window).cloned()
+    }
+
     pub fn scene_snapshot(&self, window: WindowId) -> Option<PaintScene> {
         self.scene_snapshots.get(&window).cloned()
     }
@@ -344,6 +356,10 @@ impl RuntimeState {
 
     pub fn set_layout_snapshot(&mut self, window: WindowId, snapshot: LayoutTreeSnapshot) {
         self.layout_snapshots.insert(window, snapshot);
+    }
+
+    pub fn set_semantic_snapshot(&mut self, window: WindowId, snapshot: SemanticTreeSnapshot) {
+        self.semantic_snapshots.insert(window, snapshot);
     }
 
     pub fn set_scene_snapshot(&mut self, window: WindowId, snapshot: PaintScene) {
@@ -377,6 +393,10 @@ impl RuntimeState {
         &self.last_layout_pass
     }
 
+    pub fn set_last_semantic_build(&mut self, stats: SemanticBuildStats) {
+        self.last_semantic_build = stats;
+    }
+
     pub fn set_last_scene_compile(&mut self, stats: SceneCompileStats) {
         self.last_scene_compile = stats;
     }
@@ -402,6 +422,11 @@ impl RuntimeState {
             .entry(window)
             .or_default()
             .insert(lanes);
+    }
+
+    #[cfg(test)]
+    pub fn clear_consumed_dirty_lanes(&mut self, window: WindowId) {
+        self.consumed_dirty_lanes.remove(&window);
     }
 
     pub fn reported_dirty_lanes(&self, window: WindowId) -> crate::diagnostic::DirtyLanes {

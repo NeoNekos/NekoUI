@@ -13,6 +13,15 @@ pub enum Display {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 #[non_exhaustive]
+pub enum Overflow {
+    #[default]
+    Visible,
+    Hidden,
+    Scroll,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[non_exhaustive]
 pub enum TextOverflow {
     Visible,
     #[default]
@@ -28,6 +37,7 @@ pub struct LayoutStyleDeclaration {
     padding: Edges<Option<Length>>,
     margin: Edges<Option<Length>>,
     gap: Option<Length>,
+    overflow: Option<Overflow>,
 }
 
 impl Default for LayoutStyleDeclaration {
@@ -39,6 +49,7 @@ impl Default for LayoutStyleDeclaration {
             padding: Edges::all(None),
             margin: Edges::all(None),
             gap: None,
+            overflow: None,
         }
     }
 }
@@ -66,6 +77,10 @@ impl LayoutStyleDeclaration {
 
     pub fn gap(&self) -> Option<Length> {
         self.gap
+    }
+
+    pub fn overflow(&self) -> Option<Overflow> {
+        self.overflow
     }
 }
 
@@ -188,6 +203,11 @@ impl StyleDeclaration {
         self
     }
 
+    pub fn overflow(mut self, value: Overflow) -> Self {
+        self.set_overflow(value);
+        self
+    }
+
     pub fn width(mut self, value: impl Into<Dimension>) -> Self {
         self.set_width(value.into());
         self
@@ -291,6 +311,10 @@ impl StyleDeclaration {
         self.layout.gap = Some(value);
     }
 
+    pub(crate) fn set_overflow(&mut self, value: Overflow) {
+        self.layout.overflow = Some(value);
+    }
+
     pub(crate) fn set_width(&mut self, value: Dimension) {
         self.layout.width = Some(value);
     }
@@ -377,7 +401,7 @@ fn validate_optional_length_edges(
 #[cfg(test)]
 mod tests {
     use crate::diagnostic::DirtyLane;
-    use crate::style::{Color, Display, StyleDeclaration, TextOverflow, fill, px};
+    use crate::style::{Color, Display, Overflow, StyleDeclaration, TextOverflow, fill, px};
 
     #[test]
     fn canonical_and_alias_expansion_is_longhand_ordered() {
@@ -386,7 +410,8 @@ mod tests {
             .padding_left(px(4.0))
             .margin(px(10.0))
             .margin_left(px(6.0))
-            .gap(px(3.0));
+            .gap(px(3.0))
+            .overflow(Overflow::Scroll);
         let padding = style.layout().padding();
         let margin = style.layout().margin();
 
@@ -397,6 +422,7 @@ mod tests {
         assert_eq!(margin.top, Some(px(10.0)));
         assert_eq!(margin.left, Some(px(6.0)));
         assert_eq!(style.layout().gap(), Some(px(3.0)));
+        assert_eq!(style.layout().overflow(), Some(Overflow::Scroll));
     }
 
     #[test]

@@ -14,9 +14,10 @@ use crate::diagnostic::{
 use crate::element::{Element, IntoElement};
 use crate::error::{ErrorKind, NekoError, NekoResult};
 use crate::interaction::{
-    ClickEvent, InteractionTarget, PointerEvent, PointerInput, PointerInputKind,
+    ClickEvent, InteractionTarget, KeyEvent, KeyInput, KeyInputKind, Modifiers, PointerEvent,
+    PointerInput, PointerInputKind, ScrollDelta, WheelInput, WindowFocusInput,
 };
-use crate::layout::{LayoutPassStats, LayoutSize, compute_layout};
+use crate::layout::{LayoutNodeSnapshot, LayoutPassStats, LayoutPoint, LayoutSize, compute_layout};
 #[cfg(target_os = "windows")]
 use crate::platform::NativeRenderer;
 use crate::platform::{PlatformFact, Renderability};
@@ -28,7 +29,12 @@ use crate::runtime::scheduler::RedrawRequestOutcome;
 use crate::runtime::state::RuntimeState;
 use crate::runtime::subscription_store::{SubscriptionCallback, SubscriptionKey};
 use crate::scene::{
-    SceneCompileInput, compile_scene, scene_generation_for_inputs, scene_publish_is_current,
+    HitTestEntry, SceneCompileInput, compile_scene, scene_generation_for_inputs_with_interaction,
+    scene_publish_is_current_with_interaction,
+};
+use crate::semantics::{
+    SemanticBuildInput, SemanticBuildStats, build_semantic_snapshot,
+    semantic_publish_is_current_with_interaction,
 };
 use crate::window::{AnyWindowHandle, WindowHandle, WindowOptions};
 
@@ -43,6 +49,7 @@ pub(crate) struct Runtime {
     retained_diff_duration: Duration,
     style_resolve_duration: Duration,
     layout_duration: Duration,
+    semantic_build_duration: Duration,
     scene_compile_duration: Duration,
     render_prepare_duration: Duration,
     transaction_depth: usize,
@@ -62,6 +69,7 @@ impl std::fmt::Debug for Runtime {
             .field("retained_diff_duration", &self.retained_diff_duration)
             .field("style_resolve_duration", &self.style_resolve_duration)
             .field("layout_duration", &self.layout_duration)
+            .field("semantic_build_duration", &self.semantic_build_duration)
             .field("scene_compile_duration", &self.scene_compile_duration)
             .field("render_prepare_duration", &self.render_prepare_duration)
             .field("transaction_depth", &self.transaction_depth)
@@ -138,6 +146,20 @@ impl Runtime {
     #[cfg(test)]
     pub(crate) fn state_mut(&mut self) -> &mut RuntimeState {
         &mut self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scroll_offset(
+        &self,
+        handle: impl Into<AnyWindowHandle>,
+        target: InteractionTarget,
+    ) -> NekoResult<LayoutPoint> {
+        let handle = handle.into();
+        self.state.validate_window(handle)?;
+        Ok(self
+            .state
+            .interaction(handle.id())
+            .map_or(LayoutPoint::ZERO, |state| state.scroll_offset(target)))
     }
 
     pub(crate) fn diagnostics(&self) -> &Diagnostics {
@@ -380,6 +402,39 @@ impl Runtime {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn key_input(
+        &mut self,
+        handle: impl Into<AnyWindowHandle>,
+        input: KeyInput,
+    ) -> NekoResult<()> {
+        let handle = handle.into();
+        self.ingest_platform_fact(PlatformFact::KeyInput { handle, input })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wheel_input(
+        &mut self,
+        handle: impl Into<AnyWindowHandle>,
+        input: WheelInput,
+    ) -> NekoResult<()> {
+        let handle = handle.into();
+        self.ingest_platform_fact(PlatformFact::WheelInput { handle, input })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn window_focus_changed(
+        &mut self,
+        handle: impl Into<AnyWindowHandle>,
+        input: WindowFocusInput,
+    ) -> NekoResult<()> {
+        let handle = handle.into();
+        self.ingest_platform_fact(PlatformFact::WindowFocusChanged { handle, input })?;
+        Ok(())
+    }
+
     pub(crate) fn ingest_platform_fact(&mut self, fact: PlatformFact) -> NekoResult<CommandId> {
         self.validate_platform_fact(&fact)?;
         let id = self.enqueue(RuntimeCommand::PlatformFact(fact));
@@ -430,6 +485,18 @@ impl Runtime {
         self.state
             .layout_snapshot(handle.id())
             .ok_or_else(|| NekoError::diagnostic("layout snapshot is missing for live window"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn semantic_snapshot(
+        &self,
+        handle: impl Into<AnyWindowHandle>,
+    ) -> NekoResult<crate::semantics::SemanticTreeSnapshot> {
+        let handle = handle.into();
+        self.state.validate_window(handle)?;
+        self.state
+            .semantic_snapshot(handle.id())
+            .ok_or_else(|| NekoError::diagnostic("semantic snapshot is missing for live window"))
     }
 
     pub(crate) fn scene_snapshot(
@@ -491,6 +558,7 @@ impl Runtime {
         self.drain_depth -= 1;
         if self.drain_depth == 0 {
             self.rebuild_dirty_roots()?;
+            self.execute_semantics_without_redraw_if_ready()?;
         }
         Ok(processed)
     }
@@ -613,6 +681,7 @@ impl Runtime {
                 ("retained.diff", self.retained_diff_duration),
                 ("style.resolve", self.style_resolve_duration),
                 ("layout.pass", self.layout_duration),
+                ("semantics.build", self.semantic_build_duration),
                 ("scene.compile", self.scene_compile_duration),
                 ("render.frame_graph", self.render_prepare_duration),
             ]),
@@ -822,6 +891,14 @@ impl Runtime {
             PlatformFact::PointerInput { handle, input } => {
                 self.process_pointer_input(handle, input)
             }
+            PlatformFact::KeyInput { handle, input } => self.process_key_input(handle, input),
+            PlatformFact::ModifiersChanged { handle, modifiers } => {
+                self.process_modifiers_changed(handle, modifiers)
+            }
+            PlatformFact::WheelInput { handle, input } => self.process_wheel_input(handle, input),
+            PlatformFact::WindowFocusChanged { handle, input } => {
+                self.process_window_focus_input(handle, input)
+            }
         }
     }
 
@@ -946,6 +1023,9 @@ impl Runtime {
             .mark_dirty(handle.id(), DirtyLane::Layout);
         self.state
             .scheduler_mut()
+            .mark_dirty(handle.id(), DirtyLane::Semantics);
+        self.state
+            .scheduler_mut()
             .mark_dirty(handle.id(), DirtyLane::Surface);
         self.state
             .scheduler_mut()
@@ -1003,27 +1083,27 @@ impl Runtime {
     }
 
     fn validate_platform_fact(&mut self, fact: &PlatformFact) -> NekoResult<()> {
-        match *fact {
+        match fact {
             PlatformFact::WindowCreated { handle }
             | PlatformFact::WindowShown { handle }
             | PlatformFact::CloseRequested { handle }
             | PlatformFact::CloseConfirmed { handle }
             | PlatformFact::Destroyed { handle }
-            | PlatformFact::RedrawRequested { handle } => self.validate_window(handle),
+            | PlatformFact::RedrawRequested { handle } => self.validate_window(*handle),
             PlatformFact::LogicalSizeChanged {
                 handle,
                 logical_size,
             } => {
-                self.validate_window(handle)?;
-                logical_size.validate_viewport()
+                self.validate_window(*handle)?;
+                (*logical_size).validate_viewport()
             }
-            PlatformFact::PhysicalSizeChanged { handle, .. } => self.validate_window(handle),
+            PlatformFact::PhysicalSizeChanged { handle, .. } => self.validate_window(*handle),
             PlatformFact::ScaleFactorChanged {
                 handle,
                 scale_factor,
             } => {
-                self.validate_window(handle)?;
-                if scale_factor.is_finite() && scale_factor > 0.0 {
+                self.validate_window(*handle)?;
+                if scale_factor.is_finite() && *scale_factor > 0.0 {
                     Ok(())
                 } else {
                     Err(NekoError::invalid_input(
@@ -1033,13 +1113,237 @@ impl Runtime {
             }
             PlatformFact::Minimized { handle }
             | PlatformFact::Restored { handle }
-            | PlatformFact::RenderabilityChanged { handle, .. } => self.validate_window(handle),
+            | PlatformFact::RenderabilityChanged { handle, .. } => self.validate_window(*handle),
             PlatformFact::PointerInput { handle, input } => {
-                self.validate_window(handle)?;
-                validate_pointer_input_position(input)
+                self.validate_window(*handle)?;
+                validate_pointer_input_position(*input)
+            }
+            PlatformFact::KeyInput { handle, .. }
+            | PlatformFact::ModifiersChanged { handle, .. }
+            | PlatformFact::WindowFocusChanged { handle, .. } => self.validate_window(*handle),
+            PlatformFact::WheelInput { handle, input } => {
+                self.validate_window(*handle)?;
+                validate_wheel_input(*input)
             }
             PlatformFact::Wake | PlatformFact::Exit => Ok(()),
         }
+    }
+
+    fn process_key_input(&mut self, handle: AnyWindowHandle, input: KeyInput) -> NekoResult<()> {
+        self.state.validate_window(handle)?;
+        self.diagnostics.increment_signal(SignalId::InputKeyFact);
+        self.record_key_input_fact(handle, &input);
+        self.cleanup_stale_interaction_targets(handle)?;
+
+        if input.synthetic() {
+            self.record_key_dispatch(handle, &input, None, "synthetic_ignored", None);
+            return Ok(());
+        }
+
+        let Some(target) = self
+            .state
+            .interaction(handle.id())
+            .and_then(|state| state.keyboard_focus())
+        else {
+            self.record_key_dispatch(handle, &input, None, "no_focus", None);
+            return Ok(());
+        };
+
+        let Some(node) = self.current_target_node(handle, target)? else {
+            self.state
+                .interaction_mut(handle.id())
+                .set_keyboard_focus(None);
+            self.record_stale_input_target(handle, target, "keyboard_focus_dispatch");
+            self.record_key_dispatch(handle, &input, Some(target), "stale", None);
+            self.mark_semantic_interaction_changed(handle);
+            return Ok(());
+        };
+
+        if !node.focusable() {
+            self.state
+                .interaction_mut(handle.id())
+                .set_keyboard_focus(None);
+            self.record_stale_input_target(handle, target, "keyboard_focus_not_focusable");
+            self.record_focus_transition(
+                handle,
+                "keyboard",
+                Some(target),
+                None,
+                "stale_not_focusable",
+            );
+            self.record_key_dispatch(handle, &input, Some(target), "stale", None);
+            self.mark_semantic_interaction_changed(handle);
+            return Ok(());
+        }
+
+        let handler = match input.kind() {
+            KeyInputKind::Down => node.handlers().key_down(),
+            KeyInputKind::Up => node.handlers().key_up(),
+        };
+        let Some(handler) = handler else {
+            self.record_key_dispatch(handle, &input, Some(target), "no_handler", None);
+            return Ok(());
+        };
+
+        let event = KeyEvent::new(input.clone());
+        let result = {
+            let mut cx = AppContext::from_runtime(self);
+            handler(&event, &mut cx)
+        };
+        let error_kind = result.as_ref().err().map(NekoError::kind);
+        self.record_key_dispatch(
+            handle,
+            &input,
+            Some(target),
+            if error_kind.is_some() {
+                "handler_error"
+            } else {
+                "dispatched"
+            },
+            error_kind,
+        );
+        result?;
+        Ok(())
+    }
+
+    fn process_modifiers_changed(
+        &mut self,
+        handle: AnyWindowHandle,
+        modifiers: Modifiers,
+    ) -> NekoResult<()> {
+        self.state.validate_window(handle)?;
+        self.state
+            .interaction_mut(handle.id())
+            .set_modifiers(modifiers);
+        self.diagnostics
+            .increment_signal(SignalId::InputModifiersFact);
+        self.record_modifiers_fact(handle, modifiers);
+        Ok(())
+    }
+
+    fn process_wheel_input(
+        &mut self,
+        handle: AnyWindowHandle,
+        input: WheelInput,
+    ) -> NekoResult<()> {
+        self.state.validate_window(handle)?;
+        validate_wheel_input(input)?;
+        self.diagnostics.increment_signal(SignalId::InputWheelFact);
+        self.record_wheel_input_fact(handle, input);
+        self.cleanup_stale_interaction_targets(handle)?;
+
+        let Some(position) = self
+            .state
+            .interaction(handle.id())
+            .and_then(|state| state.last_hover_position())
+        else {
+            self.record_scroll_intent(handle, input, None, "miss", "no_hover_position");
+            return Ok(());
+        };
+        let Some(entry) = self.hit_entry_at(handle, position) else {
+            self.record_scroll_intent(handle, input, None, "miss", "hit_test_miss");
+            return Ok(());
+        };
+        let Some(target) = self.nearest_scroll_target(handle, &entry)? else {
+            self.record_scroll_intent(handle, input, None, "no_scroll_target", "not_scrollable");
+            return Ok(());
+        };
+        self.record_scroll_intent(handle, input, Some(target), "accepted", "wheel_default");
+
+        let (old_offset, new_offset, max_offset, unclamped_offset, changed) = {
+            let interaction = self
+                .state
+                .interaction(handle.id())
+                .cloned()
+                .unwrap_or_default();
+            let old_offset = interaction.scroll_offset(target);
+            let max_offset = self
+                .layout_scroll_geometry(handle, target)?
+                .map_or(LayoutPoint::ZERO, |geometry| geometry.max_offset());
+            let delta = wheel_delta_pixels(input);
+            let unclamped_offset =
+                LayoutPoint::new(old_offset.x() + delta.x(), old_offset.y() + delta.y());
+            let new_offset = clamp_scroll_offset(unclamped_offset, max_offset);
+            let changed = new_offset != old_offset;
+            (
+                old_offset,
+                new_offset,
+                max_offset,
+                unclamped_offset,
+                changed,
+            )
+        };
+        self.record_scroll_clamp(handle, target, unclamped_offset, max_offset, new_offset);
+        if changed {
+            self.state
+                .interaction_mut(handle.id())
+                .set_scroll_offset(target, new_offset);
+            self.state
+                .scheduler_mut()
+                .mark_dirty(handle.id(), DirtyLane::Paint);
+            self.state
+                .scheduler_mut()
+                .mark_dirty(handle.id(), DirtyLane::Semantics);
+            self.request_redraw(handle.id());
+        }
+        self.record_scroll_offset(handle, target, old_offset, new_offset, max_offset, changed);
+        Ok(())
+    }
+
+    fn apply_scroll_offset_clamps(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
+        let targets = self
+            .state
+            .interaction(handle.id())
+            .map(|interaction| interaction.scroll_offsets().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut any_changed = false;
+        for (target, old_offset) in targets {
+            let Some(geometry) = self.layout_scroll_geometry(handle, target)? else {
+                continue;
+            };
+            let max_offset = geometry.max_offset();
+            let new_offset = clamp_scroll_offset(old_offset, max_offset);
+            if new_offset != old_offset {
+                self.state
+                    .interaction_mut(handle.id())
+                    .set_scroll_offset(target, new_offset);
+                self.record_scroll_clamp(handle, target, old_offset, max_offset, new_offset);
+                self.record_scroll_offset(handle, target, old_offset, new_offset, max_offset, true);
+                any_changed = true;
+            }
+        }
+        if any_changed {
+            self.state
+                .scheduler_mut()
+                .mark_dirty(handle.id(), DirtyLane::Paint);
+            self.state
+                .scheduler_mut()
+                .mark_dirty(handle.id(), DirtyLane::Semantics);
+            self.request_redraw(handle.id());
+        }
+        Ok(())
+    }
+
+    fn process_window_focus_input(
+        &mut self,
+        handle: AnyWindowHandle,
+        input: WindowFocusInput,
+    ) -> NekoResult<()> {
+        self.state.validate_window(handle)?;
+        let previous = self
+            .state
+            .interaction(handle.id())
+            .is_some_and(|state| state.window_focused());
+        self.state
+            .interaction_mut(handle.id())
+            .set_window_focused(input.focused());
+        self.diagnostics.increment_signal(SignalId::WindowFocusFact);
+        self.record_window_focus_fact(handle, input);
+        if previous != input.focused() {
+            self.record_window_focus_transition(handle, previous, input.focused());
+            self.mark_semantic_interaction_changed(handle);
+        }
+        Ok(())
     }
 
     fn process_pointer_input(
@@ -1056,15 +1360,20 @@ impl Runtime {
         let target = self.hit_target(handle, input);
         match input.kind() {
             PointerInputKind::Move => {
-                let previous_hover = self
-                    .state
-                    .interaction(handle.id())
-                    .and_then(|state| state.hover());
+                let previous = self.state.interaction(handle.id()).cloned();
                 self.state.interaction_mut(handle.id()).set_hover(target);
+                self.state
+                    .interaction_mut(handle.id())
+                    .set_last_hover_position(Some(input.position()));
                 if let Err(error) = self.dispatch_pointer(handle, input, target, "pointer_move") {
+                    let previous_hover = previous.as_ref().and_then(|state| state.hover());
+                    let previous_position = previous.and_then(|state| state.last_hover_position());
                     self.state
                         .interaction_mut(handle.id())
                         .set_hover(previous_hover);
+                    self.state
+                        .interaction_mut(handle.id())
+                        .set_last_hover_position(previous_position);
                     self.cleanup_stale_interaction_targets(handle)?;
                     return Err(error);
                 }
@@ -1082,6 +1391,7 @@ impl Runtime {
                     self.cleanup_stale_interaction_targets(handle)?;
                     return Err(error);
                 }
+                self.apply_pointer_down_focus_default(handle, target)?;
             }
             PointerInputKind::Up => {
                 let pressed = self
@@ -1118,12 +1428,9 @@ impl Runtime {
         handle: AnyWindowHandle,
         input: PointerInput,
     ) -> Option<InteractionTarget> {
-        let target = self.state.scene_snapshot(handle.id()).and_then(|scene| {
-            scene
-                .hit_test()
-                .hit_test(input.position())
-                .map(|entry| InteractionTarget::new(entry.node_id(), entry.node_generation()))
-        });
+        let target = self
+            .hit_entry_at(handle, input.position())
+            .map(|entry| InteractionTarget::new(entry.node_id(), entry.node_generation()));
         if target.is_some() {
             self.diagnostics.increment_signal(SignalId::InputHit);
         } else {
@@ -1138,6 +1445,46 @@ impl Runtime {
             None,
         );
         target
+    }
+
+    fn hit_entry_at(&self, handle: AnyWindowHandle, position: LayoutPoint) -> Option<HitTestEntry> {
+        self.state
+            .scene_snapshot(handle.id())
+            .and_then(|scene| scene.hit_test().hit_test(position).cloned())
+    }
+
+    fn nearest_scroll_target(
+        &mut self,
+        handle: AnyWindowHandle,
+        entry: &HitTestEntry,
+    ) -> NekoResult<Option<InteractionTarget>> {
+        for path_node in entry.path().iter().rev() {
+            let target = InteractionTarget::new(path_node.node_id(), path_node.node_generation());
+            let Some(node) = self.current_target_node(handle, target)? else {
+                self.record_stale_input_target(handle, target, "scroll_path_cleanup");
+                continue;
+            };
+            if node.resolved_style().layout().overflow() == crate::style::Overflow::Scroll
+                && self
+                    .layout_scroll_geometry(handle, target)?
+                    .is_some_and(|geometry| geometry.scrollable())
+            {
+                return Ok(Some(target));
+            }
+        }
+        Ok(None)
+    }
+
+    fn layout_scroll_geometry(
+        &self,
+        handle: AnyWindowHandle,
+        target: InteractionTarget,
+    ) -> NekoResult<Option<crate::layout::ScrollGeometry>> {
+        let layout = self.layout_snapshot(handle)?;
+        Ok(layout
+            .root()
+            .and_then(|root| find_layout_node_by_target(root, target))
+            .map(|node| node.scroll()))
     }
 
     fn dispatch_pointer(
@@ -1237,6 +1584,42 @@ impl Runtime {
         Ok(find_node_by_target(&retained, target).cloned())
     }
 
+    fn apply_pointer_down_focus_default(
+        &mut self,
+        handle: AnyWindowHandle,
+        target: Option<InteractionTarget>,
+    ) -> NekoResult<()> {
+        let Some(target) = target else {
+            return Ok(());
+        };
+        let Some(node) = self.current_target_node(handle, target)? else {
+            self.record_stale_input_target(handle, target, "keyboard_focus_default");
+            return Ok(());
+        };
+        if !node.focusable() {
+            return Ok(());
+        }
+        let previous = self
+            .state
+            .interaction(handle.id())
+            .and_then(|state| state.keyboard_focus());
+        if previous == Some(target) {
+            return Ok(());
+        }
+        self.state
+            .interaction_mut(handle.id())
+            .set_keyboard_focus(Some(target));
+        self.record_focus_transition(
+            handle,
+            "keyboard",
+            previous,
+            Some(target),
+            "pointer_down_default",
+        );
+        self.mark_semantic_interaction_changed(handle);
+        Ok(())
+    }
+
     fn cleanup_stale_interaction_targets(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
         let retained = self.retained_snapshot(handle)?;
         let hover = self
@@ -1247,6 +1630,10 @@ impl Runtime {
             .state
             .interaction(handle.id())
             .and_then(|state| state.pressed());
+        let keyboard_focus = self
+            .state
+            .interaction(handle.id())
+            .and_then(|state| state.keyboard_focus());
         if let Some(target) = hover
             && find_node_by_target(&retained, target).is_none()
         {
@@ -1258,6 +1645,29 @@ impl Runtime {
         {
             self.state.interaction_mut(handle.id()).set_pressed(None);
             self.record_stale_input_target(handle, target, "pressed_cleanup");
+        }
+        if let Some(target) = keyboard_focus
+            && find_focusable_node_by_target(&retained, target).is_none()
+        {
+            self.state
+                .interaction_mut(handle.id())
+                .set_keyboard_focus(None);
+            self.record_stale_input_target(handle, target, "keyboard_focus_cleanup");
+            self.record_focus_transition(handle, "keyboard", Some(target), None, "stale_cleanup");
+            self.mark_semantic_interaction_changed(handle);
+        }
+        let stale_scroll_targets = self
+            .state
+            .interaction_mut(handle.id())
+            .retain_scroll_offsets(|target| {
+                find_scrollable_node_by_target(&retained, target).is_some()
+            });
+        let removed_scroll_offsets = !stale_scroll_targets.is_empty();
+        for target in stale_scroll_targets {
+            self.record_stale_input_target(handle, target, "scroll_offset_cleanup");
+        }
+        if removed_scroll_offsets {
+            self.mark_semantic_interaction_changed(handle);
         }
         Ok(())
     }
@@ -1323,6 +1733,7 @@ impl Runtime {
                 self.record_layout_pass(handle, viewport, &stats, "completed");
                 self.state.set_last_layout_pass(stats);
                 self.state.set_layout_snapshot(handle.id(), output.snapshot);
+                self.apply_scroll_offset_clamps(handle)?;
                 Ok(())
             }
             Err(failure) => {
@@ -1351,6 +1762,7 @@ impl Runtime {
 
     fn execute_scene_if_dirty(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
         self.state.validate_window(handle)?;
+        self.execute_semantics_if_dirty(handle)?;
         if !self.state.window(handle)?.renderability().is_renderable() {
             self.diagnostics
                 .increment_signal(SignalId::RuntimeNotRenderable);
@@ -1368,23 +1780,30 @@ impl Runtime {
         let retained = self.retained_snapshot(handle)?;
         let style = self.style_snapshot(handle)?;
         let layout = self.layout_snapshot(handle)?;
-        let expected_generation = scene_generation_for_inputs(&retained, &style, &layout);
+        let expected_generation = scene_generation_for_inputs_with_interaction(
+            &retained,
+            &style,
+            &layout,
+            self.state.interaction(handle.id()),
+        );
         let previous = self.state.scene_snapshot(handle.id());
         let output = compile_scene(SceneCompileInput {
             retained: &retained,
             style: &style,
             layout: &layout,
+            interaction: self.state.interaction(handle.id()),
             previous: previous.as_ref(),
         });
         let current_retained = self.retained_snapshot(handle)?;
         let current_style = self.style_snapshot(handle)?;
         let current_layout = self.layout_snapshot(handle)?;
-        if !scene_publish_is_current(
+        if !scene_publish_is_current_with_interaction(
             expected_generation,
             output.scene.generation(),
             &current_retained,
             &current_style,
             &current_layout,
+            self.state.interaction(handle.id()),
         ) {
             let mut stats = output.stats;
             stats.stale_drop_count = 1;
@@ -1426,6 +1845,110 @@ impl Runtime {
         self.state
             .set_prepared_frame_snapshot(handle.id(), prepared_frame);
         Ok(())
+    }
+
+    fn execute_semantics_if_dirty(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
+        self.state.validate_window(handle)?;
+        let taken = self
+            .state
+            .scheduler_mut()
+            .take_dirty_lanes(handle.id(), DirtyLane::Semantics.flag());
+        if !taken.contains(DirtyLane::Semantics.flag()) {
+            return Ok(());
+        }
+        self.state.record_consumed_dirty_lanes(handle.id(), taken);
+
+        let retained = self.retained_snapshot(handle)?;
+        let style = self.style_snapshot(handle)?;
+        let layout = self.layout_snapshot(handle)?;
+        let output = build_semantic_snapshot(SemanticBuildInput {
+            retained: &retained,
+            style: &style,
+            layout: &layout,
+            interaction: self.state.interaction(handle.id()),
+        });
+        let current_retained = self.retained_snapshot(handle)?;
+        let current_style = self.style_snapshot(handle)?;
+        let current_layout = self.layout_snapshot(handle)?;
+        if !semantic_publish_is_current_with_interaction(
+            output.snapshot.generation(),
+            &current_retained,
+            &current_style,
+            &current_layout,
+            self.state.interaction(handle.id()),
+        ) {
+            let mut stats = output.stats;
+            stats.diagnostic_count = 0;
+            stats.stale_drop_count = 1;
+            self.record_semantic_build(handle, &stats, "stale_drop");
+            self.state.set_last_semantic_build(stats);
+            self.state
+                .scheduler_mut()
+                .mark_dirty(handle.id(), DirtyLane::Semantics);
+            return Ok(());
+        }
+
+        let snapshot = output.snapshot;
+        let stats = output.stats;
+        self.record_semantic_build(handle, &stats, "published");
+        self.diagnostics.extend_records(output.records);
+        self.state.set_last_semantic_build(stats);
+        self.state.set_semantic_snapshot(handle.id(), snapshot);
+        Ok(())
+    }
+
+    fn execute_semantics_without_redraw_if_ready(&mut self) -> NekoResult<()> {
+        for window in self.state.live_window_ids() {
+            let Some(state) = self.state.scheduler().window_state(window) else {
+                continue;
+            };
+            let dirty_lanes = state.dirty_lanes();
+            if state.pending_redraw()
+                || !dirty_lanes.contains(DirtyLane::Semantics.flag())
+                || dirty_lanes.contains(DirtyLane::Layout.flag())
+                || self.state.layout_snapshot(window).is_none()
+            {
+                continue;
+            }
+            let handle = self.state.window_by_id(window)?.handle();
+            self.execute_semantics_if_dirty(handle)?;
+        }
+        Ok(())
+    }
+
+    fn record_semantic_build(
+        &mut self,
+        handle: AnyWindowHandle,
+        stats: &SemanticBuildStats,
+        result: &'static str,
+    ) {
+        self.semantic_build_duration += stats.duration;
+        self.diagnostics.increment_signal(SignalId::SemanticsBuild);
+        self.diagnostics
+            .add_signal(SignalId::SemanticsNodeCount, stats.node_count as u64);
+        self.diagnostics
+            .add_signal(SignalId::SemanticsDiagnostic, stats.diagnostic_count as u64);
+        self.diagnostics
+            .add_signal(SignalId::SemanticsStaleDrop, stats.stale_drop_count);
+        self.diagnostics.add_signal(
+            SignalId::SemanticsDurationMicros,
+            duration_micros_signal(stats.duration),
+        );
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Semantics,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "semantics.build",
+                "semantic snapshot build completed",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("result", result)
+            .with_field("node_count", stats.node_count.to_string())
+            .with_field("diagnostic_count", stats.diagnostic_count.to_string())
+            .with_field("stale_drop_count", stats.stale_drop_count.to_string())
+            .with_field("duration_micros", stats.duration.as_micros().to_string()),
+        );
     }
 
     fn record_render_frame_graph(
@@ -1541,6 +2064,176 @@ impl Runtime {
         );
     }
 
+    fn record_key_input_fact(&mut self, handle: AnyWindowHandle, input: &KeyInput) {
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "input.key_fact",
+                "key input fact processed through runtime",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("kind", key_input_kind_name(input.kind()))
+            .with_field("logical_kind", input.logical_key().kind_name())
+            .with_field("logical_key", input.logical_key().name().to_owned())
+            .with_field("physical_key", input.physical_key().name().to_owned())
+            .with_field("repeat", input.repeat().to_string())
+            .with_field("synthetic", input.synthetic().to_string())
+            .with_field("modifiers_bits", input.modifiers().bits().to_string())
+            .with_field("shift", input.modifiers().shift().to_string())
+            .with_field("ctrl", input.modifiers().ctrl().to_string())
+            .with_field("alt", input.modifiers().alt().to_string())
+            .with_field("logo", input.modifiers().logo().to_string()),
+        );
+    }
+
+    fn record_modifiers_fact(&mut self, handle: AnyWindowHandle, modifiers: Modifiers) {
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "input.modifiers_fact",
+                "keyboard modifiers fact processed through runtime",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("modifiers_bits", modifiers.bits().to_string())
+            .with_field("shift", modifiers.shift().to_string())
+            .with_field("ctrl", modifiers.ctrl().to_string())
+            .with_field("alt", modifiers.alt().to_string())
+            .with_field("logo", modifiers.logo().to_string())
+            .with_field("command", modifiers.command().to_string()),
+        );
+    }
+
+    fn record_wheel_input_fact(&mut self, handle: AnyWindowHandle, input: WheelInput) {
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "input.wheel_fact",
+                "wheel input fact processed through runtime",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("delta_unit", input.delta().unit_name())
+            .with_field("delta_x", input.delta().x().to_string())
+            .with_field("delta_y", input.delta().y().to_string())
+            .with_field("phase", input.phase().name())
+            .with_field("modifiers_bits", input.modifiers().bits().to_string()),
+        );
+    }
+
+    fn record_scroll_intent(
+        &mut self,
+        handle: AnyWindowHandle,
+        input: WheelInput,
+        target: Option<InteractionTarget>,
+        result: &'static str,
+        reason: &'static str,
+    ) {
+        self.diagnostics.increment_signal(SignalId::ScrollIntent);
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "scroll.intent",
+                "wheel scroll intent routed through runtime",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("result", result)
+            .with_field("reason", reason)
+            .with_field("delta_unit", input.delta().unit_name())
+            .with_field("delta_x", input.delta().x().to_string())
+            .with_field("delta_y", input.delta().y().to_string())
+            .with_field("phase", input.phase().name())
+            .with_field("target_id", format_target_id(target))
+            .with_field("target_generation", format_target_generation(target)),
+        );
+    }
+
+    fn record_scroll_offset(
+        &mut self,
+        handle: AnyWindowHandle,
+        target: InteractionTarget,
+        old_offset: LayoutPoint,
+        new_offset: LayoutPoint,
+        max_offset: LayoutPoint,
+        changed: bool,
+    ) {
+        self.diagnostics.increment_signal(SignalId::ScrollOffset);
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "scroll.offset",
+                "scroll offset updated",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("target_id", target.node_id().raw().to_string())
+            .with_field(
+                "target_generation",
+                target.node_generation().raw().to_string(),
+            )
+            .with_field("old_x", old_offset.x().to_string())
+            .with_field("old_y", old_offset.y().to_string())
+            .with_field("new_x", new_offset.x().to_string())
+            .with_field("new_y", new_offset.y().to_string())
+            .with_field("max_x", max_offset.x().to_string())
+            .with_field("max_y", max_offset.y().to_string())
+            .with_field("changed", changed.to_string()),
+        );
+    }
+
+    fn record_scroll_clamp(
+        &mut self,
+        handle: AnyWindowHandle,
+        target: InteractionTarget,
+        unclamped_offset: LayoutPoint,
+        max_offset: LayoutPoint,
+        clamped_offset: LayoutPoint,
+    ) {
+        self.diagnostics.increment_signal(SignalId::ScrollClamp);
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "scroll.clamp",
+                "scroll offset clamped to layout extent",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("target_id", target.node_id().raw().to_string())
+            .with_field(
+                "target_generation",
+                target.node_generation().raw().to_string(),
+            )
+            .with_field("unclamped_x", unclamped_offset.x().to_string())
+            .with_field("unclamped_y", unclamped_offset.y().to_string())
+            .with_field("max_x", max_offset.x().to_string())
+            .with_field("max_y", max_offset.y().to_string())
+            .with_field("clamped_x", clamped_offset.x().to_string())
+            .with_field("clamped_y", clamped_offset.y().to_string()),
+        );
+    }
+
+    fn record_window_focus_fact(&mut self, handle: AnyWindowHandle, input: WindowFocusInput) {
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Window,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "window.focus_fact",
+                "window focus fact processed through runtime",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("focused", input.focused().to_string()),
+        );
+    }
+
     fn record_input_dispatch(
         &mut self,
         handle: AnyWindowHandle,
@@ -1584,12 +2277,121 @@ impl Runtime {
         );
     }
 
+    fn record_key_dispatch(
+        &mut self,
+        handle: AnyWindowHandle,
+        input: &KeyInput,
+        target: Option<InteractionTarget>,
+        result: &'static str,
+        error_kind: Option<ErrorKind>,
+    ) {
+        self.diagnostics.increment_signal(SignalId::InputDispatch);
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                error_kind.unwrap_or(ErrorKind::Diagnostic),
+                "input.dispatch",
+                "key input dispatched",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("raw_kind", key_input_kind_name(input.kind()))
+            .with_field("event_kind", key_event_kind_name(input.kind()))
+            .with_field("result", result)
+            .with_field(
+                "error_kind",
+                error_kind.map_or_else(|| "none".to_owned(), |kind| format!("{kind:?}")),
+            )
+            .with_field("logical_kind", input.logical_key().kind_name())
+            .with_field("logical_key", input.logical_key().name().to_owned())
+            .with_field("physical_key", input.physical_key().name().to_owned())
+            .with_field("repeat", input.repeat().to_string())
+            .with_field("synthetic", input.synthetic().to_string())
+            .with_field("modifiers_bits", input.modifiers().bits().to_string())
+            .with_field(
+                "target_id",
+                target.map_or_else(
+                    || "none".to_owned(),
+                    |target| target.node_id().raw().to_string(),
+                ),
+            )
+            .with_field(
+                "target_generation",
+                target.map_or_else(
+                    || "none".to_owned(),
+                    |target| target.node_generation().raw().to_string(),
+                ),
+            ),
+        );
+    }
+
+    fn record_window_focus_transition(
+        &mut self,
+        handle: AnyWindowHandle,
+        previous: bool,
+        current: bool,
+    ) {
+        self.diagnostics.increment_signal(SignalId::FocusTransition);
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "focus.transition",
+                "focus target changed",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("domain", "window")
+            .with_field("from", focus_bool_name(previous))
+            .with_field("to", focus_bool_name(current))
+            .with_field(
+                "reason",
+                if current {
+                    "window_focused"
+                } else {
+                    "window_unfocused"
+                },
+            )
+            .with_field("generation", handle.generation().raw().to_string()),
+        );
+    }
+
+    fn record_focus_transition(
+        &mut self,
+        handle: AnyWindowHandle,
+        domain: &'static str,
+        from: Option<InteractionTarget>,
+        to: Option<InteractionTarget>,
+        reason: &'static str,
+    ) {
+        self.diagnostics.increment_signal(SignalId::FocusTransition);
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "focus.transition",
+                "focus target changed",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("domain", domain)
+            .with_field("from", format_focus_target(from))
+            .with_field("to", format_focus_target(to))
+            .with_field("reason", reason)
+            .with_field("generation", focus_transition_generation(to.or(from))),
+        );
+    }
+
     fn record_stale_input_target(
         &mut self,
         handle: AnyWindowHandle,
         target: InteractionTarget,
         state_kind: &'static str,
     ) {
+        let actual_generation = self
+            .state
+            .retained_snapshot(handle.id())
+            .and_then(|retained| find_node_by_id(&retained, target).map(|node| node.generation()));
         self.diagnostics
             .increment_signal(SignalId::InputStaleTarget);
         self.diagnostics
@@ -1608,6 +2410,13 @@ impl Runtime {
             .with_field(
                 "expected_generation",
                 target.node_generation().raw().to_string(),
+            )
+            .with_field(
+                "actual_generation",
+                actual_generation.map_or_else(
+                    || "none".to_owned(),
+                    |generation| generation.raw().to_string(),
+                ),
             ),
         );
     }
@@ -1804,6 +2613,12 @@ impl Runtime {
         self.diagnostics.increment_signal(SignalId::StyleResolve);
     }
 
+    fn mark_semantic_interaction_changed(&mut self, handle: AnyWindowHandle) {
+        self.state
+            .scheduler_mut()
+            .mark_dirty(handle.id(), DirtyLane::Semantics);
+    }
+
     fn record_retained_diff(&mut self, diff: &RetainedTreeDiff) {
         self.diagnostics.increment_signal(SignalId::RetainedDiff);
         self.diagnostics.add_signal(
@@ -1868,6 +2683,73 @@ fn pointer_kind_name(kind: PointerInputKind) -> &'static str {
     }
 }
 
+fn key_input_kind_name(kind: KeyInputKind) -> &'static str {
+    match kind {
+        KeyInputKind::Down => "down",
+        KeyInputKind::Up => "up",
+    }
+}
+
+fn key_event_kind_name(kind: KeyInputKind) -> &'static str {
+    match kind {
+        KeyInputKind::Down => "key_down",
+        KeyInputKind::Up => "key_up",
+    }
+}
+
+fn focus_bool_name(focused: bool) -> &'static str {
+    if focused { "focused" } else { "unfocused" }
+}
+
+fn format_focus_target(target: Option<InteractionTarget>) -> String {
+    target.map_or_else(
+        || "none".to_owned(),
+        |target| {
+            format!(
+                "{}@{}",
+                target.node_id().raw(),
+                target.node_generation().raw()
+            )
+        },
+    )
+}
+
+fn focus_transition_generation(target: Option<InteractionTarget>) -> String {
+    target.map_or_else(
+        || "none".to_owned(),
+        |target| target.node_generation().raw().to_string(),
+    )
+}
+
+fn format_target_id(target: Option<InteractionTarget>) -> String {
+    target.map_or_else(
+        || "none".to_owned(),
+        |target| target.node_id().raw().to_string(),
+    )
+}
+
+fn format_target_generation(target: Option<InteractionTarget>) -> String {
+    target.map_or_else(
+        || "none".to_owned(),
+        |target| target.node_generation().raw().to_string(),
+    )
+}
+
+fn wheel_delta_pixels(input: WheelInput) -> LayoutPoint {
+    const LINE_HEIGHT: f32 = 40.0;
+    match input.delta() {
+        ScrollDelta::Lines { x, y } => LayoutPoint::new(x * LINE_HEIGHT, y * LINE_HEIGHT),
+        ScrollDelta::Pixels { x, y } => LayoutPoint::new(x, y),
+    }
+}
+
+fn clamp_scroll_offset(offset: LayoutPoint, max_offset: LayoutPoint) -> LayoutPoint {
+    LayoutPoint::new(
+        offset.x().clamp(0.0, max_offset.x()),
+        offset.y().clamp(0.0, max_offset.y()),
+    )
+}
+
 fn validate_pointer_input_position(input: PointerInput) -> NekoResult<()> {
     let position = input.position();
     if !position.x().is_finite() || !position.y().is_finite() {
@@ -1878,6 +2760,16 @@ fn validate_pointer_input_position(input: PointerInput) -> NekoResult<()> {
     Ok(())
 }
 
+fn validate_wheel_input(input: WheelInput) -> NekoResult<()> {
+    if input.delta().is_finite() {
+        Ok(())
+    } else {
+        Err(NekoError::invalid_input(
+            "wheel delta must be finite in both axes",
+        ))
+    }
+}
+
 fn find_node_by_target(
     retained: &RetainedTreeSnapshot,
     target: InteractionTarget,
@@ -1885,6 +2777,33 @@ fn find_node_by_target(
     retained
         .root()
         .and_then(|root| find_node_by_target_from(root, target))
+}
+
+fn find_focusable_node_by_target(
+    retained: &RetainedTreeSnapshot,
+    target: InteractionTarget,
+) -> Option<&RetainedNodeSnapshot> {
+    find_node_by_target(retained, target).filter(|node| node.focusable())
+}
+
+fn find_scrollable_node_by_target(
+    retained: &RetainedTreeSnapshot,
+    target: InteractionTarget,
+) -> Option<&RetainedNodeSnapshot> {
+    find_node_by_target(retained, target)
+        .filter(|node| node.resolved_style().layout().overflow() == crate::style::Overflow::Scroll)
+}
+
+fn find_layout_node_by_target(
+    node: &LayoutNodeSnapshot,
+    target: InteractionTarget,
+) -> Option<&LayoutNodeSnapshot> {
+    if node.node_id() == target.node_id() {
+        return Some(node);
+    }
+    node.children()
+        .iter()
+        .find_map(|child| find_layout_node_by_target(child, target))
 }
 
 fn find_node_by_target_from(
@@ -1900,4 +2819,25 @@ fn find_node_by_target_from(
     node.children()
         .iter()
         .find_map(|child| find_node_by_target_from(child, target))
+}
+
+fn find_node_by_id(
+    retained: &RetainedTreeSnapshot,
+    target: InteractionTarget,
+) -> Option<&RetainedNodeSnapshot> {
+    retained
+        .root()
+        .and_then(|root| find_node_by_id_from(root, target))
+}
+
+fn find_node_by_id_from(
+    node: &RetainedNodeSnapshot,
+    target: InteractionTarget,
+) -> Option<&RetainedNodeSnapshot> {
+    if node.id() == target.node_id() {
+        return Some(node);
+    }
+    node.children()
+        .iter()
+        .find_map(|child| find_node_by_id_from(child, target))
 }

@@ -2,13 +2,17 @@ use std::collections::HashMap;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize as WinitPhysicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key as WinitKey, ModifiersState, PhysicalKey as WinitPhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId as WinitWindowId};
 
 use crate::app::{AppContext, Application};
 use crate::error::{NekoError, NekoResult};
-use crate::interaction::PointerInput;
+use crate::interaction::{
+    Key, KeyInput, KeyInputKind, Modifiers, PhysicalKey, PointerInput, ScrollDelta, ScrollPhase,
+    WheelInput, WindowFocusInput,
+};
 use crate::layout::{LayoutPoint, LayoutSize};
 #[cfg(target_os = "windows")]
 use crate::platform::NativeRenderer;
@@ -48,6 +52,7 @@ struct WinitRuntimeApp {
     handles_by_winit: HashMap<WinitWindowId, AnyWindowHandle>,
     windows: HashMap<WinitWindowId, Window>,
     cursor_positions: HashMap<WinitWindowId, LayoutPoint>,
+    modifiers: HashMap<WinitWindowId, Modifiers>,
     #[cfg(target_os = "windows")]
     renderer: Option<NativeRenderer>,
 }
@@ -60,6 +65,7 @@ impl WinitRuntimeApp {
             handles_by_winit: HashMap::new(),
             windows: HashMap::new(),
             cursor_positions: HashMap::new(),
+            modifiers: HashMap::new(),
             #[cfg(target_os = "windows")]
             renderer: None,
         }
@@ -94,6 +100,7 @@ impl WinitRuntimeApp {
         self.windows_by_neko.insert(handle.id(), winit_id);
         self.handles_by_winit.insert(winit_id, handle);
         self.windows.insert(winit_id, window);
+        self.modifiers.insert(winit_id, Modifiers::empty());
 
         self.ingest(PlatformFact::WindowCreated { handle })?;
         self.ingest(PlatformFact::WindowShown { handle })?;
@@ -247,6 +254,7 @@ impl WinitRuntimeApp {
             self.handles_by_winit.remove(&winit_id);
             self.windows.remove(&winit_id);
             self.cursor_positions.remove(&winit_id);
+            self.modifiers.remove(&winit_id);
         }
     }
     fn remove_native_window(&mut self, handle: AnyWindowHandle) -> NekoResult<()> {
@@ -298,6 +306,73 @@ impl WinitRuntimeApp {
         };
         self.ingest(PlatformFact::PointerInput { handle, input })
     }
+
+    fn ingest_keyboard_input(
+        &mut self,
+        window_id: WinitWindowId,
+        handle: AnyWindowHandle,
+        event: winit::event::KeyEvent,
+        synthetic: bool,
+    ) -> NekoResult<()> {
+        let modifiers = self.modifiers.get(&window_id).copied().unwrap_or_default();
+        let kind = match event.state {
+            ElementState::Pressed => KeyInputKind::Down,
+            ElementState::Released => KeyInputKind::Up,
+        };
+        let input = KeyInput::new(kind, normalize_key(event.logical_key))
+            .with_physical_key(normalize_physical_key(event.physical_key))
+            .with_modifiers(modifiers)
+            .with_repeat(event.repeat)
+            .with_synthetic(synthetic);
+
+        self.ingest(PlatformFact::KeyInput { handle, input })
+    }
+
+    fn ingest_modifiers_changed(
+        &mut self,
+        window_id: WinitWindowId,
+        handle: AnyWindowHandle,
+        state: ModifiersState,
+    ) -> NekoResult<()> {
+        let modifiers = normalize_modifiers(state);
+        self.modifiers.insert(window_id, modifiers);
+        self.ingest(PlatformFact::ModifiersChanged { handle, modifiers })
+    }
+
+    fn ingest_mouse_wheel(
+        &mut self,
+        window_id: WinitWindowId,
+        handle: AnyWindowHandle,
+        delta: MouseScrollDelta,
+        phase: TouchPhase,
+    ) -> NekoResult<()> {
+        let modifiers = self.modifiers.get(&window_id).copied().unwrap_or_default();
+        let delta = match delta {
+            MouseScrollDelta::LineDelta(x, y) => logical_scroll_lines(x, y),
+            MouseScrollDelta::PixelDelta(position) => {
+                let Some(window) = self.windows.get(&window_id) else {
+                    return Ok(());
+                };
+                let scale = window.scale_factor();
+                if !(scale.is_finite() && scale > 0.0) {
+                    return Ok(());
+                }
+                logical_scroll_pixels(position, scale)
+            }
+        };
+        self.ingest(PlatformFact::WheelInput {
+            handle,
+            input: WheelInput::new(delta, normalize_scroll_phase(phase)).with_modifiers(modifiers),
+        })
+    }
+
+    fn ingest_window_focus(&mut self, handle: AnyWindowHandle, focused: bool) -> NekoResult<()> {
+        self.ingest(PlatformFact::WindowFocusChanged {
+            handle,
+            input: WindowFocusInput::new(focused),
+        })
+    }
+
     fn exit_event_loop(&mut self, event_loop: &ActiveEventLoop) {
         let _ = self.ingest(PlatformFact::Exit);
         event_loop.exit();
@@ -365,6 +440,18 @@ impl ApplicationHandler for WinitRuntimeApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 self.ingest_mouse_button(handle, state, button)
             }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => self.ingest_keyboard_input(window_id, handle, event, is_synthetic),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.ingest_modifiers_changed(window_id, handle, modifiers.state())
+            }
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                self.ingest_mouse_wheel(window_id, handle, delta, phase)
+            }
+            WindowEvent::Focused(focused) => self.ingest_window_focus(handle, focused),
             WindowEvent::Occluded(true) => self.ingest(PlatformFact::Minimized { handle }),
             WindowEvent::Occluded(false) => self.ingest(PlatformFact::Restored { handle }),
             _ => Ok(()),
@@ -405,11 +492,57 @@ fn logical_cursor_position(position: winit::dpi::PhysicalPosition<f64>, scale: f
     LayoutPoint::new(logical.x, logical.y)
 }
 
+fn logical_scroll_lines(x: f32, y: f32) -> ScrollDelta {
+    ScrollDelta::lines(-x, -y)
+}
+
+fn logical_scroll_pixels(position: winit::dpi::PhysicalPosition<f64>, scale: f64) -> ScrollDelta {
+    let logical = position.to_logical::<f32>(scale);
+    ScrollDelta::pixels(-logical.x, -logical.y)
+}
+
+fn normalize_key(key: WinitKey) -> Key {
+    match key {
+        WinitKey::Character(value) => Key::character(value.to_string()),
+        WinitKey::Named(value) => Key::named(format!("{value:?}")),
+        WinitKey::Dead(value) => Key::Dead(value),
+        WinitKey::Unidentified(_) => Key::Unidentified,
+    }
+}
+
+fn normalize_physical_key(key: WinitPhysicalKey) -> PhysicalKey {
+    match key {
+        WinitPhysicalKey::Code(value) => PhysicalKey::code(format!("{value:?}")),
+        WinitPhysicalKey::Unidentified(_) => PhysicalKey::Unidentified,
+    }
+}
+
+fn normalize_modifiers(state: ModifiersState) -> Modifiers {
+    Modifiers::new(
+        state.shift_key(),
+        state.control_key(),
+        state.alt_key(),
+        state.super_key(),
+    )
+}
+
+fn normalize_scroll_phase(phase: TouchPhase) -> ScrollPhase {
+    match phase {
+        TouchPhase::Started => ScrollPhase::Started,
+        TouchPhase::Moved => ScrollPhase::Moved,
+        TouchPhase::Ended => ScrollPhase::Ended,
+        TouchPhase::Cancelled => ScrollPhase::Cancelled,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use winit::dpi::PhysicalPosition;
+    use winit::keyboard::ModifiersState;
 
-    use super::logical_cursor_position;
+    use super::{
+        logical_cursor_position, logical_scroll_lines, logical_scroll_pixels, normalize_modifiers,
+    };
 
     #[test]
     fn pointer_positions_are_converted_from_physical_to_logical() {
@@ -417,5 +550,33 @@ mod tests {
 
         assert_eq!(position.x(), 10.0);
         assert_eq!(position.y(), 5.0);
+    }
+
+    #[test]
+    fn wheel_line_deltas_are_converted_to_internal_offset_delta() {
+        let delta = logical_scroll_lines(4.0, -2.5);
+
+        assert_eq!(delta.x(), -4.0);
+        assert_eq!(delta.y(), 2.5);
+        assert_eq!(delta.unit_name(), "lines");
+    }
+
+    #[test]
+    fn wheel_pixel_deltas_are_converted_to_internal_offset_delta() {
+        let delta = logical_scroll_pixels(PhysicalPosition::new(9.0, 6.0), 3.0);
+
+        assert_eq!(delta.x(), -3.0);
+        assert_eq!(delta.y(), -2.0);
+        assert_eq!(delta.unit_name(), "pixels");
+    }
+
+    #[test]
+    fn modifiers_are_normalized_without_winit_leakage() {
+        let modifiers = normalize_modifiers(ModifiersState::SHIFT.union(ModifiersState::ALT));
+
+        assert!(modifiers.shift());
+        assert!(!modifiers.ctrl());
+        assert!(modifiers.alt());
+        assert!(!modifiers.logo());
     }
 }

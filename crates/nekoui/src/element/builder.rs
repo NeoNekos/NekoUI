@@ -3,7 +3,9 @@ use std::rc::Rc;
 
 use crate::element::ElementKey;
 use crate::error::NekoResult;
-use crate::interaction::{ClickEvent, InteractionHandlers, IntoHandlerResult, PointerEvent};
+use crate::interaction::{
+    ClickEvent, InteractionHandlers, IntoHandlerResult, KeyEvent, PointerEvent,
+};
 use crate::style::StyleDeclaration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -31,6 +33,7 @@ pub struct Element {
     kind: ElementKind,
     key: Option<ElementKey>,
     style: StyleDeclaration,
+    focusable: bool,
     handlers: InteractionHandlers,
     text: Option<Cow<'static, str>>,
     children: Vec<Element>,
@@ -41,6 +44,7 @@ pub(crate) struct ElementParts {
     pub kind: ElementKind,
     pub key: Option<ElementKey>,
     pub style: StyleDeclaration,
+    pub focusable: bool,
     pub handlers: InteractionHandlers,
     pub text: Option<Cow<'static, str>>,
     pub children: Vec<Element>,
@@ -52,6 +56,7 @@ impl Element {
             kind,
             key: None,
             style: StyleDeclaration::default(),
+            focusable: false,
             handlers: InteractionHandlers::default(),
             text: None,
             children: Vec::new(),
@@ -68,6 +73,10 @@ impl Element {
 
     pub fn style(&self) -> &StyleDeclaration {
         &self.style
+    }
+
+    pub fn focusable(&self) -> bool {
+        self.focusable
     }
 
     pub fn text(&self) -> Option<&str> {
@@ -99,6 +108,7 @@ impl Element {
             kind: self.kind,
             key: self.key,
             style: self.style,
+            focusable: self.focusable,
             handlers: self.handlers,
             text: self.text,
             children: self.children,
@@ -134,6 +144,11 @@ impl Div {
 
     pub fn child(mut self, child: impl IntoElement) -> Self {
         self.element.children.push(child.into_element());
+        self
+    }
+
+    pub fn focusable(mut self, focusable: bool) -> Self {
+        self.element.focusable = focusable;
         self
     }
 
@@ -174,6 +189,26 @@ impl Div {
         self.element
             .handlers_mut()
             .set_click(Rc::new(move |event, _cx| handler(event).into_result()));
+        self
+    }
+
+    pub fn on_key_down<R>(mut self, handler: impl Fn(&KeyEvent) -> R + 'static) -> Self
+    where
+        R: IntoHandlerResult + 'static,
+    {
+        self.element
+            .handlers_mut()
+            .set_key_down(Rc::new(move |event, _cx| handler(event).into_result()));
+        self
+    }
+
+    pub fn on_key_up<R>(mut self, handler: impl Fn(&KeyEvent) -> R + 'static) -> Self
+    where
+        R: IntoHandlerResult + 'static,
+    {
+        self.element
+            .handlers_mut()
+            .set_key_up(Rc::new(move |event, _cx| handler(event).into_result()));
         self
     }
 
@@ -226,6 +261,32 @@ impl Div {
         self.element
             .handlers_mut()
             .set_click(Rc::new(move |event, cx| handler(event, cx).into_result()));
+        self
+    }
+
+    pub fn on_key_down_with<R>(
+        mut self,
+        handler: impl for<'a> Fn(&KeyEvent, &mut crate::app::AppContext<'a>) -> R + 'static,
+    ) -> Self
+    where
+        R: IntoHandlerResult + 'static,
+    {
+        self.element
+            .handlers_mut()
+            .set_key_down(Rc::new(move |event, cx| handler(event, cx).into_result()));
+        self
+    }
+
+    pub fn on_key_up_with<R>(
+        mut self,
+        handler: impl for<'a> Fn(&KeyEvent, &mut crate::app::AppContext<'a>) -> R + 'static,
+    ) -> Self
+    where
+        R: IntoHandlerResult + 'static,
+    {
+        self.element
+            .handlers_mut()
+            .set_key_up(Rc::new(move |event, cx| handler(event, cx).into_result()));
         self
     }
 
@@ -266,6 +327,11 @@ impl Text {
         &self.element
     }
 
+    pub fn focusable(mut self, focusable: bool) -> Self {
+        self.element.focusable = focusable;
+        self
+    }
+
     pub fn on_pointer_down<R>(mut self, handler: impl Fn(&PointerEvent) -> R + 'static) -> Self
     where
         R: IntoHandlerResult + 'static,
@@ -303,6 +369,26 @@ impl Text {
         self.element
             .handlers_mut()
             .set_click(Rc::new(move |event, _cx| handler(event).into_result()));
+        self
+    }
+
+    pub fn on_key_down<R>(mut self, handler: impl Fn(&KeyEvent) -> R + 'static) -> Self
+    where
+        R: IntoHandlerResult + 'static,
+    {
+        self.element
+            .handlers_mut()
+            .set_key_down(Rc::new(move |event, _cx| handler(event).into_result()));
+        self
+    }
+
+    pub fn on_key_up<R>(mut self, handler: impl Fn(&KeyEvent) -> R + 'static) -> Self
+    where
+        R: IntoHandlerResult + 'static,
+    {
+        self.element
+            .handlers_mut()
+            .set_key_up(Rc::new(move |event, _cx| handler(event).into_result()));
         self
     }
 
@@ -355,6 +441,32 @@ impl Text {
         self.element
             .handlers_mut()
             .set_click(Rc::new(move |event, cx| handler(event, cx).into_result()));
+        self
+    }
+
+    pub fn on_key_down_with<R>(
+        mut self,
+        handler: impl for<'a> Fn(&KeyEvent, &mut crate::app::AppContext<'a>) -> R + 'static,
+    ) -> Self
+    where
+        R: IntoHandlerResult + 'static,
+    {
+        self.element
+            .handlers_mut()
+            .set_key_down(Rc::new(move |event, cx| handler(event, cx).into_result()));
+        self
+    }
+
+    pub fn on_key_up_with<R>(
+        mut self,
+        handler: impl for<'a> Fn(&KeyEvent, &mut crate::app::AppContext<'a>) -> R + 'static,
+    ) -> Self
+    where
+        R: IntoHandlerResult + 'static,
+    {
+        self.element
+            .handlers_mut()
+            .set_key_up(Rc::new(move |event, cx| handler(event, cx).into_result()));
         self
     }
 

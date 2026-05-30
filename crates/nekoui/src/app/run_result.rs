@@ -4,6 +4,7 @@ use crate::layout::LayoutTreeSnapshot;
 use crate::retained::RetainedTreeSnapshot;
 use crate::runtime::Runtime;
 use crate::scene::PaintScene;
+use crate::semantics::SemanticTreeSnapshot;
 use crate::style::StyleTreeSnapshot;
 use crate::window::{AnyWindowHandle, WindowRecord};
 
@@ -52,6 +53,13 @@ impl TestRun {
         handle: impl Into<AnyWindowHandle>,
     ) -> NekoResult<LayoutTreeSnapshot> {
         self.runtime.layout_snapshot(handle.into())
+    }
+
+    pub(crate) fn semantic_snapshot(
+        &self,
+        handle: impl Into<AnyWindowHandle>,
+    ) -> NekoResult<SemanticTreeSnapshot> {
+        self.runtime.semantic_snapshot(handle.into())
     }
 
     pub(crate) fn scene_snapshot(

@@ -8,7 +8,7 @@ use taffy::{NodeId, TaffyTree};
 
 use crate::element::{ElementKey, ElementKind};
 use crate::error::{NekoError, NekoResult};
-use crate::layout::{LayoutNodeSnapshot, LayoutRect, LayoutSize, Viewport};
+use crate::layout::{LayoutNodeSnapshot, LayoutRect, LayoutSize, ScrollGeometry, Viewport};
 use crate::retained::{RetainedIdentity, RetainedLayoutInput, RetainedLayoutNode};
 use crate::style::{Dimension, Display, Length, ResolvedLayoutStyle, ResolvedTextStyle};
 use crate::text::{
@@ -50,6 +50,7 @@ struct BuiltNode {
     identity: RetainedIdentity,
     kind: ElementKind,
     key: Option<ElementKey>,
+    overflow: crate::style::Overflow,
     taffy_id: NodeId,
     children: Vec<BuiltNode>,
 }
@@ -159,6 +160,7 @@ fn build_node(
         identity: node.identity(),
         kind: node.kind(),
         key: node.key().cloned(),
+        overflow: node.resolved_style().layout().overflow(),
         taffy_id,
         children,
     }))
@@ -188,6 +190,7 @@ fn to_taffy_style(style: &ResolvedLayoutStyle, is_root: bool, viewport: Viewport
             width: LengthPercentage::length(gap),
             height: LengthPercentage::length(gap),
         },
+        flex_shrink: 0.0,
         flex_direction,
         ..Default::default()
     }
@@ -414,6 +417,12 @@ fn materialize_node(
             )
         })
         .collect::<NekoResult<Vec<_>>>()?;
+    let content_size = LayoutSize::new(layout.content_size.width, layout.content_size.height);
+    let scroll = ScrollGeometry::new(
+        built.overflow,
+        content_rect,
+        conservative_content_extent(content_rect, content_size, &children),
+    );
     let text_layout = tree
         .get_node_context(built.taffy_id)
         .and_then(|context| match context {
@@ -429,11 +438,27 @@ fn materialize_node(
             border_rect,
             padding_rect,
             content_rect,
-            content_size: LayoutSize::new(layout.content_size.width, layout.content_size.height),
+            content_size,
+            scroll,
             text_layout,
         },
         children,
     ))
+}
+
+fn conservative_content_extent(
+    viewport: LayoutRect,
+    content_size: LayoutSize,
+    children: &[LayoutNodeSnapshot],
+) -> LayoutSize {
+    let mut right = viewport.width().max(content_size.width());
+    let mut bottom = viewport.height().max(content_size.height());
+    for child in children {
+        let rect = child.margin_rect();
+        right = right.max(rect.x() + rect.width() - viewport.x());
+        bottom = bottom.max(rect.y() + rect.height() - viewport.y());
+    }
+    LayoutSize::new(right.max(0.0), bottom.max(0.0))
 }
 
 fn count_snapshot(node: &LayoutNodeSnapshot) -> usize {

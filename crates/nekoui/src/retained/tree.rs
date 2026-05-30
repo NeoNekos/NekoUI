@@ -20,6 +20,7 @@ struct RetainedNode {
     kind: ElementKind,
     key: Option<crate::element::ElementKey>,
     style: crate::style::StyleDeclaration,
+    focusable: bool,
     handlers: InteractionHandlers,
     resolved_style: ResolvedStyle,
     participation: OutputParticipation,
@@ -39,6 +40,7 @@ impl RetainedNode {
             kind: self.kind,
             key: self.key.clone(),
             style: self.style.clone(),
+            focusable: self.focusable,
             handlers: self.handlers.clone(),
             resolved_style: self.resolved_style.clone(),
             participation: self.participation,
@@ -181,6 +183,13 @@ impl RetainedTree {
                         interaction_lanes(),
                     );
                 }
+                if old_node.focusable != parts.focusable {
+                    context.emit_dirty(
+                        Some(identity),
+                        DirtyCause::RetainedChanged,
+                        focusable_lanes(),
+                    );
+                }
 
                 let children = self.diff_children(
                     std::mem::take(&mut old_node.children),
@@ -195,6 +204,7 @@ impl RetainedTree {
                     kind: parts.kind,
                     key: parts.key,
                     style: parts.style,
+                    focusable: parts.focusable,
                     handlers: parts.handlers,
                     resolved_style,
                     participation,
@@ -261,6 +271,7 @@ impl RetainedTree {
             kind: parts.kind,
             key: parts.key,
             style: parts.style,
+            focusable: parts.focusable,
             handlers: parts.handlers,
             resolved_style,
             participation,
@@ -459,6 +470,13 @@ fn participation_lanes() -> DirtyLanes {
 fn interaction_lanes() -> DirtyLanes {
     let mut lanes = DirtyLanes::empty();
     lanes.insert(DirtyLane::Semantics.flag());
+    lanes
+}
+
+fn focusable_lanes() -> DirtyLanes {
+    let mut lanes = DirtyLanes::empty();
+    lanes.insert(DirtyLane::Semantics.flag());
+    lanes.insert(DirtyLane::Paint.flag());
     lanes
 }
 

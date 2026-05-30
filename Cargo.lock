@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "nekoui"
-version = "0.0.73"
+version = "0.0.74"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "nekoui-shader-build"
-version = "0.0.73"
+version = "0.0.74"
 dependencies = [
  "naga",
  "nekoui-shader-types",
@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "nekoui-shader-types"
-version = "0.0.73"
+version = "0.0.74"
 
 [[package]]
 name = "new_debug_unreachable"

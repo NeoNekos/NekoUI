@@ -35,8 +35,14 @@ pub enum SceneSignatureFact {
     TextColor(u64),
     FontSize(u32),
     TextOverflow(u8),
+    Overflow(u8),
     MaxLines(Option<usize>),
     TextPayload(Option<String>),
+    ScrollOffset {
+        target: u64,
+        x: u32,
+        y: u32,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -46,9 +52,11 @@ pub struct SceneGeneration {
     style: SceneInputSignature,
     viewport: u64,
     text: SceneInputSignature,
+    scroll: SceneInputSignature,
 }
 
 impl SceneGeneration {
+    #[cfg(test)]
     pub(crate) fn new(
         retained: Option<RetainedTreeGeneration>,
         layout: Option<LayoutGeneration>,
@@ -56,12 +64,31 @@ impl SceneGeneration {
         viewport: u64,
         text: SceneInputSignature,
     ) -> Self {
+        Self::new_with_scroll(
+            retained,
+            layout,
+            style,
+            viewport,
+            text,
+            SceneInputSignature::default(),
+        )
+    }
+
+    pub(crate) fn new_with_scroll(
+        retained: Option<RetainedTreeGeneration>,
+        layout: Option<LayoutGeneration>,
+        style: SceneInputSignature,
+        viewport: u64,
+        text: SceneInputSignature,
+        scroll: SceneInputSignature,
+    ) -> Self {
         Self {
             retained,
             layout,
             style,
             viewport,
             text,
+            scroll,
         }
     }
 
@@ -83,5 +110,9 @@ impl SceneGeneration {
 
     pub fn text_generation(&self) -> &SceneInputSignature {
         &self.text
+    }
+
+    pub fn scroll_generation(&self) -> &SceneInputSignature {
+        &self.scroll
     }
 }

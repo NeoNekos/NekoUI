@@ -1,13 +1,15 @@
 use crate::app::{Context, Render};
 use crate::diagnostic::DirtyLane;
 use crate::element::{Element, IntoElement, div, text};
-use crate::layout::LayoutSize;
+use crate::interaction::{PointerInput, ScrollDelta, ScrollPhase, WheelInput};
+use crate::layout::{LayoutPoint, LayoutSize};
+use crate::platform::PlatformFact;
 use crate::runtime::Runtime;
 use crate::scene::{
     DamageReason, PaintFragmentKind, ResourceDemandKind, SceneCompileInput, compile_scene,
     scene_generation_for_inputs, scene_publish_is_current,
 };
-use crate::style::{Color, Display, StyleExt, opacity};
+use crate::style::{Color, Display, Overflow, StyleExt, opacity, px};
 use crate::window::WindowOptions;
 
 #[derive(Debug)]
@@ -110,6 +112,97 @@ fn hit_test_metadata_matches_retained_and_layout_nodes() {
 
     assert_eq!(hit_target.node_generation(), retained_target.generation());
     assert_eq!(hit_target.rect(), layout_target.border_rect());
+    let path = hit_target.path();
+    assert_eq!(path.len(), 2);
+    assert_eq!(path[0].node_id(), retained.root().unwrap().id());
+    assert_eq!(path[1].node_id(), retained_target.id());
+}
+
+#[test]
+fn overflow_scroll_style_resolves_and_layout_exposes_scroll_metadata() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div()
+                    .key("scroll")
+                    .w(px(100.0))
+                    .h(px(80.0))
+                    .overflow(Overflow::Scroll)
+                    .child(text("content").key("content").h(px(200.0))),
+            )
+        })
+        .unwrap();
+    let retained = runtime.retained_snapshot(window).unwrap();
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let retained_scroll = retained.find_by_key("scroll").unwrap();
+    let layout_scroll = layout.find_by_key("scroll").unwrap();
+
+    assert_eq!(
+        retained_scroll.resolved_style().layout().overflow(),
+        Overflow::Scroll
+    );
+    assert_eq!(layout_scroll.scroll().overflow(), Overflow::Scroll);
+    assert_eq!(layout_scroll.scroll().viewport().height(), 80.0);
+    assert_eq!(layout_scroll.scroll().content_extent().height(), 200.0);
+    assert_eq!(layout_scroll.scroll().max_offset().y(), 120.0);
+}
+
+#[test]
+fn clipped_out_scrolled_child_hit_test_changes_after_scroll() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div()
+                    .key("scroll")
+                    .w(px(100.0))
+                    .h(px(100.0))
+                    .overflow(Overflow::Scroll)
+                    .child(text("top").key("top").h(px(100.0)))
+                    .child(text("bottom").key("bottom").h(px(100.0))),
+            )
+        })
+        .unwrap();
+    let retained = runtime.retained_snapshot(window).unwrap();
+    let bottom_id = retained.find_by_key("bottom").unwrap().id();
+    let scene = runtime.scene_snapshot(window).unwrap();
+    let bottom_entry = scene
+        .hit_test()
+        .entries()
+        .iter()
+        .find(|entry| entry.node_id() == bottom_id)
+        .unwrap();
+    assert!(bottom_entry.clip().is_some());
+    assert_ne!(
+        scene
+            .hit_test()
+            .hit_test(LayoutPoint::new(1.0, 101.0))
+            .map(|entry| entry.node_id()),
+        Some(bottom_id)
+    );
+
+    runtime
+        .pointer_input(window, PointerInput::move_to(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    runtime
+        .ingest_platform_fact(PlatformFact::WheelInput {
+            handle: window.into(),
+            input: WheelInput::new(ScrollDelta::pixels(0.0, 100.0), ScrollPhase::Moved),
+        })
+        .unwrap();
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+
+    let scrolled_scene = runtime.scene_snapshot(window).unwrap();
+    let target = scrolled_scene
+        .hit_test()
+        .hit_test(LayoutPoint::new(1.0, 1.0))
+        .unwrap();
+    assert_eq!(target.node_id(), bottom_id);
 }
 
 #[test]
@@ -260,6 +353,7 @@ fn damage_reasons_are_value_level_observable() {
         retained: &retained,
         style: &style,
         layout: &layout,
+        interaction: None,
         previous: Some(&initial_scene),
     });
     assert_eq!(unchanged.scene.damage().reason(), DamageReason::Unchanged);
@@ -269,6 +363,7 @@ fn damage_reasons_are_value_level_observable() {
         retained: &retained,
         style: &style,
         layout: &layout,
+        interaction: None,
         previous: None,
     });
     assert_eq!(output.scene.damage().reason(), DamageReason::Initial);
@@ -338,6 +433,7 @@ fn stale_like_input_change_produces_conservative_damage() {
         retained: &retained,
         style: &style,
         layout: &resized_layout,
+        interaction: None,
         previous: Some(&previous),
     });
 

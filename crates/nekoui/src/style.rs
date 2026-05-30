@@ -7,8 +7,8 @@ mod units;
 
 pub use color::{Color, ColorSpace, Opacity, opacity};
 pub use declaration::{
-    Display, LayoutStyleDeclaration, StyleDeclaration, TextOverflow, TextStyleDeclaration,
-    VisualStyleDeclaration,
+    Display, LayoutStyleDeclaration, Overflow, StyleDeclaration, TextOverflow,
+    TextStyleDeclaration, VisualStyleDeclaration,
 };
 pub use extension::StyleExt;
 pub use resolve::{ResolvedLayoutStyle, ResolvedStyle, ResolvedTextStyle, ResolvedVisualStyle};

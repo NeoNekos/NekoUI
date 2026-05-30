@@ -1,10 +1,10 @@
 #[cfg(target_os = "windows")]
 use crate::error::ErrorKind;
-use crate::interaction::PointerInput;
+use crate::interaction::{KeyInput, Modifiers, PointerInput, WheelInput, WindowFocusInput};
 use crate::layout::LayoutSize;
 use crate::window::AnyWindowHandle;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PlatformFact {
     WindowCreated {
         handle: AnyWindowHandle,
@@ -51,6 +51,22 @@ pub(crate) enum PlatformFact {
     PointerInput {
         handle: AnyWindowHandle,
         input: PointerInput,
+    },
+    KeyInput {
+        handle: AnyWindowHandle,
+        input: KeyInput,
+    },
+    ModifiersChanged {
+        handle: AnyWindowHandle,
+        modifiers: Modifiers,
+    },
+    WheelInput {
+        handle: AnyWindowHandle,
+        input: WheelInput,
+    },
+    WindowFocusChanged {
+        handle: AnyWindowHandle,
+        input: WindowFocusInput,
     },
 }
 

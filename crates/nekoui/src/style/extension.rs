@@ -1,5 +1,5 @@
 use crate::element::{Div, Element, Text};
-use crate::style::{Color, Dimension, Display, Length, Opacity, StyleDeclaration};
+use crate::style::{Color, Dimension, Display, Length, Opacity, Overflow, StyleDeclaration};
 
 pub trait StyleExt: Sized {
     fn update_style<F>(self, update: F) -> Self
@@ -141,6 +141,10 @@ pub trait StyleExt: Sized {
         self.update_style(|style| style.set_gap(value))
     }
 
+    fn overflow(self, value: Overflow) -> Self {
+        self.update_style(|style| style.set_overflow(value))
+    }
+
     fn width(self, value: impl Into<Dimension>) -> Self {
         let value = value.into();
         self.update_style(|style| style.set_width(value))
@@ -219,7 +223,7 @@ impl StyleExt for Element {
 #[cfg(test)]
 mod tests {
     use crate::element::{IntoElement, div};
-    use crate::style::{Color, Dimension, StyleExt, fill, px};
+    use crate::style::{Color, Dimension, Overflow, StyleExt, fill, px};
 
     #[test]
     fn style_extension_methods_write_canonical_declaration() {
@@ -231,6 +235,7 @@ mod tests {
             .m(px(10.0))
             .ml(px(6.0))
             .gap(px(2.0))
+            .overflow(Overflow::Scroll)
             .width(fill())
             .w(fill())
             .background(Color::rgb(1, 2, 3))
@@ -245,6 +250,7 @@ mod tests {
         assert_eq!(margin.top, Some(px(10.0)));
         assert_eq!(margin.left, Some(px(6.0)));
         assert_eq!(element.style().layout().gap(), Some(px(2.0)));
+        assert_eq!(element.style().layout().overflow(), Some(Overflow::Scroll));
         assert_eq!(element.style().layout().width(), Some(Dimension::Fill));
         assert_eq!(
             element.style().visual().background(),

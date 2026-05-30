@@ -12,6 +12,7 @@ mod render;
 pub mod retained;
 mod runtime;
 pub mod scene;
+mod semantics;
 pub mod style;
 mod text;
 pub mod window;
