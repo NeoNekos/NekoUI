@@ -397,10 +397,21 @@ fn assert_artifact_for_manifest(
         .find(|candidate| candidate.target == target)
         .unwrap();
     assert_eq!(manifest.checked_binary, checked_binary);
-    assert_eq!(sha256_hex(bytes), manifest.sha256);
+    let actual_sha256 = if checked_binary {
+        sha256_hex(bytes)
+    } else {
+        sha256_text_bytes_hex(bytes)
+    };
+    assert_eq!(actual_sha256, manifest.sha256);
     if checked_binary {
         assert!(bytes.starts_with(b"DXBC"));
     }
+}
+
+fn sha256_text_bytes_hex(bytes: &[u8]) -> String {
+    let text = std::str::from_utf8(bytes).expect("shader text artifacts should be valid UTF-8");
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    sha256_hex(normalized.as_bytes())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

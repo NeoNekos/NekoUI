@@ -113,13 +113,13 @@ pub(crate) const SOLID_RECT_TARGETS: &[ShaderArtifactTarget] = &[
     ShaderArtifactTarget {
         target: ShaderBackendTarget::D3d11Sm5VertexHlsl,
         path: "shaders/generated/solid_rect.vs_5_0.hlsl",
-        sha256: "4e3e36c999b9ac99778d661178d51736c7c258fb72efada6aeb51a1184fc238a",
+        sha256: "d4f04447fb2e5eb26371be3a7e0db823506fd18772146d079100f2faee1d25ef",
         checked_binary: false,
     },
     ShaderArtifactTarget {
         target: ShaderBackendTarget::D3d11Sm5FragmentHlsl,
         path: "shaders/generated/solid_rect.ps_5_0.hlsl",
-        sha256: "913e9e1a4a6eb3de972d8f9ff985c0757fc2dd71cba9da9c139f7ec3c481f5c0",
+        sha256: "23f5bdb944ebbd4601cb5266f882d09fe30414600eafca1713338441e61a9eca",
         checked_binary: false,
     },
     ShaderArtifactTarget {
