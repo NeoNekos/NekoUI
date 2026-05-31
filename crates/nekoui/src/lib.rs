@@ -18,7 +18,9 @@ mod text;
 pub mod window;
 
 pub use app::{AppContext, Application, Context, Entity, Render, Subscription, WeakEntity};
-pub use element::{Div, Element, ElementKey, ElementKind, IntoElement, Text, div, text};
+pub use element::{
+    Div, Element, ElementKey, ElementKind, Input, IntoElement, Text, div, input, text,
+};
 pub use error::{ErrorKind, NekoError, NekoResult};
 
 #[cfg(test)]

@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::error::{NekoError, NekoResult};
 use crate::interaction::InteractionState;
-use crate::layout::{LayoutPassStats, LayoutSize, LayoutTreeSnapshot};
-use crate::platform::{PhysicalSize, Renderability};
+use crate::layout::{LayoutPassStats, LayoutRect, LayoutSize, LayoutTreeSnapshot};
+use crate::platform::{ImePlatformRequest, PhysicalSize, Renderability};
 use crate::render::{FrameGraphStats, PreparedFrame};
 use crate::retained::{
     DirtyCause, RetainedDiffStats, RetainedDirty, RetainedIdentity, RetainedTree,
@@ -40,6 +40,7 @@ pub struct RuntimeState {
     entity_store: EntityStore,
     subscription_store: SubscriptionStore,
     interaction: BTreeMap<WindowId, InteractionState>,
+    ime_requests: BTreeMap<WindowId, Vec<ImePlatformRequest>>,
 }
 
 impl Default for RuntimeState {
@@ -64,6 +65,7 @@ impl Default for RuntimeState {
             entity_store: EntityStore::default(),
             subscription_store: SubscriptionStore::default(),
             interaction: BTreeMap::new(),
+            ime_requests: BTreeMap::new(),
         }
     }
 }
@@ -121,6 +123,7 @@ impl RuntimeState {
         self.scene_snapshots.remove(&handle.id());
         self.prepared_frame_snapshots.remove(&handle.id());
         self.interaction.remove(&handle.id());
+        self.ime_requests.remove(&handle.id());
         Ok(())
     }
 
@@ -345,6 +348,25 @@ impl RuntimeState {
 
     pub(crate) fn interaction_mut(&mut self, window: WindowId) -> &mut InteractionState {
         self.interaction.entry(window).or_default()
+    }
+
+    pub(crate) fn push_ime_request(&mut self, window: WindowId, request: ImePlatformRequest) {
+        self.ime_requests.entry(window).or_default().push(request);
+    }
+
+    pub(crate) fn take_ime_requests(&mut self, window: WindowId) -> Vec<ImePlatformRequest> {
+        self.ime_requests.remove(&window).unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peek_ime_requests(&self, window: WindowId) -> &[ImePlatformRequest] {
+        self.ime_requests.get(&window).map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn replace_ime_candidate_rect(&mut self, window: WindowId, rect: LayoutRect) {
+        let requests = self.ime_requests.entry(window).or_default();
+        requests.retain(|request| !matches!(request, ImePlatformRequest::CursorArea { .. }));
+        requests.push(ImePlatformRequest::CursorArea { rect });
     }
 
     pub fn layout_node_count(&self) -> usize {

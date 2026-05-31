@@ -80,6 +80,10 @@ pub(crate) enum SignalId {
     InputModifiersFact,
     InputWheelFact,
     WindowFocusFact,
+    TextInputFact,
+    ImeTransition,
+    ImePreedit,
+    ImeCommit,
     InputHit,
     InputMiss,
     InputDispatch,
@@ -92,7 +96,7 @@ pub(crate) enum SignalId {
 }
 
 impl SignalId {
-    pub(crate) const COUNT: usize = 89;
+    pub(crate) const COUNT: usize = 93;
 
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::RuntimeCommandQueued,
@@ -175,6 +179,10 @@ impl SignalId {
         Self::InputModifiersFact,
         Self::InputWheelFact,
         Self::WindowFocusFact,
+        Self::TextInputFact,
+        Self::ImeTransition,
+        Self::ImePreedit,
+        Self::ImeCommit,
         Self::InputHit,
         Self::InputMiss,
         Self::InputDispatch,
@@ -268,6 +276,10 @@ impl SignalId {
             Self::InputModifiersFact => "input.modifiers_fact",
             Self::InputWheelFact => "input.wheel_fact",
             Self::WindowFocusFact => "window.focus_fact",
+            Self::TextInputFact => "text.input_fact",
+            Self::ImeTransition => "ime.transition",
+            Self::ImePreedit => "ime.preedit",
+            Self::ImeCommit => "ime.commit",
             Self::InputHit => "input.hit",
             Self::InputMiss => "input.miss",
             Self::InputDispatch => "input.dispatch",

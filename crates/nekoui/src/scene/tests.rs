@@ -1,8 +1,8 @@
 use crate::app::{Context, Render};
 use crate::diagnostic::DirtyLane;
-use crate::element::{Element, IntoElement, div, text};
+use crate::element::{Element, ElementKind, IntoElement, div, input, text};
 use crate::interaction::{PointerInput, ScrollDelta, ScrollPhase, WheelInput};
-use crate::layout::{LayoutPoint, LayoutSize};
+use crate::layout::{LayoutPoint, LayoutSize, text_viewport_placement};
 use crate::platform::PlatformFact;
 use crate::runtime::Runtime;
 use crate::scene::{
@@ -311,6 +311,255 @@ fn text_glyph_demands_match_scene_text_generation() {
         .find(|fragment| matches!(fragment.kind(), PaintFragmentKind::Text { .. }))
         .unwrap();
     assert!(text_fragment.text_layout().is_some());
+}
+
+#[test]
+fn focused_tall_input_text_and_caret_share_centered_line_box_origin() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div()
+                    .key("root")
+                    .child(input("hi").key("field").h(px(48.0)).font_size(px(12.0)))
+                    .child(text("plain").key("label").h(px(48.0)).font_size(px(12.0))),
+            )
+        })
+        .unwrap();
+    let unfocused_generation = runtime.scene_snapshot(window).unwrap().generation();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+
+    let scene = runtime.scene_snapshot(window).unwrap();
+    let retained = runtime.retained_snapshot(window).unwrap();
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let field = retained.find_by_key("field").unwrap();
+    let field_layout = layout.find_by_key("field").unwrap();
+    let field_text_layout = field_layout.text_layout().unwrap();
+    let field_content = field_layout.content_rect();
+    let field_line_box_y = field_content.y()
+        + ((field_content.height() - field_text_layout.metrics().height) / 2.0).max(0.0);
+    let field_text_fragment = scene
+        .fragments()
+        .iter()
+        .find(|fragment| {
+            fragment.node_id() == field.id()
+                && matches!(fragment.kind(), PaintFragmentKind::Text { .. })
+        })
+        .expect("focused input should retain its text fragment");
+    let expected_caret = field_text_layout
+        .trailing_caret_rect()
+        .translate(field_content.x(), field_line_box_y);
+    let caret_fragment = scene
+        .fragments()
+        .iter()
+        .find(|fragment| {
+            fragment.node_id() == field.id()
+                && matches!(fragment.kind(), PaintFragmentKind::Rect { color } if *color == Color::BLACK)
+                && fragment.rect() == expected_caret
+        })
+        .expect("focused input should emit a static caret rect");
+    let label = retained.find_by_key("label").unwrap();
+    let label_layout = layout.find_by_key("label").unwrap();
+    let label_text_fragment = scene
+        .fragments()
+        .iter()
+        .find(|fragment| {
+            fragment.node_id() == label.id()
+                && matches!(fragment.kind(), PaintFragmentKind::Text { .. })
+        })
+        .expect("ordinary text should emit a text fragment");
+
+    assert_eq!(field_text_fragment.rect().x(), field_content.x());
+    assert_eq!(field_text_fragment.rect().y(), field_line_box_y);
+    assert!(field_text_fragment.rect().y() > field_content.y());
+    assert_eq!(caret_fragment.rect(), expected_caret);
+    assert_eq!(
+        caret_fragment.rect().y() - field_text_fragment.rect().y(),
+        field_text_layout.trailing_caret_rect().y()
+    );
+    assert!(
+        scene
+            .fragments()
+            .iter()
+            .position(|fragment| fragment == field_text_fragment)
+            .unwrap()
+            < scene
+                .fragments()
+                .iter()
+                .position(|fragment| {
+                    fragment.node_id() == field.id()
+                        && matches!(fragment.kind(), PaintFragmentKind::Rect { color } if *color == Color::BLACK)
+                        && fragment.rect() == expected_caret
+                })
+                .unwrap()
+    );
+    assert_eq!(label_text_fragment.rect(), label_layout.content_rect());
+    assert_ne!(scene.generation(), unfocused_generation);
+}
+
+#[test]
+fn ordinary_tall_text_uses_content_top_origin() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div()
+                    .key("root")
+                    .child(text("plain").key("label").h(px(48.0)).font_size(px(12.0))),
+            )
+        })
+        .unwrap();
+
+    let scene = runtime.scene_snapshot(window).unwrap();
+    let retained = runtime.retained_snapshot(window).unwrap();
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let label = retained.find_by_key("label").unwrap();
+    let label_layout = layout.find_by_key("label").unwrap();
+    let label_text = scene
+        .fragments()
+        .iter()
+        .find(|fragment| {
+            fragment.node_id() == label.id()
+                && matches!(fragment.kind(), PaintFragmentKind::Text { .. })
+        })
+        .unwrap();
+
+    assert!(
+        ((label_layout.content_rect().height()
+            - label_layout.text_layout().unwrap().metrics().height)
+            / 2.0)
+            .max(0.0)
+            > 0.0
+    );
+    assert_eq!(label_text.rect(), label_layout.content_rect());
+}
+
+#[test]
+fn focused_input_emits_static_caret_rect_after_text_fragment() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(div().key("root").child(input("hi").key("field")))
+        })
+        .unwrap();
+    let unfocused_generation = runtime.scene_snapshot(window).unwrap().generation();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+
+    let scene = runtime.scene_snapshot(window).unwrap();
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let field_layout = layout.find_by_key("field").unwrap();
+    let text_layout = field_layout.text_layout().unwrap();
+    let expected_caret =
+        text_viewport_placement(ElementKind::Input, field_layout.content_rect(), text_layout)
+            .visible_caret_rect();
+    let field_fragments = scene
+        .fragments()
+        .iter()
+        .filter(|fragment| {
+            fragment
+                .rect()
+                .intersect(field_layout.content_rect())
+                .is_some()
+        })
+        .collect::<Vec<_>>();
+    let text_index = field_fragments
+        .iter()
+        .position(|fragment| matches!(fragment.kind(), PaintFragmentKind::Text { .. }))
+        .expect("focused input should retain its text fragment");
+    let caret_index = field_fragments
+        .iter()
+        .position(|fragment| {
+            matches!(fragment.kind(), PaintFragmentKind::Rect { color } if *color == Color::BLACK)
+                && fragment.rect() == expected_caret
+        })
+        .expect("focused input should emit a static caret rect");
+
+    assert!(text_index < caret_index);
+    assert_ne!(scene.generation(), unfocused_generation);
+}
+
+#[test]
+fn focused_long_input_reveals_text_and_caret_with_shared_inline_scroll() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div().key("root").child(
+                    input("AAAA AAAA AAAA AAAA")
+                        .key("field")
+                        .w(px(36.0))
+                        .font_size(px(12.0)),
+                ),
+            )
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+
+    let scene = runtime.scene_snapshot(window).unwrap();
+    let retained = runtime.retained_snapshot(window).unwrap();
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let field = retained.find_by_key("field").unwrap();
+    let field_layout = layout.find_by_key("field").unwrap();
+    let content = field_layout.content_rect();
+    let text_layout = field_layout.text_layout().unwrap();
+    let placement = text_viewport_placement(ElementKind::Input, content, text_layout);
+    let text_fragment = scene
+        .fragments()
+        .iter()
+        .find(|fragment| {
+            fragment.node_id() == field.id()
+                && matches!(fragment.kind(), PaintFragmentKind::Text { .. })
+        })
+        .expect("focused input should retain its text fragment");
+    let caret_fragment = scene
+        .fragments()
+        .iter()
+        .find(|fragment| {
+            fragment.node_id() == field.id()
+                && matches!(fragment.kind(), PaintFragmentKind::Rect { color } if *color == Color::BLACK)
+                && fragment.rect() == placement.visible_caret_rect()
+        })
+        .expect("focused input should emit a visible caret rect");
+
+    assert_eq!(text_layout.metrics().line_count, 1);
+    assert!(text_layout.trailing_caret_rect().x() > content.width());
+    assert!(placement.input_inline_scroll() > 0.0);
+    assert_eq!(placement.viewport_rect(), content);
+    assert_eq!(text_fragment.rect(), placement.text_draw_rect());
+    assert_eq!(text_fragment.clip(), Some(content));
+    assert_eq!(caret_fragment.rect(), placement.visible_caret_rect());
+    assert_eq!(
+        content.x() - text_fragment.rect().x(),
+        placement.input_inline_scroll()
+    );
+    assert!(caret_fragment.rect().x() >= content.x());
+    assert!(
+        caret_fragment.rect().x() + caret_fragment.rect().width() <= content.x() + content.width()
+    );
 }
 
 #[test]

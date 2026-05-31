@@ -3,7 +3,9 @@ use std::time::Instant;
 
 use crate::element::ElementKind;
 use crate::interaction::InteractionState;
-use crate::layout::{LayoutNodeSnapshot, LayoutPoint, LayoutRect, LayoutTreeSnapshot};
+use crate::layout::{
+    LayoutNodeSnapshot, LayoutPoint, LayoutRect, LayoutTreeSnapshot, text_viewport_placement,
+};
 use crate::retained::{RetainedNodeSnapshot, RetainedTreeSnapshot};
 use crate::scene::{
     DamageRegion, HitTestEntry, HitTestPathNode, HitTestScene, PaintFragment, PaintFragmentKind,
@@ -65,12 +67,13 @@ pub(crate) fn scene_generation_for_inputs(
     style: &StyleTreeSnapshot,
     layout: &LayoutTreeSnapshot,
 ) -> SceneGeneration {
-    SceneGeneration::new(
+    SceneGeneration::new_with_scroll(
         retained.generation(),
         layout.generation(),
         style_signature(style),
         layout.viewport().generation().raw(),
         text_signature(retained),
+        scroll_signature(None),
     )
 }
 
@@ -211,33 +214,59 @@ impl SceneCompiler {
                 ));
             }
 
-            if retained.kind() == ElementKind::Text && retained.text().is_some() {
+            if text_capable_kind(retained.kind()) && retained.display_text().is_some() {
                 let Some(text_layout) = layout.text_layout().cloned() else {
                     self.emit_unsupported(retained, layout.content_rect(), "text.layout_missing");
                     return;
                 };
+                let placement =
+                    text_viewport_placement(retained.kind(), layout.content_rect(), &text_layout);
+                let text_rect = placement.text_draw_rect();
+                let clip = (retained.kind() == ElementKind::Input)
+                    .then(|| context.map_rect(placement.viewport_rect()));
                 let order = self.next_order();
-                self.fragments.push(
-                    PaintFragment::new(
-                        retained.id(),
-                        retained.generation(),
-                        order,
-                        context.map_rect(layout.content_rect()),
-                        PaintFragmentKind::Text {
-                            text_generation: self.text_generation.clone(),
-                            text_metrics_generation: self
-                                .generation
-                                .layout_generation()
-                                .map_or(0, |generation| generation.raw()),
-                            color: retained.resolved_style().text().text_color(),
-                        },
-                    )
-                    .with_text_layout(text_layout.clone()),
-                );
+                let mut fragment = PaintFragment::new(
+                    retained.id(),
+                    retained.generation(),
+                    order,
+                    context.map_rect(text_rect),
+                    PaintFragmentKind::Text {
+                        text_generation: self.text_generation.clone(),
+                        text_metrics_generation: self
+                            .generation
+                            .layout_generation()
+                            .map_or(0, |generation| generation.raw()),
+                        color: retained.resolved_style().text().text_color(),
+                    },
+                )
+                .with_text_layout(text_layout.clone());
+                if let Some(clip) = clip {
+                    fragment = fragment.with_clip(clip);
+                }
+                self.fragments.push(fragment);
                 self.demands.push(SceneResourceDemand::glyph(
                     retained.id().raw(),
                     self.text_generation.clone(),
                     TextGlyphDemand::new(text_layout),
+                ));
+            }
+
+            if retained.kind() == ElementKind::Input
+                && context.text_input_focused(retained)
+                && let Some(text_layout) = layout.text_layout()
+            {
+                let placement =
+                    text_viewport_placement(retained.kind(), layout.content_rect(), text_layout);
+                let caret = context.map_rect(placement.visible_caret_rect());
+                let order = self.next_order();
+                self.fragments.push(PaintFragment::new(
+                    retained.id(),
+                    retained.generation(),
+                    order,
+                    caret,
+                    PaintFragmentKind::Rect {
+                        color: retained.resolved_style().text().text_color(),
+                    },
                 ));
             }
         }
@@ -379,6 +408,15 @@ impl<'a> VisitContext<'a> {
         })
     }
 
+    fn text_input_focused(&self, retained: &RetainedNodeSnapshot) -> bool {
+        self.interaction.is_some_and(|state| {
+            state.text_input_focus().is_some_and(|target| {
+                target.node_id() == retained.id()
+                    && target.node_generation() == retained.generation()
+            })
+        })
+    }
+
     fn path_with(&self, retained: &RetainedNodeSnapshot) -> Vec<HitTestPathNode> {
         let mut path = self.path.clone();
         path.push(HitTestPathNode::new(retained.id(), retained.generation()));
@@ -400,6 +438,10 @@ fn viewport_rect(layout: &LayoutTreeSnapshot) -> LayoutRect {
     LayoutRect::new(0.0, 0.0, size.width(), size.height())
 }
 
+fn text_capable_kind(kind: ElementKind) -> bool {
+    matches!(kind, ElementKind::Text | ElementKind::Input)
+}
+
 fn style_signature(style: &StyleTreeSnapshot) -> SceneInputSignature {
     let mut facts = Vec::new();
     facts.push(SceneSignatureFact::MaxLines(Some(style.node_count())));
@@ -418,17 +460,21 @@ fn text_signature(retained: &RetainedTreeSnapshot) -> SceneInputSignature {
 }
 
 fn scroll_signature(interaction: Option<&InteractionState>) -> SceneInputSignature {
-    let Some(interaction) = interaction else {
-        return SceneInputSignature::default();
-    };
-    let facts = interaction
-        .scroll_offsets()
-        .map(|(target, offset)| SceneSignatureFact::ScrollOffset {
-            target: scroll_target_signature(target),
-            x: offset.x().to_bits(),
-            y: offset.y().to_bits(),
-        })
-        .collect();
+    let mut facts = Vec::new();
+    if let Some(interaction) = interaction {
+        facts.extend(interaction.scroll_offsets().map(|(target, offset)| {
+            SceneSignatureFact::ScrollOffset {
+                target: scroll_target_signature(target),
+                x: offset.x().to_bits(),
+                y: offset.y().to_bits(),
+            }
+        }));
+    }
+    let text_input_focus = interaction.and_then(InteractionState::text_input_focus);
+    facts.push(SceneSignatureFact::TextInputFocus {
+        target_id: text_input_focus.map(|target| target.node_id().raw()),
+        target_generation: text_input_focus.map(|target| target.node_generation().raw()),
+    });
     SceneInputSignature::new(facts)
 }
 
@@ -445,10 +491,8 @@ fn collect_text_node(node: &RetainedNodeSnapshot, facts: &mut Vec<SceneSignature
         node_id: node.id().raw(),
         node_generation: node.generation().raw(),
     });
-    if node.kind() == ElementKind::Text {
-        facts.push(SceneSignatureFact::TextPayload(
-            node.text().map(ToOwned::to_owned),
-        ));
+    if text_capable_kind(node.kind()) {
+        facts.push(SceneSignatureFact::TextPayload(node.display_text()));
     }
     for child in node.children() {
         collect_text_node(child, facts);

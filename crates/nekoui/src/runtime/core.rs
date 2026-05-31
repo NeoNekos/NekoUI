@@ -11,16 +11,20 @@ use crate::diagnostic::{
     PerformanceReport, RenderFrameGraphReport, RenderPerformanceReport, RetainedPerformanceReport,
     ScenePerformanceReport, StylePerformanceReport, TextPerformanceReport,
 };
-use crate::element::{Element, IntoElement};
+use crate::element::{Element, ElementKind, IntoElement};
 use crate::error::{ErrorKind, NekoError, NekoResult};
 use crate::interaction::{
-    ClickEvent, InteractionTarget, KeyEvent, KeyInput, KeyInputKind, Modifiers, PointerEvent,
-    PointerInput, PointerInputKind, ScrollDelta, WheelInput, WindowFocusInput,
+    ClickEvent, ImeInput, InteractionTarget, Key, KeyEvent, KeyInput, KeyInputKind, Modifiers,
+    PointerEvent, PointerInput, PointerInputKind, ScrollDelta, TextInput, TextInputPurpose,
+    TextRange, WheelInput, WindowFocusInput,
 };
-use crate::layout::{LayoutNodeSnapshot, LayoutPassStats, LayoutPoint, LayoutSize, compute_layout};
+use crate::layout::{
+    LayoutNodeSnapshot, LayoutPassStats, LayoutPoint, LayoutSize, compute_layout,
+    text_viewport_placement,
+};
 #[cfg(target_os = "windows")]
 use crate::platform::NativeRenderer;
-use crate::platform::{PlatformFact, Renderability};
+use crate::platform::{ImePlatformRequest, PlatformFact, Renderability};
 use crate::render::{FrameGraphStats, PreparedFrameContext, prepare_frame_graph_for_surface};
 use crate::retained::{DirtyCause, RetainedNodeSnapshot, RetainedTreeDiff, RetainedTreeSnapshot};
 use crate::runtime::command::{CommandId, RuntimeCommand, SequencedCommand, WindowCommand};
@@ -36,6 +40,7 @@ use crate::semantics::{
     SemanticBuildInput, SemanticBuildStats, build_semantic_snapshot,
     semantic_publish_is_current_with_interaction,
 };
+use crate::text::{TextEditOutcome, TextRangeError};
 use crate::window::{AnyWindowHandle, WindowHandle, WindowOptions};
 
 #[derive(Default)]
@@ -414,6 +419,16 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(crate) fn ime_requests(
+        &self,
+        handle: impl Into<AnyWindowHandle>,
+    ) -> NekoResult<Vec<ImePlatformRequest>> {
+        let handle = handle.into();
+        self.state.validate_window(handle)?;
+        Ok(self.state.peek_ime_requests(handle.id()).to_vec())
+    }
+
+    #[cfg(test)]
     pub(crate) fn wheel_input(
         &mut self,
         handle: impl Into<AnyWindowHandle>,
@@ -702,6 +717,14 @@ impl Runtime {
             .collect()
     }
 
+    pub(crate) fn take_platform_ime_requests(
+        &mut self,
+        handle: AnyWindowHandle,
+    ) -> NekoResult<Vec<ImePlatformRequest>> {
+        self.state.validate_window(handle)?;
+        Ok(self.state.take_ime_requests(handle.id()))
+    }
+
     pub(crate) fn take_platform_close_requests(&self) -> Vec<AnyWindowHandle> {
         self.state.closing_windows_for_platform()
     }
@@ -892,6 +915,8 @@ impl Runtime {
                 self.process_pointer_input(handle, input)
             }
             PlatformFact::KeyInput { handle, input } => self.process_key_input(handle, input),
+            PlatformFact::TextInput { handle, input } => self.process_text_input(handle, input),
+            PlatformFact::ImeInput { handle, input } => self.process_ime_input(handle, input),
             PlatformFact::ModifiersChanged { handle, modifiers } => {
                 self.process_modifiers_changed(handle, modifiers)
             }
@@ -1119,6 +1144,8 @@ impl Runtime {
                 validate_pointer_input_position(*input)
             }
             PlatformFact::KeyInput { handle, .. }
+            | PlatformFact::TextInput { handle, .. }
+            | PlatformFact::ImeInput { handle, .. }
             | PlatformFact::ModifiersChanged { handle, .. }
             | PlatformFact::WindowFocusChanged { handle, .. } => self.validate_window(*handle),
             PlatformFact::WheelInput { handle, input } => {
@@ -1182,7 +1209,7 @@ impl Runtime {
         };
         let Some(handler) = handler else {
             self.record_key_dispatch(handle, &input, Some(target), "no_handler", None);
-            return Ok(());
+            return self.apply_key_default_edit(handle, target, &input);
         };
 
         let event = KeyEvent::new(input.clone());
@@ -1203,7 +1230,445 @@ impl Runtime {
             error_kind,
         );
         result?;
+        self.apply_key_default_edit(handle, target, &input)
+    }
+
+    fn apply_key_default_edit(
+        &mut self,
+        handle: AnyWindowHandle,
+        keyboard_target: InteractionTarget,
+        input: &KeyInput,
+    ) -> NekoResult<()> {
+        if !is_backspace_down(input) {
+            return Ok(());
+        }
+        let Some(text_target) = self
+            .state
+            .interaction(handle.id())
+            .and_then(|state| state.text_input_focus())
+        else {
+            return Ok(());
+        };
+        if text_target != keyboard_target {
+            return Ok(());
+        }
+        self.apply_delete_backward(handle, text_target)
+    }
+
+    fn process_text_input(&mut self, handle: AnyWindowHandle, input: TextInput) -> NekoResult<()> {
+        self.state.validate_window(handle)?;
+        self.cleanup_stale_interaction_targets(handle)?;
+        self.record_text_input_fact(handle, "text_input", input.text().len(), input.replace());
+        let Some(target) = self
+            .state
+            .interaction(handle.id())
+            .and_then(|state| state.text_input_focus())
+        else {
+            self.record_text_edit(
+                handle,
+                None,
+                "text_input",
+                "no_focus",
+                input.text().len(),
+                None,
+            );
+            return Ok(());
+        };
+        self.apply_text_input(handle, target, &input, "text_input")
+    }
+
+    fn process_ime_input(&mut self, handle: AnyWindowHandle, input: ImeInput) -> NekoResult<()> {
+        self.state.validate_window(handle)?;
+        self.diagnostics.increment_signal(SignalId::ImeTransition);
+        self.cleanup_stale_interaction_targets(handle)?;
+        match input {
+            ImeInput::Enabled => {
+                self.record_ime_transition(handle, "enabled", None, "accepted");
+                Ok(())
+            }
+            ImeInput::Preedit(preedit) => {
+                self.diagnostics.increment_signal(SignalId::ImePreedit);
+                self.record_text_input_fact(
+                    handle,
+                    "preedit",
+                    preedit.text().len(),
+                    preedit.replace(),
+                );
+                let Some(target) = self
+                    .state
+                    .interaction(handle.id())
+                    .and_then(|state| state.text_input_focus())
+                else {
+                    self.record_text_edit(
+                        handle,
+                        None,
+                        "preedit",
+                        "no_focus",
+                        preedit.text().len(),
+                        None,
+                    );
+                    return Ok(());
+                };
+                self.apply_ime_preedit(handle, target, &preedit)
+            }
+            ImeInput::Commit(input) => {
+                self.diagnostics.increment_signal(SignalId::ImeCommit);
+                self.record_text_input_fact(
+                    handle,
+                    "ime_commit",
+                    input.text().len(),
+                    input.replace(),
+                );
+                let Some(target) = self
+                    .state
+                    .interaction(handle.id())
+                    .and_then(|state| state.text_input_focus())
+                else {
+                    self.record_text_edit(
+                        handle,
+                        None,
+                        "ime_commit",
+                        "no_focus",
+                        input.text().len(),
+                        None,
+                    );
+                    return Ok(());
+                };
+                self.apply_text_commit(handle, target, &input)
+            }
+            ImeInput::Disabled => {
+                let target = self
+                    .state
+                    .interaction(handle.id())
+                    .and_then(|state| state.text_input_focus());
+                self.record_ime_transition(handle, "disabled", target, "accepted");
+                if let Some(target) = target
+                    && matches!(
+                        self.state
+                            .retained_tree_mut(handle.id())
+                            .and_then(|tree| tree.clear_composition_at_target(target)),
+                        Some(TextEditOutcome::Mutated)
+                    )
+                {
+                    self.mark_text_target_changed(handle, target);
+                    self.refresh_text_input_cursor_area(handle);
+                }
+                if target.is_some() {
+                    self.state.push_ime_request(
+                        handle.id(),
+                        ImePlatformRequest::Allowed { allowed: true },
+                    );
+                    self.refresh_text_input_cursor_area(handle);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn record_text_input_fact(
+        &mut self,
+        handle: AnyWindowHandle,
+        kind: &'static str,
+        text_len: usize,
+        replace: Option<TextRange>,
+    ) {
+        self.diagnostics.increment_signal(SignalId::TextInputFact);
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "text.input_fact",
+                "text input fact processed through runtime",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("kind", kind)
+            .with_field("text_len", text_len.to_string())
+            .with_field("replace", format_text_range(replace)),
+        );
+    }
+
+    fn record_text_edit(
+        &mut self,
+        handle: AnyWindowHandle,
+        target: Option<InteractionTarget>,
+        kind: &'static str,
+        result: &'static str,
+        text_len: usize,
+        error_kind: Option<ErrorKind>,
+    ) {
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Text,
+                DiagnosticSeverity::Info,
+                error_kind.unwrap_or(ErrorKind::Diagnostic),
+                "text.edit",
+                "editable text state update routed through runtime",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("kind", kind)
+            .with_field("result", result)
+            .with_field("text_len", text_len.to_string())
+            .with_field("target_id", format_target_id(target))
+            .with_field("target_generation", format_target_generation(target))
+            .with_field(
+                "error_kind",
+                error_kind.map_or_else(|| "none".to_owned(), |kind| format!("{kind:?}")),
+            ),
+        );
+    }
+
+    fn record_ime_transition(
+        &mut self,
+        handle: AnyWindowHandle,
+        transition: &'static str,
+        target: Option<InteractionTarget>,
+        result: &'static str,
+    ) {
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "ime.transition",
+                "IME lifecycle transition routed through runtime",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("transition", transition)
+            .with_field("result", result)
+            .with_field("target_id", format_target_id(target))
+            .with_field("target_generation", format_target_generation(target)),
+        );
+    }
+
+    fn apply_text_commit(
+        &mut self,
+        handle: AnyWindowHandle,
+        target: InteractionTarget,
+        input: &TextInput,
+    ) -> NekoResult<()> {
+        self.apply_text_input(handle, target, input, "commit")
+    }
+
+    fn apply_text_input(
+        &mut self,
+        handle: AnyWindowHandle,
+        target: InteractionTarget,
+        input: &TextInput,
+        kind: &'static str,
+    ) -> NekoResult<()> {
+        let result = self
+            .state
+            .retained_tree_mut(handle.id())
+            .ok_or_else(|| NekoError::diagnostic("retained tree is missing for live window"))?
+            .insert_text_at_target(target, input.text(), input.replace());
+        self.finish_text_edit(handle, target, kind, input.text().len(), result)
+    }
+
+    fn apply_delete_backward(
+        &mut self,
+        handle: AnyWindowHandle,
+        target: InteractionTarget,
+    ) -> NekoResult<()> {
+        let result = self
+            .state
+            .retained_tree_mut(handle.id())
+            .ok_or_else(|| NekoError::diagnostic("retained tree is missing for live window"))?
+            .delete_backward_at_target(target);
+        self.finish_text_edit(handle, target, "delete_backward", 0, result)
+    }
+
+    fn apply_ime_preedit(
+        &mut self,
+        handle: AnyWindowHandle,
+        target: InteractionTarget,
+        input: &crate::interaction::ImePreeditInput,
+    ) -> NekoResult<()> {
+        let result = self
+            .state
+            .retained_tree_mut(handle.id())
+            .ok_or_else(|| NekoError::diagnostic("retained tree is missing for live window"))?
+            .set_composition_at_target(target, input.text(), input.cursor(), input.replace());
+        self.finish_text_edit(handle, target, "preedit", input.text().len(), result)
+    }
+
+    fn finish_text_edit(
+        &mut self,
+        handle: AnyWindowHandle,
+        target: InteractionTarget,
+        kind: &'static str,
+        text_len: usize,
+        result: Result<Option<TextEditOutcome>, TextRangeError>,
+    ) -> NekoResult<()> {
+        match result {
+            Ok(Some(TextEditOutcome::Mutated)) => {
+                self.mark_text_target_changed(handle, target);
+                self.refresh_text_input_cursor_area(handle);
+                self.record_text_edit(handle, Some(target), kind, "mutated", text_len, None);
+            }
+            Ok(Some(TextEditOutcome::Unchanged)) => {
+                self.record_text_edit(handle, Some(target), kind, "unchanged", text_len, None);
+            }
+            Ok(None) => {
+                self.record_text_edit(handle, Some(target), kind, "stale", text_len, None);
+                self.record_stale_input_target(handle, target, "text_edit_target");
+            }
+            Err(error) => {
+                self.record_text_edit(
+                    handle,
+                    Some(target),
+                    kind,
+                    text_range_error_name(error),
+                    text_len,
+                    Some(ErrorKind::InvalidInput),
+                );
+            }
+        }
         Ok(())
+    }
+
+    fn clear_text_input_focus(
+        &mut self,
+        handle: AnyWindowHandle,
+        reason: &'static str,
+    ) -> NekoResult<()> {
+        let previous = self
+            .state
+            .interaction(handle.id())
+            .and_then(|state| state.text_input_focus());
+        let Some(previous_target) = previous else {
+            return Ok(());
+        };
+        if matches!(
+            self.state
+                .retained_tree_mut(handle.id())
+                .and_then(|tree| tree.clear_composition_at_target(previous_target)),
+            Some(TextEditOutcome::Mutated)
+        ) {
+            self.mark_text_target_changed(handle, previous_target);
+        }
+        self.state
+            .interaction_mut(handle.id())
+            .set_text_input_focus(None);
+        self.state
+            .push_ime_request(handle.id(), ImePlatformRequest::Allowed { allowed: false });
+        self.record_focus_transition(handle, "text_input", previous, None, reason);
+        self.mark_text_input_focus_changed(handle);
+        Ok(())
+    }
+
+    fn focus_text_input_target(
+        &mut self,
+        handle: AnyWindowHandle,
+        target: InteractionTarget,
+        reason: &'static str,
+    ) -> NekoResult<()> {
+        let previous = self
+            .state
+            .interaction(handle.id())
+            .and_then(|state| state.text_input_focus());
+        if previous == Some(target) {
+            self.refresh_text_input_cursor_area(handle);
+            return Ok(());
+        }
+        if let Some(previous_target) = previous
+            && matches!(
+                self.state
+                    .retained_tree_mut(handle.id())
+                    .and_then(|tree| tree.clear_composition_at_target(previous_target)),
+                Some(TextEditOutcome::Mutated)
+            )
+        {
+            self.mark_text_target_changed(handle, previous_target);
+        }
+        self.state
+            .interaction_mut(handle.id())
+            .set_text_input_focus(Some(target));
+        self.state
+            .push_ime_request(handle.id(), ImePlatformRequest::Allowed { allowed: true });
+        self.state.push_ime_request(
+            handle.id(),
+            ImePlatformRequest::Purpose {
+                purpose: TextInputPurpose::Normal,
+            },
+        );
+        self.refresh_text_input_cursor_area(handle);
+        self.record_focus_transition(handle, "text_input", previous, Some(target), reason);
+        self.mark_text_input_focus_changed(handle);
+        Ok(())
+    }
+
+    fn refresh_text_input_cursor_area(&mut self, handle: AnyWindowHandle) {
+        let Some(target) = self
+            .state
+            .interaction(handle.id())
+            .and_then(|state| state.text_input_focus())
+        else {
+            return;
+        };
+        if let Some(rect) = self.text_input_cursor_area(handle, target) {
+            self.state.replace_ime_candidate_rect(handle.id(), rect);
+        }
+    }
+
+    fn text_input_cursor_area(
+        &self,
+        handle: AnyWindowHandle,
+        target: InteractionTarget,
+    ) -> Option<crate::layout::LayoutRect> {
+        let retained = self.state.retained_snapshot(handle.id())?;
+        let retained_node = find_node_by_target(&retained, target)?;
+        if retained_node.kind() != ElementKind::Input {
+            return None;
+        }
+        let layout = self.state.layout_snapshot(handle.id())?;
+        let (layout_node, scroll_offset) = layout.root().and_then(|layout_root| {
+            retained.root().and_then(|retained_root| {
+                find_layout_node_by_target_with_scroll(
+                    retained_root,
+                    layout_root,
+                    target,
+                    LayoutPoint::ZERO,
+                    self.state.interaction(handle.id()),
+                )
+            })
+        })?;
+        let content = layout_node.content_rect();
+        let text_layout = layout_node.text_layout()?;
+        Some(
+            text_viewport_placement(retained_node.kind(), content, text_layout)
+                .visible_caret_rect()
+                .translate(-scroll_offset.x(), -scroll_offset.y()),
+        )
+    }
+
+    fn mark_text_target_changed(&mut self, handle: AnyWindowHandle, target: InteractionTarget) {
+        let mut lanes = DirtyLanes::empty();
+        lanes.insert(DirtyLane::Text.flag());
+        lanes.insert(DirtyLane::Layout.flag());
+        lanes.insert(DirtyLane::Semantics.flag());
+        lanes.insert(DirtyLane::Paint.flag());
+        self.state
+            .scheduler_mut()
+            .mark_dirty(handle.id(), DirtyLane::Text);
+        self.state
+            .scheduler_mut()
+            .mark_dirty(handle.id(), DirtyLane::Layout);
+        self.state
+            .scheduler_mut()
+            .mark_dirty(handle.id(), DirtyLane::Semantics);
+        self.state
+            .scheduler_mut()
+            .mark_dirty(handle.id(), DirtyLane::Paint);
+        self.state.emit_retained_dirty(
+            Some(crate::retained::RetainedIdentity::new(
+                target.node_id(),
+                target.node_generation(),
+            )),
+            DirtyCause::TextChanged,
+            lanes,
+        );
+        self.request_redraw(handle.id());
     }
 
     fn process_modifiers_changed(
@@ -1278,6 +1743,7 @@ impl Runtime {
             self.state
                 .interaction_mut(handle.id())
                 .set_scroll_offset(target, new_offset);
+            self.refresh_text_input_cursor_area(handle);
             self.state
                 .scheduler_mut()
                 .mark_dirty(handle.id(), DirtyLane::Paint);
@@ -1313,6 +1779,7 @@ impl Runtime {
             }
         }
         if any_changed {
+            self.refresh_text_input_cursor_area(handle);
             self.state
                 .scheduler_mut()
                 .mark_dirty(handle.id(), DirtyLane::Paint);
@@ -1342,6 +1809,9 @@ impl Runtime {
         if previous != input.focused() {
             self.record_window_focus_transition(handle, previous, input.focused());
             self.mark_semantic_interaction_changed(handle);
+        }
+        if !input.focused() {
+            self.clear_text_input_focus(handle, "window_unfocused")?;
         }
         Ok(())
     }
@@ -1590,33 +2060,40 @@ impl Runtime {
         target: Option<InteractionTarget>,
     ) -> NekoResult<()> {
         let Some(target) = target else {
+            self.clear_text_input_focus(handle, "pointer_down_miss")?;
             return Ok(());
         };
         let Some(node) = self.current_target_node(handle, target)? else {
             self.record_stale_input_target(handle, target, "keyboard_focus_default");
+            self.clear_text_input_focus(handle, "pointer_down_stale")?;
             return Ok(());
         };
         if !node.focusable() {
+            self.clear_text_input_focus(handle, "pointer_down_non_focusable")?;
             return Ok(());
         }
         let previous = self
             .state
             .interaction(handle.id())
             .and_then(|state| state.keyboard_focus());
-        if previous == Some(target) {
-            return Ok(());
+        if previous != Some(target) {
+            self.state
+                .interaction_mut(handle.id())
+                .set_keyboard_focus(Some(target));
+            self.record_focus_transition(
+                handle,
+                "keyboard",
+                previous,
+                Some(target),
+                "pointer_down_default",
+            );
+            self.mark_semantic_interaction_changed(handle);
         }
-        self.state
-            .interaction_mut(handle.id())
-            .set_keyboard_focus(Some(target));
-        self.record_focus_transition(
-            handle,
-            "keyboard",
-            previous,
-            Some(target),
-            "pointer_down_default",
-        );
-        self.mark_semantic_interaction_changed(handle);
+        if node.kind() == ElementKind::Input {
+            self.focus_text_input_target(handle, target, "pointer_down_default")?;
+        } else {
+            self.clear_text_input_focus(handle, "pointer_down_non_text_input")?;
+        }
         Ok(())
     }
 
@@ -1634,6 +2111,10 @@ impl Runtime {
             .state
             .interaction(handle.id())
             .and_then(|state| state.keyboard_focus());
+        let text_input_focus = self
+            .state
+            .interaction(handle.id())
+            .and_then(|state| state.text_input_focus());
         if let Some(target) = hover
             && find_node_by_target(&retained, target).is_none()
         {
@@ -1655,6 +2136,12 @@ impl Runtime {
             self.record_stale_input_target(handle, target, "keyboard_focus_cleanup");
             self.record_focus_transition(handle, "keyboard", Some(target), None, "stale_cleanup");
             self.mark_semantic_interaction_changed(handle);
+        }
+        if let Some(target) = text_input_focus
+            && find_text_input_node_by_target(&retained, target).is_none()
+        {
+            self.record_stale_input_target(handle, target, "text_input_focus_cleanup");
+            self.clear_text_input_focus(handle, "stale_cleanup")?;
         }
         let stale_scroll_targets = self
             .state
@@ -1733,6 +2220,7 @@ impl Runtime {
                 self.record_layout_pass(handle, viewport, &stats, "completed");
                 self.state.set_last_layout_pass(stats);
                 self.state.set_layout_snapshot(handle.id(), output.snapshot);
+                self.refresh_text_input_cursor_area(handle);
                 self.apply_scroll_offset_clamps(handle)?;
                 Ok(())
             }
@@ -2619,6 +3107,14 @@ impl Runtime {
             .mark_dirty(handle.id(), DirtyLane::Semantics);
     }
 
+    fn mark_text_input_focus_changed(&mut self, handle: AnyWindowHandle) {
+        self.mark_semantic_interaction_changed(handle);
+        self.state
+            .scheduler_mut()
+            .mark_dirty(handle.id(), DirtyLane::Paint);
+        self.request_redraw(handle.id());
+    }
+
     fn record_retained_diff(&mut self, diff: &RetainedTreeDiff) {
         self.diagnostics.increment_signal(SignalId::RetainedDiff);
         self.diagnostics.add_signal(
@@ -2697,6 +3193,11 @@ fn key_event_kind_name(kind: KeyInputKind) -> &'static str {
     }
 }
 
+fn is_backspace_down(input: &KeyInput) -> bool {
+    input.kind() == KeyInputKind::Down
+        && matches!(input.logical_key(), Key::Named(name) if name == "Backspace")
+}
+
 fn focus_bool_name(focused: bool) -> &'static str {
     if focused { "focused" } else { "unfocused" }
 }
@@ -2733,6 +3234,21 @@ fn format_target_generation(target: Option<InteractionTarget>) -> String {
         || "none".to_owned(),
         |target| target.node_generation().raw().to_string(),
     )
+}
+
+fn format_text_range(range: Option<TextRange>) -> String {
+    range.map_or_else(
+        || "none".to_owned(),
+        |range| format!("{}..{}", range.start(), range.end()),
+    )
+}
+
+fn text_range_error_name(error: TextRangeError) -> &'static str {
+    match error {
+        TextRangeError::Reversed => "invalid_reversed_range",
+        TextRangeError::OutOfBounds => "invalid_out_of_bounds_range",
+        TextRangeError::NotBoundary => "invalid_char_boundary_range",
+    }
 }
 
 fn wheel_delta_pixels(input: WheelInput) -> LayoutPoint {
@@ -2794,6 +3310,13 @@ fn find_scrollable_node_by_target(
         .filter(|node| node.resolved_style().layout().overflow() == crate::style::Overflow::Scroll)
 }
 
+fn find_text_input_node_by_target(
+    retained: &RetainedTreeSnapshot,
+    target: InteractionTarget,
+) -> Option<&RetainedNodeSnapshot> {
+    find_node_by_target(retained, target).filter(|node| node.kind() == ElementKind::Input)
+}
+
 fn find_layout_node_by_target(
     node: &LayoutNodeSnapshot,
     target: InteractionTarget,
@@ -2804,6 +3327,45 @@ fn find_layout_node_by_target(
     node.children()
         .iter()
         .find_map(|child| find_layout_node_by_target(child, target))
+}
+
+fn find_layout_node_by_target_with_scroll<'a>(
+    retained: &RetainedNodeSnapshot,
+    layout: &'a LayoutNodeSnapshot,
+    target: InteractionTarget,
+    scroll_offset: LayoutPoint,
+    interaction: Option<&crate::interaction::InteractionState>,
+) -> Option<(&'a LayoutNodeSnapshot, LayoutPoint)> {
+    if retained.id() != layout.node_id() {
+        return None;
+    }
+    if layout.node_id() == target.node_id() {
+        return Some((layout, scroll_offset));
+    }
+    let node_target =
+        crate::interaction::InteractionTarget::new(retained.id(), retained.generation());
+    let child_scroll_offset = if layout.scroll().overflow() == crate::style::Overflow::Scroll {
+        let current =
+            interaction.map_or(LayoutPoint::ZERO, |state| state.scroll_offset(node_target));
+        scroll_offset.translate(current.x(), current.y())
+    } else {
+        scroll_offset
+    };
+    retained.children().iter().find_map(|retained_child| {
+        layout
+            .children()
+            .iter()
+            .find(|layout_child| layout_child.node_id() == retained_child.id())
+            .and_then(|layout_child| {
+                find_layout_node_by_target_with_scroll(
+                    retained_child,
+                    layout_child,
+                    target,
+                    child_scroll_offset,
+                    interaction,
+                )
+            })
+    })
 }
 
 fn find_node_by_target_from(

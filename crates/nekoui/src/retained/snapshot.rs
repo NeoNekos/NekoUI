@@ -4,6 +4,7 @@ use crate::element::{ElementKey, ElementKind};
 use crate::interaction::InteractionHandlers;
 use crate::retained::{NodeGeneration, RetainedNodeId, RetainedTreeGeneration};
 use crate::style::{OutputParticipation, ResolvedStyle, StyleDeclaration};
+use crate::text::{EditableTextState, TextBlock};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RetainedNodeSnapshot {
@@ -17,6 +18,7 @@ pub struct RetainedNodeSnapshot {
     pub(crate) resolved_style: ResolvedStyle,
     pub(crate) participation: OutputParticipation,
     pub(crate) text: Option<Cow<'static, str>>,
+    pub(crate) editable: Option<EditableTextState>,
     pub(crate) children: Vec<RetainedNodeSnapshot>,
 }
 
@@ -59,6 +61,21 @@ impl RetainedNodeSnapshot {
 
     pub fn text(&self) -> Option<&str> {
         self.text.as_deref()
+    }
+
+    pub(crate) fn editable(&self) -> Option<&EditableTextState> {
+        self.editable.as_ref()
+    }
+
+    pub(crate) fn text_block(&self) -> Option<&TextBlock> {
+        self.editable.as_ref().map(EditableTextState::block)
+    }
+
+    pub(crate) fn display_text(&self) -> Option<String> {
+        self.editable
+            .as_ref()
+            .map(|editable| editable.block().display_text())
+            .or_else(|| self.text().map(ToOwned::to_owned))
     }
 
     pub fn children(&self) -> &[RetainedNodeSnapshot] {

@@ -111,6 +111,7 @@ fn rect_and_glyph_text_draw_items_are_supported_while_advanced_items_remain_unsu
                 text_generation: crate::scene::SceneInputSignature::default(),
                 text_metrics_generation: 1,
                 layout: test_text_layout_with_glyph(),
+                clip: None,
                 color: Color::rgb(1, 2, 3),
             },
         ),
@@ -137,6 +138,7 @@ fn empty_text_draw_items_remain_unsupported_until_glyphs_exist() {
             text_generation: crate::scene::SceneInputSignature::default(),
             text_metrics_generation: 1,
             layout: test_empty_text_layout(),
+            clip: None,
             color: Color::rgb(1, 2, 3),
         },
     )]);
@@ -404,6 +406,7 @@ fn test_text_layout(
         style_generation: crate::text::TextGeneration::INITIAL,
         text_hash: 1,
         available_inline_width_bits: None,
+        layout_mode: crate::text::TextLayoutMode::SoftWrap,
         font_size_bits: 12.0_f32.to_bits(),
         max_lines: None,
         text_overflow: crate::style::TextOverflow::Clip,
@@ -422,6 +425,7 @@ fn test_text_layout(
             baseline: 0.0,
             line_count: 1,
         },
+        crate::layout::LayoutRect::new(0.0, 0.0, 1.0, 1.0),
         glyphs,
         demands,
     ))

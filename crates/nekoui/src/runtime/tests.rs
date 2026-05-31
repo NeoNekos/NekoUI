@@ -3,15 +3,16 @@ use std::rc::Rc;
 
 use crate::app::{Application, Context, Entity, Render};
 use crate::diagnostic::{DirtyLane, DirtyLanes};
-use crate::element::{Element, IntoElement, div, text};
+use crate::element::{Element, ElementKind, IntoElement, div, input, text};
 use crate::error::{ErrorKind, NekoError};
 use crate::interaction::{
-    Key, KeyEvent, KeyInput, Modifiers, PhysicalKey, PointerInput, ScrollDelta, ScrollPhase,
-    WheelInput, WindowFocusInput,
+    ImeInput, ImePreeditInput, Key, KeyEvent, KeyInput, Modifiers, PhysicalKey, PointerInput,
+    ScrollDelta, ScrollPhase, TextInput, TextRange, WheelInput, WindowFocusInput,
 };
 use crate::layout::LayoutPoint;
 use crate::layout::LayoutSize;
-use crate::platform::PlatformFact;
+use crate::layout::text_viewport_placement;
+use crate::platform::{ImePlatformRequest, PlatformFact};
 use crate::runtime::Runtime;
 use crate::runtime::command::RuntimeCommand;
 use crate::style::{Display, Overflow, StyleExt, px};
@@ -285,6 +286,12 @@ enum FocusMutationMode {
     Destroyed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextInputMutationMode {
+    Visible,
+    DisplayNone,
+}
+
 #[derive(Debug)]
 struct MutatingFocusableRoot {
     mode: Entity<FocusMutationMode>,
@@ -315,6 +322,23 @@ impl Render for MutatingFocusableRoot {
                     }),
             ),
             FocusMutationMode::Destroyed => div().key("root"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MutatingInputRoot {
+    mode: Rc<Cell<TextInputMutationMode>>,
+}
+
+impl Render for MutatingInputRoot {
+    fn render(&mut self, _cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let field = input("hi").key("field").h(px(20.0));
+        match self.mode.get() {
+            TextInputMutationMode::Visible => div().key("root").child(field),
+            TextInputMutationMode::DisplayNone => {
+                div().key("root").child(field.display(Display::None))
+            }
         }
     }
 }
@@ -1921,6 +1945,713 @@ fn keydown_is_not_text_input_and_synthetic_key_does_not_invoke_behavior() {
                 .fields
                 .get("result")
                 .is_some_and(|value| value == "synthetic_ignored")
+    }));
+}
+
+#[test]
+fn text_input_platform_fact_inserts_into_focused_input_without_logical_key_text() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(div().key("root").child(input("").key("field")))
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    runtime
+        .ingest_platform_fact(PlatformFact::KeyInput {
+            handle: window.into(),
+            input: KeyInput::down(Key::character("x")),
+        })
+        .unwrap();
+    assert_eq!(
+        runtime
+            .retained_snapshot(window)
+            .unwrap()
+            .find_by_key("field")
+            .unwrap()
+            .display_text(),
+        Some(String::new()),
+    );
+
+    runtime
+        .ingest_platform_fact(PlatformFact::TextInput {
+            handle: window.into(),
+            input: TextInput::commit("é"),
+        })
+        .unwrap();
+
+    let field = runtime
+        .retained_snapshot(window)
+        .unwrap()
+        .find_by_key("field")
+        .unwrap()
+        .clone();
+    assert_eq!(field.display_text(), Some("é".to_owned()));
+    assert_eq!(
+        field.text_block().unwrap().selection(),
+        TextRange::collapsed("é".len())
+    );
+    let diagnostics = runtime.diagnostics().snapshot();
+    assert_eq!(diagnostics.counter("text.input_fact"), 1);
+    assert!(diagnostics.records().iter().any(|record| {
+        record.operation == "text.input_fact"
+            && record
+                .fields
+                .get("kind")
+                .is_some_and(|value| value == "text_input")
+    }));
+}
+
+#[test]
+fn backspace_deletes_previous_utf8_char_in_focused_input() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(div().key("root").child(input("aé").key("field")))
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    runtime
+        .ingest_platform_fact(PlatformFact::KeyInput {
+            handle: window.into(),
+            input: KeyInput::down(Key::named("Backspace")),
+        })
+        .unwrap();
+
+    let field = runtime
+        .retained_snapshot(window)
+        .unwrap()
+        .find_by_key("field")
+        .unwrap()
+        .clone();
+    assert_eq!(field.display_text(), Some("a".to_owned()));
+    assert_eq!(
+        field.text_block().unwrap().selection(),
+        TextRange::collapsed(1)
+    );
+    assert!(
+        runtime
+            .diagnostics()
+            .snapshot()
+            .records()
+            .iter()
+            .any(|record| {
+                record.operation == "text.edit"
+                    && record
+                        .fields
+                        .get("kind")
+                        .is_some_and(|value| value == "delete_backward")
+                    && record
+                        .fields
+                        .get("result")
+                        .is_some_and(|value| value == "mutated")
+            })
+    );
+}
+
+#[test]
+fn ime_preedit_and_commit_update_text_input_and_candidate_rect_from_text_layout() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(div().key("root").child(input("hi").key("field")))
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+
+    let requests = runtime.ime_requests(window).unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| matches!(request, ImePlatformRequest::Allowed { allowed: true }))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| matches!(request, ImePlatformRequest::Purpose { .. }))
+    );
+    let cursor_area = requests
+        .iter()
+        .find_map(|request| match request {
+            ImePlatformRequest::CursorArea { rect } => Some(*rect),
+            _ => None,
+        })
+        .expect("text input focus should publish an IME cursor area");
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let field_layout = layout.find_by_key("field").unwrap();
+    let text_layout = field_layout.text_layout().unwrap();
+    let expected_cursor_area =
+        text_viewport_placement(ElementKind::Input, field_layout.content_rect(), text_layout)
+            .visible_caret_rect();
+    assert_eq!(cursor_area, expected_cursor_area);
+    assert_eq!(cursor_area.width(), 1.0);
+    assert!(cursor_area.x() > field_layout.content_rect().x());
+
+    runtime
+        .ingest_platform_fact(PlatformFact::ImeInput {
+            handle: window.into(),
+            input: ImeInput::Preedit(ImePreeditInput::new(
+                "文",
+                Some(TextRange::collapsed("文".len())),
+            )),
+        })
+        .unwrap();
+    assert_eq!(
+        runtime
+            .retained_snapshot(window)
+            .unwrap()
+            .find_by_key("field")
+            .unwrap()
+            .display_text(),
+        Some("hi文".to_owned()),
+    );
+
+    runtime
+        .ingest_platform_fact(PlatformFact::ImeInput {
+            handle: window.into(),
+            input: ImeInput::Commit(TextInput::commit("!")),
+        })
+        .unwrap();
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+
+    assert_eq!(
+        runtime
+            .retained_snapshot(window)
+            .unwrap()
+            .find_by_key("field")
+            .unwrap()
+            .display_text(),
+        Some("hi!".to_owned()),
+    );
+    let semantic = runtime.semantic_snapshot(window).unwrap();
+    let field = semantic.find_by_key("field").unwrap();
+    assert_eq!(field.value(), Some("hi!"));
+    assert!(field.state().editable());
+    assert!(field.state().focused());
+    assert_eq!(field.state().selection(), Some(TextRange::collapsed(3)));
+    assert_eq!(field.state().composition(), None);
+    assert_eq!(field.state().composition_cursor(), None);
+    let diagnostics = runtime.diagnostics().snapshot();
+    assert_eq!(diagnostics.counter("ime.preedit"), 1);
+    assert_eq!(diagnostics.counter("ime.commit"), 1);
+    assert_eq!(diagnostics.counter("text.input_fact"), 2);
+    assert!(diagnostics.records().iter().any(|record| {
+        record.operation == "text.input_fact"
+            && record
+                .fields
+                .get("kind")
+                .is_some_and(|value| value == "preedit")
+            && record
+                .fields
+                .get("text_len")
+                .is_some_and(|value| value == &"文".len().to_string())
+    }));
+    assert!(diagnostics.records().iter().any(|record| {
+        record.operation == "text.input_fact"
+            && record
+                .fields
+                .get("kind")
+                .is_some_and(|value| value == "ime_commit")
+            && record
+                .fields
+                .get("text_len")
+                .is_some_and(|value| value == "1")
+    }));
+}
+
+#[test]
+fn ime_candidate_rect_for_long_input_uses_visible_caret() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div().key("root").child(
+                    input("AAAA AAAA AAAA AAAA")
+                        .key("field")
+                        .w(px(36.0))
+                        .font_size(px(12.0)),
+                ),
+            )
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+
+    let cursor_area = runtime
+        .ime_requests(window)
+        .unwrap()
+        .into_iter()
+        .find_map(|request| match request {
+            ImePlatformRequest::CursorArea { rect } => Some(rect),
+            _ => None,
+        })
+        .expect("text input focus should publish a cursor area");
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let field_layout = layout.find_by_key("field").unwrap();
+    let content = field_layout.content_rect();
+    let text_layout = field_layout.text_layout().unwrap();
+    let placement = text_viewport_placement(ElementKind::Input, content, text_layout);
+
+    assert!(placement.input_inline_scroll() > 0.0);
+    assert_eq!(cursor_area, placement.visible_caret_rect());
+    assert!(cursor_area.x() >= content.x());
+    assert!(cursor_area.x() + cursor_area.width() <= content.x() + content.width());
+}
+
+#[test]
+fn ime_disabled_after_commit_keeps_text_input_focus_and_does_not_disable_platform_ime() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(div().key("root").child(input("hi").key("field")))
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    let _ = runtime.take_platform_ime_requests(window.into()).unwrap();
+    let field = runtime
+        .retained_snapshot(window)
+        .unwrap()
+        .find_by_key("field")
+        .unwrap()
+        .clone();
+    let target = crate::interaction::InteractionTarget::new(field.id(), field.generation());
+    runtime
+        .ingest_platform_fact(PlatformFact::ImeInput {
+            handle: window.into(),
+            input: ImeInput::Preedit(ImePreeditInput::new("ni", None)),
+        })
+        .unwrap();
+    runtime
+        .ingest_platform_fact(PlatformFact::ImeInput {
+            handle: window.into(),
+            input: ImeInput::Commit(TextInput::commit("你")),
+        })
+        .unwrap();
+
+    runtime
+        .ingest_platform_fact(PlatformFact::ImeInput {
+            handle: window.into(),
+            input: ImeInput::Disabled,
+        })
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .state()
+            .interaction(window.id())
+            .unwrap()
+            .text_input_focus(),
+        Some(target),
+    );
+    assert_eq!(
+        runtime
+            .retained_snapshot(window)
+            .unwrap()
+            .find_by_key("field")
+            .unwrap()
+            .display_text(),
+        Some("hi你".to_owned()),
+    );
+    let ime_requests = runtime.take_platform_ime_requests(window.into()).unwrap();
+    assert!(
+        ime_requests
+            .iter()
+            .any(|request| matches!(request, ImePlatformRequest::Allowed { allowed: true }))
+    );
+    assert!(
+        !ime_requests
+            .iter()
+            .any(|request| matches!(request, ImePlatformRequest::Allowed { allowed: false }))
+    );
+    assert!(
+        runtime
+            .diagnostics()
+            .snapshot()
+            .records()
+            .iter()
+            .any(|record| {
+                record.operation == "ime.transition"
+                    && record
+                        .fields
+                        .get("transition")
+                        .is_some_and(|value| value == "disabled")
+                    && record
+                        .fields
+                        .get("target_id")
+                        .is_some_and(|value| value != "none")
+            })
+    );
+}
+
+#[test]
+fn ime_candidate_rect_tracks_scroll_offset_and_shaped_caret_geometry() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div().key("root").child(
+                    div()
+                        .key("scroll")
+                        .w(px(120.0))
+                        .h(px(40.0))
+                        .overflow(Overflow::Scroll)
+                        .child(div().h(px(80.0)).child(input("hello").key("field"))),
+                ),
+            )
+        })
+        .unwrap();
+    let retained = runtime.retained_snapshot(window).unwrap();
+    let scroll_node = retained.find_by_key("scroll").unwrap();
+    let scroll_target =
+        crate::interaction::InteractionTarget::new(scroll_node.id(), scroll_node.generation());
+    runtime
+        .pointer_input(window, PointerInput::move_to(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    runtime
+        .ingest_platform_fact(PlatformFact::WheelInput {
+            handle: window.into(),
+            input: WheelInput::new(ScrollDelta::pixels(0.0, 5.0), ScrollPhase::Moved),
+        })
+        .unwrap();
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+    assert_eq!(
+        runtime.scroll_offset(window, scroll_target).unwrap().y(),
+        5.0
+    );
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+
+    let cursor_area = runtime
+        .ime_requests(window)
+        .unwrap()
+        .into_iter()
+        .find_map(|request| match request {
+            ImePlatformRequest::CursorArea { rect } => Some(rect),
+            _ => None,
+        })
+        .expect("text input focus should publish a cursor area");
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let field_layout = layout.find_by_key("field").unwrap();
+    let text_layout = field_layout.text_layout().unwrap();
+    let expected =
+        text_viewport_placement(ElementKind::Input, field_layout.content_rect(), text_layout)
+            .visible_caret_rect()
+            .translate(0.0, -5.0);
+
+    assert_eq!(cursor_area, expected);
+}
+
+#[test]
+fn stale_text_input_target_clears_focus_composition_and_disables_ime() {
+    let mut runtime = Runtime::new();
+    let mode = Rc::new(Cell::new(TextInputMutationMode::Visible));
+    let window = runtime
+        .open_window(WindowOptions::new(), {
+            let mode = mode.clone();
+            move |_| MutatingInputRoot { mode }
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    let _ = runtime.take_platform_ime_requests(window.into()).unwrap();
+    runtime
+        .ingest_platform_fact(PlatformFact::ImeInput {
+            handle: window.into(),
+            input: ImeInput::Preedit(ImePreeditInput::new("文", None)),
+        })
+        .unwrap();
+    assert_eq!(
+        runtime
+            .retained_snapshot(window)
+            .unwrap()
+            .find_by_key("field")
+            .unwrap()
+            .display_text(),
+        Some("hi文".to_owned()),
+    );
+
+    mode.set(TextInputMutationMode::DisplayNone);
+    runtime.request_notify();
+    runtime.drain_all().unwrap();
+
+    assert_eq!(
+        runtime
+            .retained_snapshot(window)
+            .unwrap()
+            .find_by_key("field")
+            .unwrap()
+            .display_text(),
+        Some("hi".to_owned()),
+    );
+    assert_eq!(
+        runtime
+            .state()
+            .interaction(window.id())
+            .unwrap()
+            .text_input_focus(),
+        None,
+    );
+    assert!(
+        runtime
+            .take_platform_ime_requests(window.into())
+            .unwrap()
+            .iter()
+            .any(|request| matches!(request, ImePlatformRequest::Allowed { allowed: false }))
+    );
+    let diagnostics = runtime.diagnostics().snapshot();
+    assert!(diagnostics.records().iter().any(|record| {
+        record.operation == "input.stale_target"
+            && record
+                .fields
+                .get("state_kind")
+                .is_some_and(|value| value == "text_input_focus_cleanup")
+    }));
+    assert!(diagnostics.records().iter().any(|record| {
+        record.operation == "focus.transition"
+            && record
+                .fields
+                .get("domain")
+                .is_some_and(|value| value == "text_input")
+            && record
+                .fields
+                .get("reason")
+                .is_some_and(|value| value == "stale_cleanup")
+    }));
+}
+
+#[test]
+fn window_blur_clears_text_input_focus_composition_and_disables_platform_ime() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(div().key("root").child(input("hi").key("field")))
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    let _ = runtime.take_platform_ime_requests(window.into()).unwrap();
+    runtime
+        .ingest_platform_fact(PlatformFact::ImeInput {
+            handle: window.into(),
+            input: ImeInput::Preedit(ImePreeditInput::new(
+                "文",
+                Some(TextRange::collapsed("文".len())),
+            )),
+        })
+        .unwrap();
+    assert_eq!(
+        runtime
+            .retained_snapshot(window)
+            .unwrap()
+            .find_by_key("field")
+            .unwrap()
+            .display_text(),
+        Some("hi文".to_owned()),
+    );
+
+    runtime
+        .ingest_platform_fact(PlatformFact::WindowFocusChanged {
+            handle: window.into(),
+            input: WindowFocusInput::new(false),
+        })
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .retained_snapshot(window)
+            .unwrap()
+            .find_by_key("field")
+            .unwrap()
+            .display_text(),
+        Some("hi".to_owned()),
+    );
+    assert_eq!(
+        runtime
+            .state()
+            .interaction(window.id())
+            .unwrap()
+            .text_input_focus(),
+        None,
+    );
+    assert!(
+        runtime
+            .take_platform_ime_requests(window.into())
+            .unwrap()
+            .iter()
+            .any(|request| matches!(request, ImePlatformRequest::Allowed { allowed: false }))
+    );
+    let diagnostics = runtime.diagnostics().snapshot();
+    assert!(diagnostics.records().iter().any(|record| {
+        record.operation == "focus.transition"
+            && record
+                .fields
+                .get("domain")
+                .is_some_and(|value| value == "text_input")
+            && record
+                .fields
+                .get("reason")
+                .is_some_and(|value| value == "window_unfocused")
+    }));
+}
+
+#[test]
+fn pointer_down_away_from_input_clears_text_focus_composition_and_disables_ime() {
+    for (point, reason) in [
+        (LayoutPoint::new(99.0, 99.0), "pointer_down_miss"),
+        (LayoutPoint::new(1.0, 24.0), "pointer_down_non_focusable"),
+    ] {
+        let mut runtime = Runtime::new();
+        let window = runtime
+            .open_window(WindowOptions::new(), |_| {
+                TestRoot::new(
+                    div()
+                        .key("root")
+                        .w(px(40.0))
+                        .h(px(40.0))
+                        .child(input("hi").key("field").h(px(20.0)))
+                        .child(div().key("surface").h(px(20.0))),
+                )
+            })
+            .unwrap();
+
+        runtime
+            .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+            .unwrap();
+        let _ = runtime.take_platform_ime_requests(window.into()).unwrap();
+        runtime
+            .ingest_platform_fact(PlatformFact::ImeInput {
+                handle: window.into(),
+                input: ImeInput::Preedit(ImePreeditInput::new("文", None)),
+            })
+            .unwrap();
+        assert_eq!(
+            runtime
+                .retained_snapshot(window)
+                .unwrap()
+                .find_by_key("field")
+                .unwrap()
+                .display_text(),
+            Some("hi文".to_owned()),
+        );
+
+        runtime
+            .pointer_input(window, PointerInput::down(point))
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .retained_snapshot(window)
+                .unwrap()
+                .find_by_key("field")
+                .unwrap()
+                .display_text(),
+            Some("hi".to_owned()),
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .interaction(window.id())
+                .unwrap()
+                .text_input_focus(),
+            None,
+        );
+        assert!(
+            runtime
+                .take_platform_ime_requests(window.into())
+                .unwrap()
+                .iter()
+                .any(|request| matches!(request, ImePlatformRequest::Allowed { allowed: false }))
+        );
+        let diagnostics = runtime.diagnostics().snapshot();
+        assert!(diagnostics.records().iter().any(|record| {
+            record.operation == "focus.transition"
+                && record
+                    .fields
+                    .get("domain")
+                    .is_some_and(|value| value == "text_input")
+                && record
+                    .fields
+                    .get("reason")
+                    .is_some_and(|value| value == reason)
+        }));
+    }
+}
+
+#[test]
+fn ime_candidate_rect_ignores_display_none_retained_siblings_during_layout_lookup() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div().key("root").child(
+                    div()
+                        .key("scroll")
+                        .w(px(120.0))
+                        .h(px(40.0))
+                        .overflow(Overflow::Scroll)
+                        .child(
+                            div()
+                                .key("hidden")
+                                .display(Display::None)
+                                .child(text("hidden")),
+                        )
+                        .child(div().h(px(80.0)).child(input("hello").key("field"))),
+                ),
+            )
+        })
+        .unwrap();
+    let retained = runtime.retained_snapshot(window).unwrap();
+    assert!(retained.find_by_key("hidden").is_some());
+    let layout = runtime.layout_snapshot(window).unwrap();
+    assert!(layout.find_by_key("hidden").is_none());
+
+    runtime
+        .pointer_input(window, PointerInput::move_to(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    runtime
+        .ingest_platform_fact(PlatformFact::WheelInput {
+            handle: window.into(),
+            input: WheelInput::new(ScrollDelta::pixels(0.0, 5.0), ScrollPhase::Moved),
+        })
+        .unwrap();
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+
+    assert!(runtime.ime_requests(window).unwrap().iter().any(|request| {
+        matches!(request, ImePlatformRequest::CursorArea { rect } if rect.y() < layout.find_by_key("field").unwrap().content_rect().y())
     }));
 }
 

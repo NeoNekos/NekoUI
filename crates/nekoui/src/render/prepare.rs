@@ -39,6 +39,7 @@ fn prepare_frame_graph_inner(scene: &PaintScene, context: PreparedFrameContext) 
                         .text_layout()
                         .expect("text fragments carry a private layout ref")
                         .clone(),
+                    clip: fragment.clip(),
                     color: *color,
                 },
                 PaintFragmentKind::ClipPush { .. } => DrawItemKind::ClipPush,

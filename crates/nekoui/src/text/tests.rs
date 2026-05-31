@@ -8,8 +8,8 @@ use crate::text::measure::{
     TextMeasureErrorKind,
 };
 use crate::text::{
-    FontManager, TextGeneration, TextLayoutResult, TextMeasureQuery, TextMeasureResult,
-    TextMeasureSession,
+    FontManager, TextGeneration, TextLayoutMode, TextLayoutResult, TextMeasureQuery,
+    TextMeasureResult, TextMeasureSession,
 };
 
 #[test]
@@ -25,6 +25,7 @@ fn measurement_uses_shaped_layout_not_scalar_count_estimates() {
         text: "👨‍👩‍👧‍👦a",
         style: style.text(),
         available_inline_width: None,
+        layout_mode: TextLayoutMode::SoftWrap,
         font_generation: session.font_generation(),
         scale_generation: 1,
         scale_factor: 1.0,
@@ -55,6 +56,7 @@ fn layout_uses_shaped_glyph_positions_and_stable_generation() {
         text: "AV",
         style: style.text(),
         available_inline_width: None,
+        layout_mode: TextLayoutMode::SoftWrap,
         font_generation: session.font_generation(),
         scale_generation: 1,
         scale_factor: 1.0,
@@ -95,6 +97,7 @@ fn layout_deduplicates_glyph_demands_by_key_while_preserving_instances() {
         text: "AAAAAA",
         style: style.text(),
         available_inline_width: None,
+        layout_mode: TextLayoutMode::SoftWrap,
         font_generation: session.font_generation(),
         scale_generation: 1,
         scale_factor: 1.0,
@@ -134,6 +137,7 @@ fn scale_factor_participates_in_layout_key_and_glyph_demands() {
         text: "AA",
         style: style.text(),
         available_inline_width: None,
+        layout_mode: TextLayoutMode::SoftWrap,
         font_generation: session.font_generation(),
         scale_generation: 1,
         scale_factor: 1.0,
@@ -188,6 +192,7 @@ fn pass_local_memo_hits_repeated_queries() {
             text: "memo",
             style: style.text(),
             available_inline_width: Some(50.0),
+            layout_mode: TextLayoutMode::SoftWrap,
             font_generation,
             scale_generation: 1,
             scale_factor: 1.0,
@@ -217,6 +222,7 @@ fn font_generation_participates_in_memo_key() {
         text: "font",
         style: style.text(),
         available_inline_width: None,
+        layout_mode: TextLayoutMode::SoftWrap,
         font_generation: generation,
         scale_generation: 1,
         scale_factor: 1.0,
@@ -270,6 +276,7 @@ fn stale_font_generation_defers_and_counts_blocker() {
         text: "defer",
         style: style.text(),
         available_inline_width: None,
+        layout_mode: TextLayoutMode::SoftWrap,
         font_generation: crate::text::FontGeneration::INITIAL.next(),
         scale_generation: 1,
         scale_factor: 1.0,
@@ -317,6 +324,7 @@ fn memo_key_tracks_policy_dimensions() {
             text: "policy",
             style,
             available_inline_width: Some(18.0),
+            layout_mode: TextLayoutMode::SoftWrap,
             font_generation: session.font_generation(),
             scale_generation: 1,
             scale_factor: 1.0,
@@ -324,6 +332,103 @@ fn memo_key_tracks_policy_dimensions() {
     }
 
     assert_eq!(session.stats().cache_misses, 3);
+}
+
+#[test]
+fn trailing_caret_rect_uses_final_visible_shaped_line() {
+    let style = ResolvedStyle::resolve(
+        &StyleDeclaration::default()
+            .font_size(px(12.0))
+            .line_clamp(2),
+        None,
+    );
+    let font_manager = FontManager::default();
+    let mut session = TextMeasureSession::new(&font_manager);
+    let layout = match session.layout(TextMeasureQuery {
+        node_id: RetainedNodeId::new(41),
+        node_generation: NodeGeneration::INITIAL,
+        text_generation: TextGeneration::INITIAL,
+        style_generation: TextGeneration::INITIAL,
+        text: "AAAA AAAA A",
+        style: style.text(),
+        available_inline_width: Some(36.0),
+        layout_mode: TextLayoutMode::SoftWrap,
+        font_generation: session.font_generation(),
+        scale_generation: 1,
+        scale_factor: 1.0,
+    }) {
+        TextLayoutResult::Ready(layout) => layout,
+        TextLayoutResult::Deferred(_) | TextLayoutResult::Failed(_) => unreachable!(),
+    };
+    let caret = layout.trailing_caret_rect();
+    let metrics = layout.metrics();
+
+    assert_eq!(metrics.line_count, 2);
+    assert!(caret.y() > 0.0);
+    assert!(caret.height() < metrics.height);
+    assert!(caret.x() <= metrics.width);
+}
+
+#[test]
+fn single_line_input_mode_does_not_soft_wrap_at_available_width() {
+    let style = ResolvedStyle::resolve(&StyleDeclaration::default().font_size(px(12.0)), None);
+    let font_manager = FontManager::default();
+    let mut session = TextMeasureSession::new(&font_manager);
+    let available_inline_width = 36.0;
+    let expected_line_height = style.text().font_size().as_px() * 1.2;
+    let layout = match session.layout(TextMeasureQuery {
+        node_id: RetainedNodeId::new(42),
+        node_generation: NodeGeneration::INITIAL,
+        text_generation: TextGeneration::INITIAL,
+        style_generation: TextGeneration::INITIAL,
+        text: "AAAA AAAA AAAA AAAA",
+        style: style.text(),
+        available_inline_width: Some(available_inline_width),
+        layout_mode: TextLayoutMode::SingleLineInput,
+        font_generation: session.font_generation(),
+        scale_generation: 1,
+        scale_factor: 1.0,
+    }) {
+        TextLayoutResult::Ready(layout) => layout,
+        TextLayoutResult::Deferred(_) | TextLayoutResult::Failed(_) => unreachable!(),
+    };
+    let metrics = layout.metrics();
+
+    assert_eq!(metrics.line_count, 1);
+    assert!((metrics.height - expected_line_height).abs() < 0.01);
+    assert!(layout.trailing_caret_rect().x() > available_inline_width);
+    assert_eq!(layout.trailing_caret_rect().y(), 0.0);
+    assert_eq!(layout.key().layout_mode, TextLayoutMode::SingleLineInput);
+}
+
+#[test]
+fn soft_wrap_text_mode_still_wraps_at_available_width() {
+    let style = ResolvedStyle::resolve(&StyleDeclaration::default().font_size(px(12.0)), None);
+    let font_manager = FontManager::default();
+    let mut session = TextMeasureSession::new(&font_manager);
+    let expected_line_height = style.text().font_size().as_px() * 1.2;
+    let layout = match session.layout(TextMeasureQuery {
+        node_id: RetainedNodeId::new(43),
+        node_generation: NodeGeneration::INITIAL,
+        text_generation: TextGeneration::INITIAL,
+        style_generation: TextGeneration::INITIAL,
+        text: "AAAA AAAA AAAA AAAA",
+        style: style.text(),
+        available_inline_width: Some(36.0),
+        layout_mode: TextLayoutMode::SoftWrap,
+        font_generation: session.font_generation(),
+        scale_generation: 1,
+        scale_factor: 1.0,
+    }) {
+        TextLayoutResult::Ready(layout) => layout,
+        TextLayoutResult::Deferred(_) | TextLayoutResult::Failed(_) => unreachable!(),
+    };
+    let metrics = layout.metrics();
+
+    assert!(metrics.line_count > 1);
+    assert!(metrics.height > expected_line_height);
+    assert!(layout.trailing_caret_rect().y() > 0.0);
+    assert_eq!(layout.key().layout_mode, TextLayoutMode::SoftWrap);
 }
 
 #[test]
@@ -357,6 +462,7 @@ fn ready_event_samples_are_bounded_but_counters_are_exact() {
             text: "bounded ready samples",
             style: style.text(),
             available_inline_width: Some(80.0),
+            layout_mode: TextLayoutMode::SoftWrap,
             font_generation: session.font_generation(),
             scale_generation: 1,
             scale_factor: 1.0,
@@ -387,6 +493,7 @@ fn blocker_samples_are_bounded_but_deferred_counters_are_exact() {
             text: "bounded deferred samples",
             style: style.text(),
             available_inline_width: None,
+            layout_mode: TextLayoutMode::SoftWrap,
             font_generation: crate::text::FontGeneration::INITIAL.next(),
             scale_generation: 1,
             scale_factor: 1.0,

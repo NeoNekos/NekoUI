@@ -421,6 +421,121 @@ impl WheelInput {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct TextRange {
+    start: usize,
+    end: usize,
+}
+
+impl TextRange {
+    pub const fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+
+    pub const fn collapsed(offset: usize) -> Self {
+        Self {
+            start: offset,
+            end: offset,
+        }
+    }
+
+    pub const fn start(self) -> usize {
+        self.start
+    }
+
+    pub const fn end(self) -> usize {
+        self.end
+    }
+
+    pub const fn is_collapsed(self) -> bool {
+        self.start == self.end
+    }
+
+    pub(crate) fn validate_for_text(self, text: &str) -> bool {
+        self.start <= self.end
+            && self.end <= text.len()
+            && text.is_char_boundary(self.start)
+            && text.is_char_boundary(self.end)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct TextInput {
+    text: String,
+    replace: Option<TextRange>,
+}
+
+impl TextInput {
+    pub fn commit(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            replace: None,
+        }
+    }
+
+    pub fn with_replace(mut self, range: TextRange) -> Self {
+        self.replace = Some(range);
+        self
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn replace(&self) -> Option<TextRange> {
+        self.replace
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ImePreeditInput {
+    text: String,
+    cursor: Option<TextRange>,
+    replace: Option<TextRange>,
+}
+
+impl ImePreeditInput {
+    pub fn new(text: impl Into<String>, cursor: Option<TextRange>) -> Self {
+        Self {
+            text: text.into(),
+            cursor,
+            replace: None,
+        }
+    }
+
+    pub fn with_replace(mut self, range: TextRange) -> Self {
+        self.replace = Some(range);
+        self
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn cursor(&self) -> Option<TextRange> {
+        self.cursor
+    }
+
+    pub fn replace(&self) -> Option<TextRange> {
+        self.replace
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ImeInput {
+    Enabled,
+    Preedit(ImePreeditInput),
+    Commit(TextInput),
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum TextInputPurpose {
+    #[default]
+    Normal,
+    Password,
+    Terminal,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct WindowFocusInput {
     focused: bool,

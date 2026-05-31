@@ -43,6 +43,10 @@ pub enum SceneSignatureFact {
         x: u32,
         y: u32,
     },
+    TextInputFocus {
+        target_id: Option<u64>,
+        target_generation: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -56,24 +60,6 @@ pub struct SceneGeneration {
 }
 
 impl SceneGeneration {
-    #[cfg(test)]
-    pub(crate) fn new(
-        retained: Option<RetainedTreeGeneration>,
-        layout: Option<LayoutGeneration>,
-        style: SceneInputSignature,
-        viewport: u64,
-        text: SceneInputSignature,
-    ) -> Self {
-        Self::new_with_scroll(
-            retained,
-            layout,
-            style,
-            viewport,
-            text,
-            SceneInputSignature::default(),
-        )
-    }
-
     pub(crate) fn new_with_scroll(
         retained: Option<RetainedTreeGeneration>,
         layout: Option<LayoutGeneration>,

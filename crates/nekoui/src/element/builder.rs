@@ -13,6 +13,7 @@ use crate::style::StyleDeclaration;
 pub enum ElementKind {
     Div,
     Text,
+    Input,
 }
 
 impl ElementKind {
@@ -24,6 +25,7 @@ impl ElementKind {
         match self {
             ElementKind::Div => "div",
             ElementKind::Text => "text",
+            ElementKind::Input => "input",
         }
     }
 }
@@ -317,6 +319,11 @@ pub struct Text {
     element: Element,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Input {
+    element: Element,
+}
+
 impl Text {
     pub fn key(mut self, key: impl Into<ElementKey>) -> Self {
         self.element = self.element.with_key(key);
@@ -481,6 +488,32 @@ impl IntoElement for Text {
     }
 }
 
+impl Input {
+    pub fn key(mut self, key: impl Into<ElementKey>) -> Self {
+        self.element = self.element.with_key(key);
+        self
+    }
+
+    pub fn as_element(&self) -> &Element {
+        &self.element
+    }
+
+    pub fn focusable(mut self, focusable: bool) -> Self {
+        self.element.focusable = focusable;
+        self
+    }
+
+    pub(crate) fn style_mut(&mut self) -> &mut StyleDeclaration {
+        self.element.style_mut()
+    }
+}
+
+impl IntoElement for Input {
+    fn into_element(self) -> Element {
+        self.element
+    }
+}
+
 pub fn div() -> Div {
     Div {
         element: Element::new(ElementKind::Div),
@@ -491,6 +524,13 @@ pub fn text(value: impl Into<Cow<'static, str>>) -> Text {
     let mut element = Element::new(ElementKind::Text);
     element.text = Some(value.into());
     Text { element }
+}
+
+pub fn input(value: impl Into<Cow<'static, str>>) -> Input {
+    let mut element = Element::new(ElementKind::Input);
+    element.text = Some(value.into());
+    element.focusable = true;
+    Input { element }
 }
 
 #[cfg(test)]

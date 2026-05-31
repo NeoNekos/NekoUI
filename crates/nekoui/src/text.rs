@@ -1,7 +1,9 @@
+mod edit;
 mod font;
 mod glyph;
 mod measure;
 
+pub(crate) use edit::{EditableTextState, TextBlock, TextEditOutcome, TextRangeError};
 pub(crate) use font::{FontGeneration, FontManager};
 #[cfg(target_os = "windows")]
 pub(crate) use glyph::{GlyphBitmap, GlyphRasterError};
@@ -14,7 +16,8 @@ pub(crate) use measure::TextMeasureResult;
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) use measure::TextMetrics;
 pub(crate) use measure::{
-    TextGeneration, TextLayoutResult, TextMeasureQuery, TextMeasureSession, TextMeasureStats,
+    TextGeneration, TextLayoutMode, TextLayoutResult, TextMeasureQuery, TextMeasureSession,
+    TextMeasureStats,
 };
 
 #[cfg(test)]

@@ -3,9 +3,9 @@ mod contract;
 mod windows;
 mod winit_runtime;
 
-pub(crate) use contract::PlatformFact;
 #[cfg(target_os = "windows")]
 pub(crate) use contract::{BackendFrameReceipt, BackendFrameStatus, BackendSurfaceState};
+pub(crate) use contract::{ImePlatformRequest, PlatformFact};
 pub(crate) use contract::{PhysicalSize, Renderability};
 #[cfg(target_os = "windows")]
 pub(crate) use windows::NativeRenderer;

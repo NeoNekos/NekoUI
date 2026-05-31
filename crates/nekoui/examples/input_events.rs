@@ -1,4 +1,5 @@
 use nekoui::prelude::*;
+use tracing_subscriber::EnvFilter;
 
 const RECENT_LIMIT: usize = 8;
 
@@ -223,7 +224,7 @@ fn format_key_event(event: &KeyEvent) -> String {
     )
 }
 
-fn main() -> NekoResult<()> {
+fn run_example() {
     Application::new().run(|cx| {
         let state = cx.new_entity(|_| InputEventsState::default());
         cx.windows()
@@ -232,7 +233,16 @@ fn main() -> NekoResult<()> {
             })?;
 
         Ok(())
-    })
+    }).unwrap();
+}
+
+fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")))
+        .with_thread_names(true)
+        .init();
+
+    run_example();
 }
 
 #[cfg(test)]

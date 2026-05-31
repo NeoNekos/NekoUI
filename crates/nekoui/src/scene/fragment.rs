@@ -44,6 +44,7 @@ pub struct PaintFragment {
     rect: LayoutRect,
     kind: PaintFragmentKind,
     text_layout: Option<TextLayoutRef>,
+    clip: Option<LayoutRect>,
 }
 
 impl PaintFragment {
@@ -61,11 +62,17 @@ impl PaintFragment {
             rect,
             kind,
             text_layout: None,
+            clip: None,
         }
     }
 
     pub(crate) fn with_text_layout(mut self, layout: TextLayoutRef) -> Self {
         self.text_layout = Some(layout);
+        self
+    }
+
+    pub(crate) fn with_clip(mut self, clip: LayoutRect) -> Self {
+        self.clip = Some(clip);
         self
     }
 
@@ -91,5 +98,9 @@ impl PaintFragment {
 
     pub(crate) fn text_layout(&self) -> Option<&TextLayoutRef> {
         self.text_layout.as_ref()
+    }
+
+    pub(crate) fn clip(&self) -> Option<LayoutRect> {
+        self.clip
     }
 }

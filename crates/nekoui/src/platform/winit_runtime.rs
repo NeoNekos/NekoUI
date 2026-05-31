@@ -1,22 +1,26 @@
 use std::collections::HashMap;
 
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize as WinitPhysicalSize};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize as WinitPhysicalSize};
+use winit::event::{
+    ElementState, Ime as WinitIme, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WinitKey, ModifiersState, PhysicalKey as WinitPhysicalKey};
-use winit::window::{Window, WindowAttributes, WindowId as WinitWindowId};
+use winit::window::{
+    ImePurpose as WinitImePurpose, Window, WindowAttributes, WindowId as WinitWindowId,
+};
 
 use crate::app::{AppContext, Application};
 use crate::error::{NekoError, NekoResult};
 use crate::interaction::{
-    Key, KeyInput, KeyInputKind, Modifiers, PhysicalKey, PointerInput, ScrollDelta, ScrollPhase,
-    WheelInput, WindowFocusInput,
+    ImeInput, ImePreeditInput, Key, KeyInput, KeyInputKind, Modifiers, PhysicalKey, PointerInput,
+    ScrollDelta, ScrollPhase, TextInput, TextInputPurpose, TextRange, WheelInput, WindowFocusInput,
 };
-use crate::layout::{LayoutPoint, LayoutSize};
+use crate::layout::{LayoutPoint, LayoutRect, LayoutSize};
 #[cfg(target_os = "windows")]
 use crate::platform::NativeRenderer;
-use crate::platform::{PhysicalSize, PlatformFact, Renderability};
+use crate::platform::{ImePlatformRequest, PhysicalSize, PlatformFact, Renderability};
 use crate::runtime::Runtime;
 use crate::window::{AnyWindowHandle, WindowId, WindowRecord};
 
@@ -244,6 +248,19 @@ impl WinitRuntimeApp {
                 window.request_redraw();
             }
         }
+        let live_windows = self.runtime.live_windows_for_platform();
+        for record in live_windows {
+            let handle = record.handle();
+            let Some(winit_id) = self.windows_by_neko.get(&handle.id()) else {
+                continue;
+            };
+            let Some(window) = self.windows.get(winit_id) else {
+                continue;
+            };
+            for request in self.runtime.take_platform_ime_requests(handle)? {
+                forward_ime_request(window, request);
+            }
+        }
         Ok(())
     }
 
@@ -324,8 +341,14 @@ impl WinitRuntimeApp {
             .with_modifiers(modifiers)
             .with_repeat(event.repeat)
             .with_synthetic(synthetic);
+        let text_input =
+            text_input_from_key_event_text(kind, synthetic, modifiers, event.text.as_deref());
 
-        self.ingest(PlatformFact::KeyInput { handle, input })
+        self.ingest(PlatformFact::KeyInput { handle, input })?;
+        if let Some(input) = text_input {
+            self.ingest(PlatformFact::TextInput { handle, input })?;
+        }
+        Ok(())
     }
 
     fn ingest_modifiers_changed(
@@ -371,6 +394,11 @@ impl WinitRuntimeApp {
             handle,
             input: WindowFocusInput::new(focused),
         })
+    }
+
+    fn ingest_ime_input(&mut self, handle: AnyWindowHandle, ime: WinitIme) -> NekoResult<()> {
+        let input = normalize_ime_input(ime);
+        self.ingest(PlatformFact::ImeInput { handle, input })
     }
 
     fn exit_event_loop(&mut self, event_loop: &ActiveEventLoop) {
@@ -451,6 +479,7 @@ impl ApplicationHandler for WinitRuntimeApp {
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 self.ingest_mouse_wheel(window_id, handle, delta, phase)
             }
+            WindowEvent::Ime(ime) => self.ingest_ime_input(handle, ime),
             WindowEvent::Focused(focused) => self.ingest_window_focus(handle, focused),
             WindowEvent::Occluded(true) => self.ingest(PlatformFact::Minimized { handle }),
             WindowEvent::Occluded(false) => self.ingest(PlatformFact::Restored { handle }),
@@ -501,6 +530,50 @@ fn logical_scroll_pixels(position: winit::dpi::PhysicalPosition<f64>, scale: f64
     ScrollDelta::pixels(-logical.x, -logical.y)
 }
 
+fn normalize_ime_input(ime: WinitIme) -> ImeInput {
+    match ime {
+        WinitIme::Enabled => ImeInput::Enabled,
+        WinitIme::Preedit(text, cursor) => ImeInput::Preedit(ImePreeditInput::new(
+            text,
+            cursor.map(normalize_ime_cursor_range),
+        )),
+        WinitIme::Commit(text) => ImeInput::Commit(TextInput::commit(text)),
+        WinitIme::Disabled => ImeInput::Disabled,
+    }
+}
+
+fn normalize_ime_cursor_range((start, end): (usize, usize)) -> TextRange {
+    TextRange::new(start, end)
+}
+
+fn forward_ime_request(window: &Window, request: ImePlatformRequest) {
+    match request {
+        ImePlatformRequest::Allowed { allowed } => window.set_ime_allowed(allowed),
+        ImePlatformRequest::CursorArea { rect } => {
+            window.set_ime_cursor_area(winit_position(rect), winit_size(rect));
+        }
+        ImePlatformRequest::Purpose { purpose } => {
+            window.set_ime_purpose(winit_ime_purpose(purpose))
+        }
+    }
+}
+
+fn winit_position(rect: LayoutRect) -> LogicalPosition<f64> {
+    LogicalPosition::new(f64::from(rect.x()), f64::from(rect.y()))
+}
+
+fn winit_size(rect: LayoutRect) -> LogicalSize<f64> {
+    LogicalSize::new(f64::from(rect.width()), f64::from(rect.height()))
+}
+
+fn winit_ime_purpose(purpose: TextInputPurpose) -> WinitImePurpose {
+    match purpose {
+        TextInputPurpose::Normal => WinitImePurpose::Normal,
+        TextInputPurpose::Password => WinitImePurpose::Password,
+        TextInputPurpose::Terminal => WinitImePurpose::Terminal,
+    }
+}
+
 fn normalize_key(key: WinitKey) -> Key {
     match key {
         WinitKey::Character(value) => Key::character(value.to_string()),
@@ -526,6 +599,27 @@ fn normalize_modifiers(state: ModifiersState) -> Modifiers {
     )
 }
 
+fn text_input_from_key_event_text(
+    kind: KeyInputKind,
+    synthetic: bool,
+    modifiers: Modifiers,
+    text: Option<&str>,
+) -> Option<TextInput> {
+    if kind != KeyInputKind::Down || synthetic || shortcut_modifiers_block_text(modifiers) {
+        return None;
+    }
+    let text = text?;
+    insertable_text(text).then(|| TextInput::commit(text))
+}
+
+fn shortcut_modifiers_block_text(modifiers: Modifiers) -> bool {
+    modifiers.logo() || (modifiers.ctrl() && !modifiers.alt())
+}
+
+fn insertable_text(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|character| !character.is_control())
+}
+
 fn normalize_scroll_phase(phase: TouchPhase) -> ScrollPhase {
     match phase {
         TouchPhase::Started => ScrollPhase::Started,
@@ -538,11 +632,14 @@ fn normalize_scroll_phase(phase: TouchPhase) -> ScrollPhase {
 #[cfg(test)]
 mod tests {
     use winit::dpi::PhysicalPosition;
+    use winit::event::Ime as WinitIme;
     use winit::keyboard::ModifiersState;
 
     use super::{
-        logical_cursor_position, logical_scroll_lines, logical_scroll_pixels, normalize_modifiers,
+        logical_cursor_position, logical_scroll_lines, logical_scroll_pixels, normalize_ime_input,
+        normalize_modifiers, text_input_from_key_event_text,
     };
+    use crate::interaction::{ImeInput, KeyInputKind, Modifiers, TextInput, TextRange};
 
     #[test]
     fn pointer_positions_are_converted_from_physical_to_logical() {
@@ -578,5 +675,79 @@ mod tests {
         assert!(!modifiers.ctrl());
         assert!(modifiers.alt());
         assert!(!modifiers.logo());
+    }
+
+    #[test]
+    fn key_event_text_becomes_text_input_only_for_insertable_pressed_text() {
+        assert_eq!(
+            text_input_from_key_event_text(
+                KeyInputKind::Down,
+                false,
+                Modifiers::empty(),
+                Some("é"),
+            ),
+            Some(TextInput::commit("é")),
+        );
+        assert_eq!(
+            text_input_from_key_event_text(
+                KeyInputKind::Down,
+                false,
+                Modifiers::new(false, true, true, false),
+                Some("@"),
+            ),
+            Some(TextInput::commit("@")),
+        );
+        assert_eq!(
+            text_input_from_key_event_text(KeyInputKind::Up, false, Modifiers::empty(), Some("a"),),
+            None,
+        );
+        assert_eq!(
+            text_input_from_key_event_text(KeyInputKind::Down, true, Modifiers::empty(), Some("a"),),
+            None,
+        );
+        assert_eq!(
+            text_input_from_key_event_text(
+                KeyInputKind::Down,
+                false,
+                Modifiers::new(false, true, false, false),
+                Some("a"),
+            ),
+            None,
+        );
+        assert_eq!(
+            text_input_from_key_event_text(
+                KeyInputKind::Down,
+                false,
+                Modifiers::new(false, false, false, true),
+                Some("a"),
+            ),
+            None,
+        );
+        assert_eq!(
+            text_input_from_key_event_text(
+                KeyInputKind::Down,
+                false,
+                Modifiers::empty(),
+                Some("\r"),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn ime_events_are_normalized_to_platform_neutral_inputs() {
+        assert_eq!(normalize_ime_input(WinitIme::Enabled), ImeInput::Enabled);
+        assert_eq!(
+            normalize_ime_input(WinitIme::Preedit("ni".to_owned(), Some((0, 2)))),
+            ImeInput::Preedit(crate::interaction::ImePreeditInput::new(
+                "ni",
+                Some(TextRange::new(0, 2)),
+            )),
+        );
+        assert_eq!(
+            normalize_ime_input(WinitIme::Commit("你".to_owned())),
+            ImeInput::Commit(TextInput::commit("你")),
+        );
+        assert_eq!(normalize_ime_input(WinitIme::Disabled), ImeInput::Disabled);
     }
 }

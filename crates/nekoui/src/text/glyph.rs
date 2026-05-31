@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
+use crate::layout::LayoutRect;
 use crate::retained::{NodeGeneration, RetainedNodeId};
 use crate::style::TextOverflow;
 
 use super::font::FontGeneration;
-use super::measure::{TextGeneration, TextMetrics};
+use super::measure::{TextGeneration, TextLayoutMode, TextMetrics};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct TextLayoutGeneration(u64);
@@ -32,6 +33,7 @@ pub(crate) struct TextLayoutKey {
     pub(crate) style_generation: TextGeneration,
     pub(crate) text_hash: u64,
     pub(crate) available_inline_width_bits: Option<u32>,
+    pub(crate) layout_mode: TextLayoutMode,
     pub(crate) font_size_bits: u32,
     pub(crate) max_lines: Option<usize>,
     pub(crate) text_overflow: TextOverflow,
@@ -111,6 +113,7 @@ pub(crate) struct TextLayoutData {
     key: TextLayoutKey,
     scale_factor: f32,
     metrics: TextMetrics,
+    trailing_caret_rect: LayoutRect,
     glyphs: Arc<[GlyphInstance]>,
     demands: Arc<[GlyphDemand]>,
 }
@@ -120,6 +123,7 @@ impl TextLayoutData {
         generation: TextLayoutGeneration,
         key: TextLayoutKey,
         metrics: TextMetrics,
+        trailing_caret_rect: LayoutRect,
         glyphs: Arc<[GlyphInstance]>,
         demands: Arc<[GlyphDemand]>,
     ) -> Self {
@@ -129,6 +133,7 @@ impl TextLayoutData {
             key,
             scale_factor,
             metrics,
+            trailing_caret_rect,
             glyphs,
             demands,
         }
@@ -159,6 +164,10 @@ impl TextLayoutRef {
 
     pub(crate) fn metrics(&self) -> TextMetrics {
         self.data.metrics
+    }
+
+    pub(crate) fn trailing_caret_rect(&self) -> LayoutRect {
+        self.data.trailing_caret_rect
     }
 
     #[cfg(any(test, target_os = "windows"))]

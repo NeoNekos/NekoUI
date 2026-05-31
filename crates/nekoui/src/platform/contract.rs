@@ -1,6 +1,8 @@
 #[cfg(target_os = "windows")]
 use crate::error::ErrorKind;
-use crate::interaction::{KeyInput, Modifiers, PointerInput, WheelInput, WindowFocusInput};
+use crate::interaction::{
+    ImeInput, KeyInput, Modifiers, PointerInput, TextInput, WheelInput, WindowFocusInput,
+};
 use crate::layout::LayoutSize;
 use crate::window::AnyWindowHandle;
 
@@ -56,6 +58,14 @@ pub(crate) enum PlatformFact {
         handle: AnyWindowHandle,
         input: KeyInput,
     },
+    TextInput {
+        handle: AnyWindowHandle,
+        input: TextInput,
+    },
+    ImeInput {
+        handle: AnyWindowHandle,
+        input: ImeInput,
+    },
     ModifiersChanged {
         handle: AnyWindowHandle,
         modifiers: Modifiers,
@@ -70,6 +80,18 @@ pub(crate) enum PlatformFact {
     },
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ImePlatformRequest {
+    Allowed {
+        allowed: bool,
+    },
+    CursorArea {
+        rect: crate::layout::LayoutRect,
+    },
+    Purpose {
+        purpose: crate::interaction::TextInputPurpose,
+    },
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PhysicalSize {
     width: u32,

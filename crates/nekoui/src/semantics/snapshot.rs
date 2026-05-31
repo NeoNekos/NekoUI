@@ -34,6 +34,7 @@ pub(crate) enum SemanticRole {
     Window,
     Generic,
     Text,
+    Textbox,
 }
 
 impl SemanticRole {
@@ -42,6 +43,7 @@ impl SemanticRole {
             Self::Window => "window",
             Self::Generic => "generic",
             Self::Text => "text",
+            Self::Textbox => "textbox",
         }
     }
 }
@@ -51,6 +53,7 @@ pub(crate) enum SemanticAction {
     Activate,
     Focus,
     Scroll,
+    Edit,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -59,20 +62,34 @@ pub(crate) struct SemanticStateSnapshot {
     focused: bool,
     window_focused: bool,
     scrollable: bool,
+    editable: bool,
+    selection: Option<crate::interaction::TextRange>,
+    composition: Option<crate::interaction::TextRange>,
+    composition_cursor: Option<crate::interaction::TextRange>,
+}
+
+pub(crate) struct SemanticStateParts {
+    pub(crate) focusable: bool,
+    pub(crate) focused: bool,
+    pub(crate) window_focused: bool,
+    pub(crate) scrollable: bool,
+    pub(crate) editable: bool,
+    pub(crate) selection: Option<crate::interaction::TextRange>,
+    pub(crate) composition: Option<crate::interaction::TextRange>,
+    pub(crate) composition_cursor: Option<crate::interaction::TextRange>,
 }
 
 impl SemanticStateSnapshot {
-    pub(crate) fn new(
-        focusable: bool,
-        focused: bool,
-        window_focused: bool,
-        scrollable: bool,
-    ) -> Self {
+    pub(crate) fn new(parts: SemanticStateParts) -> Self {
         Self {
-            focusable,
-            focused,
-            window_focused,
-            scrollable,
+            focusable: parts.focusable,
+            focused: parts.focused,
+            window_focused: parts.window_focused,
+            scrollable: parts.scrollable,
+            editable: parts.editable,
+            selection: parts.selection,
+            composition: parts.composition,
+            composition_cursor: parts.composition_cursor,
         }
     }
 
@@ -94,6 +111,26 @@ impl SemanticStateSnapshot {
     #[cfg(test)]
     pub(crate) fn scrollable(&self) -> bool {
         self.scrollable
+    }
+
+    #[cfg(test)]
+    pub(crate) fn editable(&self) -> bool {
+        self.editable
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selection(&self) -> Option<crate::interaction::TextRange> {
+        self.selection
+    }
+
+    #[cfg(test)]
+    pub(crate) fn composition(&self) -> Option<crate::interaction::TextRange> {
+        self.composition
+    }
+
+    #[cfg(test)]
+    pub(crate) fn composition_cursor(&self) -> Option<crate::interaction::TextRange> {
+        self.composition_cursor
     }
 }
 

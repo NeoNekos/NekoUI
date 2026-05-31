@@ -7,12 +7,13 @@ use crate::diagnostic::{
 };
 use crate::element::{Element, ElementKind, ElementParts};
 use crate::error::ErrorKind;
-use crate::interaction::InteractionHandlers;
+use crate::interaction::{InteractionHandlers, InteractionTarget, TextRange};
 use crate::retained::{
     DirtyCause, IdentitySeed, RetainedDiffStats, RetainedDirty, RetainedIdentity,
     RetainedNodeSnapshot, RetainedTreeGeneration, RetainedTreeSnapshot,
 };
 use crate::style::{OutputParticipation, ResolvedStyle, StyleNodeSnapshot, StyleTreeSnapshot};
+use crate::text::{EditableTextState, TextEditOutcome, TextRangeError};
 
 #[derive(Clone, Debug, PartialEq)]
 struct RetainedNode {
@@ -25,6 +26,7 @@ struct RetainedNode {
     resolved_style: ResolvedStyle,
     participation: OutputParticipation,
     text: Option<Cow<'static, str>>,
+    editable: Option<EditableTextState>,
     children: Vec<RetainedNode>,
 }
 
@@ -45,6 +47,7 @@ impl RetainedNode {
             resolved_style: self.resolved_style.clone(),
             participation: self.participation,
             text: self.text.clone(),
+            editable: self.editable.clone(),
             children: self.children.iter().map(Self::snapshot).collect(),
         }
     }
@@ -132,6 +135,72 @@ impl RetainedTree {
         RetainedLayoutInput { tree: self }
     }
 
+    pub(crate) fn insert_text_at_target(
+        &mut self,
+        target: InteractionTarget,
+        text: &str,
+        replace: Option<TextRange>,
+    ) -> Result<Option<TextEditOutcome>, TextRangeError> {
+        let Some(root) = self.root.as_mut() else {
+            return Ok(None);
+        };
+        let Some(node) = find_node_by_target_mut(root, target) else {
+            return Ok(None);
+        };
+        let Some(editable) = node.editable.as_mut() else {
+            return Ok(None);
+        };
+        editable.block_mut().insert_text(text, replace).map(Some)
+    }
+
+    pub(crate) fn delete_backward_at_target(
+        &mut self,
+        target: InteractionTarget,
+    ) -> Result<Option<TextEditOutcome>, TextRangeError> {
+        let Some(root) = self.root.as_mut() else {
+            return Ok(None);
+        };
+        let Some(node) = find_node_by_target_mut(root, target) else {
+            return Ok(None);
+        };
+        let Some(editable) = node.editable.as_mut() else {
+            return Ok(None);
+        };
+        editable.block_mut().delete_backward().map(Some)
+    }
+
+    pub(crate) fn set_composition_at_target(
+        &mut self,
+        target: InteractionTarget,
+        text: &str,
+        cursor: Option<TextRange>,
+        replace: Option<TextRange>,
+    ) -> Result<Option<TextEditOutcome>, TextRangeError> {
+        let Some(root) = self.root.as_mut() else {
+            return Ok(None);
+        };
+        let Some(node) = find_node_by_target_mut(root, target) else {
+            return Ok(None);
+        };
+        let Some(editable) = node.editable.as_mut() else {
+            return Ok(None);
+        };
+        editable
+            .block_mut()
+            .set_composition(text, cursor, replace)
+            .map(Some)
+    }
+
+    pub(crate) fn clear_composition_at_target(
+        &mut self,
+        target: InteractionTarget,
+    ) -> Option<TextEditOutcome> {
+        let root = self.root.as_mut()?;
+        let node = find_node_by_target_mut(root, target)?;
+        let editable = node.editable.as_mut()?;
+        Some(editable.block_mut().clear_composition())
+    }
+
     fn diff_node(
         &mut self,
         old: Option<RetainedNode>,
@@ -168,7 +237,13 @@ impl RetainedTree {
                         participation_lanes(),
                     );
                 }
-                if old_node.text != parts.text {
+                let editable = reconcile_editable_state(&old_node, parts.kind, &parts.text);
+                let old_display_text = node_display_text(&old_node);
+                let new_display_text = editable
+                    .as_ref()
+                    .map(|editable| editable.block().display_text())
+                    .or_else(|| parts.text.as_deref().map(ToOwned::to_owned));
+                if old_display_text != new_display_text {
                     let mut text_lanes = DirtyLanes::empty();
                     text_lanes.insert(DirtyLane::Text.flag());
                     text_lanes.insert(DirtyLane::Layout.flag());
@@ -209,6 +284,7 @@ impl RetainedTree {
                     resolved_style,
                     participation,
                     text: parts.text,
+                    editable,
                     children,
                 }
             }
@@ -248,7 +324,7 @@ impl RetainedTree {
         lanes.insert(DirtyLane::Layout.flag());
         lanes.insert(DirtyLane::Semantics.flag());
         lanes.insert(DirtyLane::Paint.flag());
-        if parts.kind == ElementKind::Text {
+        if text_capable_kind(parts.kind) {
             lanes.insert(DirtyLane::Text.flag());
         }
         context.emit_dirty(Some(identity), DirtyCause::NodeCreated, lanes);
@@ -275,7 +351,8 @@ impl RetainedTree {
             handlers: parts.handlers,
             resolved_style,
             participation,
-            text: parts.text,
+            text: parts.text.clone(),
+            editable: initial_editable_state(parts.kind, parts.text.as_deref()),
             children,
         }
     }
@@ -411,8 +488,21 @@ impl<'a> RetainedLayoutNode<'a> {
         self.node.participation
     }
 
-    pub(crate) fn text(self) -> Option<&'a str> {
-        self.node.text.as_deref()
+    pub(crate) fn display_text(self) -> Option<String> {
+        self.node
+            .editable
+            .as_ref()
+            .map(|editable| editable.block().display_text())
+            .or_else(|| self.node.text.as_deref().map(ToOwned::to_owned))
+    }
+
+    pub(crate) fn text_generation(self) -> crate::text::TextGeneration {
+        self.node
+            .editable
+            .as_ref()
+            .map_or(crate::text::TextGeneration::INITIAL, |editable| {
+                editable.block().generation()
+            })
     }
 
     pub(crate) fn children_len(self) -> usize {
@@ -422,6 +512,54 @@ impl<'a> RetainedLayoutNode<'a> {
     pub(crate) fn children(self) -> impl Iterator<Item = RetainedLayoutNode<'a>> {
         self.node.children.iter().map(RetainedNode::layout_node)
     }
+}
+
+fn text_capable_kind(kind: ElementKind) -> bool {
+    matches!(kind, ElementKind::Text | ElementKind::Input)
+}
+
+fn editable_kind(kind: ElementKind) -> bool {
+    matches!(kind, ElementKind::Input)
+}
+
+fn initial_editable_state(kind: ElementKind, text: Option<&str>) -> Option<EditableTextState> {
+    editable_kind(kind).then(|| EditableTextState::new(text.unwrap_or_default()))
+}
+
+fn reconcile_editable_state(
+    old_node: &RetainedNode,
+    new_kind: ElementKind,
+    declared_text: &Option<Cow<'static, str>>,
+) -> Option<EditableTextState> {
+    if !editable_kind(new_kind) {
+        return None;
+    }
+    old_node.editable.clone().or_else(|| {
+        Some(EditableTextState::new(
+            declared_text.as_deref().unwrap_or_default(),
+        ))
+    })
+}
+
+fn node_display_text(node: &RetainedNode) -> Option<String> {
+    node.editable
+        .as_ref()
+        .map(|editable| editable.block().display_text())
+        .or_else(|| node.text.as_deref().map(ToOwned::to_owned))
+}
+
+fn find_node_by_target_mut(
+    node: &mut RetainedNode,
+    target: InteractionTarget,
+) -> Option<&mut RetainedNode> {
+    if node.identity.id() == target.node_id()
+        && node.identity.generation() == target.node_generation()
+    {
+        return Some(node);
+    }
+    node.children
+        .iter_mut()
+        .find_map(|child| find_node_by_target_mut(child, target))
 }
 
 fn pop_compatible_unkeyed(

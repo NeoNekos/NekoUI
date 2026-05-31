@@ -22,6 +22,13 @@ pub(super) struct GlyphDraw {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct GlyphDrawContext {
+    order: crate::scene::SceneOrder,
+    origin: LayoutRect,
+    clip: Option<LayoutRect>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct GlyphUv {
     pub(super) left: f32,
     pub(super) top: f32,
@@ -411,7 +418,13 @@ pub(super) fn collect_glyph_draws(
     draws.clear();
     let mut unsupported = GlyphUnsupportedReport::default();
     for item in prepared.draw_items() {
-        let DrawItemKind::Text { layout, color, .. } = item.kind() else {
+        let DrawItemKind::Text {
+            layout,
+            clip,
+            color,
+            ..
+        } = item.kind()
+        else {
             continue;
         };
         if color.srgb_channels().is_none() {
@@ -420,8 +433,11 @@ pub(super) fn collect_glyph_draws(
         push_layout_draws(
             draws,
             &mut unsupported,
-            item.order(),
-            item.rect(),
+            GlyphDrawContext {
+                order: item.order(),
+                origin: item.rect(),
+                clip: *clip,
+            },
             layout,
             *color,
             atlas,
@@ -433,8 +449,7 @@ pub(super) fn collect_glyph_draws(
 fn push_layout_draws(
     draws: &mut Vec<GlyphDraw>,
     unsupported: &mut GlyphUnsupportedReport,
-    order: crate::scene::SceneOrder,
-    origin: LayoutRect,
+    context: GlyphDrawContext,
     layout: &TextLayoutRef,
     color: Color,
     atlas: &GlyphAtlas,
@@ -453,14 +468,48 @@ fn push_layout_draws(
         if entry.width == 0 || entry.height == 0 {
             continue;
         }
+        let rect = glyph_rect(context.origin, *glyph, entry, scale_factor);
+        let uv = entry.uv(atlas.width, atlas.height)?;
+        let Some((rect, uv)) = clip_glyph_draw(rect, uv, context.clip) else {
+            continue;
+        };
         draws.push(GlyphDraw {
-            order,
-            rect: glyph_rect(origin, *glyph, entry, scale_factor),
-            uv: entry.uv(atlas.width, atlas.height)?,
+            order: context.order,
+            rect,
+            uv,
             color,
         });
     }
     Ok(())
+}
+
+fn clip_glyph_draw(
+    rect: LayoutRect,
+    uv: GlyphUv,
+    clip: Option<LayoutRect>,
+) -> Option<(LayoutRect, GlyphUv)> {
+    let Some(clip) = clip else {
+        return Some((rect, uv));
+    };
+    let clipped = rect.intersect(clip)?;
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return None;
+    }
+    let u_span = uv.right - uv.left;
+    let v_span = uv.bottom - uv.top;
+    let left_ratio = (clipped.x() - rect.x()) / rect.width();
+    let right_ratio = (clipped.x() + clipped.width() - rect.x()) / rect.width();
+    let top_ratio = (clipped.y() - rect.y()) / rect.height();
+    let bottom_ratio = (clipped.y() + clipped.height() - rect.y()) / rect.height();
+    Some((
+        clipped,
+        GlyphUv {
+            left: uv.left + u_span * left_ratio,
+            top: uv.top + v_span * top_ratio,
+            right: uv.left + u_span * right_ratio,
+            bottom: uv.top + v_span * bottom_ratio,
+        },
+    ))
 }
 
 fn glyph_rect(
@@ -566,6 +615,7 @@ mod tests {
             text: "A",
             style: style.text(),
             available_inline_width: None,
+            layout_mode: crate::text::TextLayoutMode::SoftWrap,
             font_generation: session.font_generation(),
             scale_generation: 1,
             scale_factor: 1.0,
@@ -871,8 +921,11 @@ mod tests {
         push_layout_draws(
             &mut draws,
             &mut unsupported,
-            crate::scene::SceneOrder::new(1),
-            LayoutRect::new(100.0, 50.0, 20.0, 10.0),
+            GlyphDrawContext {
+                order: crate::scene::SceneOrder::new(1),
+                origin: LayoutRect::new(100.0, 50.0, 20.0, 10.0),
+                clip: None,
+            },
             &layout,
             Color::rgb(1, 2, 3),
             &atlas,
@@ -882,6 +935,73 @@ mod tests {
         assert_eq!(draws.len(), 1);
         assert!(unsupported.is_empty());
         assert_eq!(draws[0].rect, LayoutRect::new(105.0, 54.0, 5.0, 3.0));
+    }
+
+    #[test]
+    fn clipped_glyph_draws_adjust_rect_and_uv_to_text_clip() {
+        let mut atlas = GlyphAtlas::new(16, 16).unwrap();
+        let key = test_glyph_key(1);
+        let bitmap = GlyphBitmap::new(key, 8, 4, 0, 0, std::sync::Arc::from([7_u8; 32]));
+        atlas.ensure_glyph(key, |_| Ok(bitmap)).unwrap();
+        let layout = test_text_layout(
+            std::sync::Arc::from([GlyphInstance::new(key, 0, 0)]),
+            std::sync::Arc::from([crate::text::GlyphDemand::new(key)]),
+        );
+        let mut draws = Vec::new();
+        let mut unsupported = GlyphUnsupportedReport::default();
+
+        push_layout_draws(
+            &mut draws,
+            &mut unsupported,
+            GlyphDrawContext {
+                order: crate::scene::SceneOrder::new(1),
+                origin: LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+                clip: Some(LayoutRect::new(2.0, 1.0, 4.0, 2.0)),
+            },
+            &layout,
+            Color::rgb(1, 2, 3),
+            &atlas,
+        )
+        .unwrap();
+
+        assert_eq!(draws.len(), 1);
+        assert!(unsupported.is_empty());
+        assert_eq!(draws[0].rect, LayoutRect::new(2.0, 1.0, 4.0, 2.0));
+        assert_eq!(draws[0].uv.left, 0.25);
+        assert_eq!(draws[0].uv.top, 0.1875);
+        assert_eq!(draws[0].uv.right, 0.5);
+        assert_eq!(draws[0].uv.bottom, 0.3125);
+    }
+
+    #[test]
+    fn fully_clipped_glyph_draws_are_skipped_without_unsupported_diagnostics() {
+        let mut atlas = GlyphAtlas::new(16, 16).unwrap();
+        let key = test_glyph_key(1);
+        let bitmap = GlyphBitmap::new(key, 2, 2, 0, 0, std::sync::Arc::from([7_u8; 4]));
+        atlas.ensure_glyph(key, |_| Ok(bitmap)).unwrap();
+        let layout = test_text_layout(
+            std::sync::Arc::from([GlyphInstance::new(key, 0, 0)]),
+            std::sync::Arc::from([crate::text::GlyphDemand::new(key)]),
+        );
+        let mut draws = Vec::new();
+        let mut unsupported = GlyphUnsupportedReport::default();
+
+        push_layout_draws(
+            &mut draws,
+            &mut unsupported,
+            GlyphDrawContext {
+                order: crate::scene::SceneOrder::new(1),
+                origin: LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+                clip: Some(LayoutRect::new(5.0, 5.0, 2.0, 2.0)),
+            },
+            &layout,
+            Color::rgb(1, 2, 3),
+            &atlas,
+        )
+        .unwrap();
+
+        assert!(draws.is_empty());
+        assert!(unsupported.is_empty());
     }
 
     #[test]
@@ -898,8 +1018,11 @@ mod tests {
         push_layout_draws(
             &mut draws,
             &mut unsupported,
-            crate::scene::SceneOrder::new(1),
-            LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            GlyphDrawContext {
+                order: crate::scene::SceneOrder::new(1),
+                origin: LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+                clip: None,
+            },
             &layout,
             Color::rgb(1, 2, 3),
             &atlas,
@@ -1066,6 +1189,7 @@ mod tests {
             style_generation: TextGeneration::INITIAL,
             text_hash: 1,
             available_inline_width_bits: None,
+            layout_mode: crate::text::TextLayoutMode::SoftWrap,
             font_size_bits: 12.0_f32.to_bits(),
             max_lines: None,
             text_overflow: crate::style::TextOverflow::Clip,
@@ -1084,6 +1208,7 @@ mod tests {
                 baseline: 0.0,
                 line_count: 1,
             },
+            LayoutRect::new(0.0, 0.0, 1.0, 1.0),
             glyphs,
             demands,
         ))
@@ -1101,6 +1226,7 @@ mod tests {
                 text_generation: crate::scene::SceneInputSignature::default(),
                 text_metrics_generation: 1,
                 layout,
+                clip: None,
                 color: Color::rgb(1, 2, 3),
             },
         )

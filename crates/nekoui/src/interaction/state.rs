@@ -32,6 +32,7 @@ pub(crate) struct InteractionState {
     hover: Option<InteractionTarget>,
     pressed: Option<InteractionTarget>,
     keyboard_focus: Option<InteractionTarget>,
+    text_input_focus: Option<InteractionTarget>,
     last_hover_position: Option<LayoutPoint>,
     scroll_offsets: BTreeMap<InteractionTarget, LayoutPoint>,
     modifiers: Modifiers,
@@ -49,6 +50,10 @@ impl InteractionState {
 
     pub(crate) fn keyboard_focus(&self) -> Option<InteractionTarget> {
         self.keyboard_focus
+    }
+
+    pub(crate) fn text_input_focus(&self) -> Option<InteractionTarget> {
+        self.text_input_focus
     }
 
     pub(crate) fn last_hover_position(&self) -> Option<LayoutPoint> {
@@ -98,6 +103,10 @@ impl InteractionState {
 
     pub(crate) fn set_keyboard_focus(&mut self, target: Option<InteractionTarget>) {
         self.keyboard_focus = target;
+    }
+
+    pub(crate) fn set_text_input_focus(&mut self, target: Option<InteractionTarget>) {
+        self.text_input_focus = target;
     }
 
     pub(crate) fn set_modifiers(&mut self, modifiers: Modifiers) {

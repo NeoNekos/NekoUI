@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::layout::LayoutRect;
 use crate::retained::{NodeGeneration, RetainedNodeId};
 use crate::style::{ResolvedTextStyle, TextOverflow};
 use crate::text::{
@@ -16,6 +17,14 @@ pub(crate) struct TextGeneration(u64);
 
 impl TextGeneration {
     pub(crate) const INITIAL: Self = Self(1);
+
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -54,6 +63,35 @@ impl TextMeasureErrorKind {
         match self {
             Self::InvalidStyle => "invalid_style",
             Self::ShapingFailed => "shaping_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) enum TextLayoutMode {
+    SoftWrap,
+    SingleLineInput,
+}
+
+impl TextLayoutMode {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::SoftWrap => 0,
+            Self::SingleLineInput => 1,
+        }
+    }
+
+    fn wrap(self) -> cosmic_text::Wrap {
+        match self {
+            Self::SoftWrap => cosmic_text::Wrap::WordOrGlyph,
+            Self::SingleLineInput => cosmic_text::Wrap::None,
+        }
+    }
+
+    fn height_limit(self, line_height: f32) -> Option<f32> {
+        match self {
+            Self::SoftWrap => None,
+            Self::SingleLineInput => Some(line_height),
         }
     }
 }
@@ -241,6 +279,7 @@ pub(crate) struct TextMeasureQuery<'a> {
     pub(crate) text: &'a str,
     pub(crate) style: &'a ResolvedTextStyle,
     pub(crate) available_inline_width: Option<f32>,
+    pub(crate) layout_mode: TextLayoutMode,
     pub(crate) font_generation: FontGeneration,
     pub(crate) scale_generation: u64,
     pub(crate) scale_factor: f32,
@@ -289,6 +328,7 @@ struct MemoKey {
     text_generation: TextGeneration,
     style_generation: TextGeneration,
     available_inline_width_bits: Option<u32>,
+    layout_mode: TextLayoutMode,
     font_size_bits: u32,
     line_height_policy: TextLineHeightPolicy,
     wrap_policy: TextWrapPolicy,
@@ -313,6 +353,7 @@ impl Ord for MemoKey {
                 self.available_inline_width_bits
                     .cmp(&other.available_inline_width_bits)
             })
+            .then_with(|| self.layout_mode.rank().cmp(&other.layout_mode.rank()))
             .then_with(|| self.font_size_bits.cmp(&other.font_size_bits))
             .then_with(|| {
                 self.line_height_policy
@@ -523,6 +564,7 @@ impl MemoKey {
             text_generation: query.text_generation,
             style_generation: query.style_generation,
             available_inline_width_bits: query.available_inline_width.map(f32::to_bits),
+            layout_mode: query.layout_mode,
             font_size_bits: query.style.font_size().as_px().to_bits(),
             line_height_policy: TextLineHeightPolicy::DEFAULT,
             wrap_policy: TextWrapPolicy::DEFAULT,
@@ -545,7 +587,12 @@ fn layout_uncached(
     let metrics = cosmic_text::Metrics::new(font_size, line_height);
     let buffer = font_manager.with_font_system(|font_system| {
         let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
-        buffer.set_size(font_system, query.available_inline_width, None);
+        buffer.set_wrap(font_system, query.layout_mode.wrap());
+        buffer.set_size(
+            font_system,
+            query.available_inline_width,
+            query.layout_mode.height_limit(line_height),
+        );
         buffer.set_text(
             font_system,
             query.text,
@@ -566,6 +613,7 @@ fn layout_uncached(
     let mut height = 0.0_f32;
     let mut baseline = 0.0_f32;
     let mut line_count = 0_usize;
+    let mut visible_trailing_caret_rect = LayoutRect::ZERO;
 
     for run in buffer.layout_runs() {
         line_count += 1;
@@ -576,6 +624,18 @@ fn layout_uncached(
         max_content_width = max_content_width.max(run.line_w);
         min_content_width = min_content_width.max(min_run_width(run.glyphs));
         height = height.max(run.line_top + run.line_height);
+        if query
+            .style
+            .max_lines()
+            .is_none_or(|max_lines| line_count <= max_lines.max(1))
+        {
+            visible_trailing_caret_rect = LayoutRect::new(
+                trailing_run_advance(run.glyphs),
+                run.line_top,
+                1.0,
+                run.line_height.max(1.0),
+            );
+        }
         for glyph in run.glyphs {
             let physical = glyph.physical((0.0, run.line_y), query.scale_factor);
             let key = GlyphKey::new(physical.cache_key, query.scale_factor);
@@ -597,6 +657,9 @@ fn layout_uncached(
     if query.text.is_empty() {
         height = line_height;
         baseline = font_size * 0.8;
+        visible_trailing_caret_rect = LayoutRect::new(0.0, 0.0, 1.0, line_height.max(1.0));
+    } else if visible_trailing_caret_rect == LayoutRect::ZERO {
+        visible_trailing_caret_rect = LayoutRect::new(width, 0.0, 1.0, height.max(1.0));
     }
 
     let layout_key = TextLayoutKey {
@@ -606,6 +669,7 @@ fn layout_uncached(
         style_generation: query.style_generation,
         text_hash: stable_text_hash(query.text),
         available_inline_width_bits: query.available_inline_width.map(f32::to_bits),
+        layout_mode: query.layout_mode,
         font_size_bits: query.style.font_size().as_px().to_bits(),
         max_lines: query.style.max_lines(),
         text_overflow: query.style.text_overflow(),
@@ -626,9 +690,17 @@ fn layout_uncached(
         generation,
         layout_key,
         metrics,
+        visible_trailing_caret_rect,
         Arc::from(glyphs),
         Arc::from(demands),
     )))
+}
+
+fn trailing_run_advance(glyphs: &[cosmic_text::LayoutGlyph]) -> f32 {
+    glyphs
+        .iter()
+        .map(|glyph| glyph.x + glyph.w)
+        .fold(0.0_f32, f32::max)
 }
 
 fn min_run_width(glyphs: &[cosmic_text::LayoutGlyph]) -> f32 {

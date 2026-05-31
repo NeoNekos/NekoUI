@@ -1,11 +1,11 @@
 use crate::app::{Context, Render};
-use crate::element::{Element, IntoElement, div, text};
+use crate::element::{Element, IntoElement, div, input, text};
 use crate::layout::LayoutSize;
 use crate::platform::{PhysicalSize, PlatformFact, Renderability};
 use crate::render::{DrawItemKind, RenderPass, prepare_frame_graph};
 use crate::runtime::Runtime;
 use crate::scene::ResourceDemandKind;
-use crate::style::{Color, StyleExt, opacity};
+use crate::style::{Color, StyleExt, opacity, px};
 use crate::window::WindowOptions;
 use nekoui_shader_types::ShaderBackendTarget;
 
@@ -120,6 +120,24 @@ fn text_draw_items_carry_private_layout_and_color() {
     assert_eq!(text.1, Color::rgb(11, 22, 33));
     assert!(!text.0.glyphs().is_empty());
     assert!(text.0.glyph_demands().len() <= text.0.glyphs().len());
+}
+
+#[test]
+fn input_text_draw_items_carry_private_content_clip() {
+    let scene = compile_scene(input("AAAA AAAA AAAA").w(px(36.0)));
+    let frame = prepare_frame_graph(&scene);
+    let text = frame
+        .draw_items()
+        .iter()
+        .find_map(|item| match item.kind() {
+            DrawItemKind::Text { clip, .. } => Some((*clip, item.rect())),
+            _ => None,
+        })
+        .unwrap();
+
+    assert!(text.0.is_some());
+    assert_eq!(text.0.unwrap().width(), 36.0);
+    assert!(text.1.x() <= text.0.unwrap().x());
 }
 
 #[test]

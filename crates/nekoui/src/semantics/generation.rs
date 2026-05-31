@@ -39,8 +39,17 @@ pub(crate) enum SemanticSignatureFact {
         len: usize,
         hash: u64,
     },
+    EditableValue {
+        len: usize,
+        generation: u64,
+        composing: bool,
+    },
     WindowFocus(bool),
     KeyboardFocus {
+        target_id: Option<u64>,
+        target_generation: Option<u64>,
+    },
+    TextInputFocus {
         target_id: Option<u64>,
         target_generation: Option<u64>,
     },
@@ -115,6 +124,7 @@ pub(crate) fn element_kind_fact(kind: ElementKind) -> u8 {
     match kind {
         ElementKind::Div => 1,
         ElementKind::Text => 2,
+        ElementKind::Input => 3,
     }
 }
 
@@ -150,6 +160,11 @@ pub(crate) fn interaction_signature(
     facts.push(SemanticSignatureFact::KeyboardFocus {
         target_id: keyboard_focus.map(|target| target.node_id().raw()),
         target_generation: keyboard_focus.map(|target| target.node_generation().raw()),
+    });
+    let text_input_focus = interaction.text_input_focus();
+    facts.push(SemanticSignatureFact::TextInputFocus {
+        target_id: text_input_focus.map(|target| target.node_id().raw()),
+        target_generation: text_input_focus.map(|target| target.node_generation().raw()),
     });
     facts.extend(interaction.scroll_offsets().map(|(target, offset)| {
         SemanticSignatureFact::ScrollOffset {

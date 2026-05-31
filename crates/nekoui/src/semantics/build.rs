@@ -13,7 +13,7 @@ use crate::semantics::generation::{
 };
 use crate::semantics::snapshot::{
     SemanticAction, SemanticNodeId, SemanticNodeParts, SemanticNodeSnapshot, SemanticRole,
-    SemanticStateSnapshot,
+    SemanticStateParts, SemanticStateSnapshot,
 };
 use crate::semantics::{SemanticBuildStats, SemanticTreeSnapshot};
 use crate::style::StyleTreeSnapshot;
@@ -138,13 +138,24 @@ impl<'a> SemanticBuilder<'a> {
         let role = semantic_role(retained, is_root);
         let (name, value) = semantic_name_and_value(retained);
         let scrollable = layout.scroll().scrollable();
-        let state = SemanticStateSnapshot::new(
-            retained.focusable(),
-            self.is_focused(retained),
-            self.interaction
+        let state = SemanticStateSnapshot::new(SemanticStateParts {
+            focusable: retained.focusable(),
+            focused: self.is_focused(retained),
+            window_focused: self
+                .interaction
                 .is_some_and(InteractionState::window_focused),
             scrollable,
-        );
+            editable: retained.editable().is_some(),
+            selection: retained.text_block().map(|block| block.selection()),
+            composition: retained
+                .text_block()
+                .and_then(|block| block.composition().map(|composition| composition.range())),
+            composition_cursor: retained.text_block().and_then(|block| {
+                block
+                    .composition()
+                    .and_then(|composition| composition.cursor())
+            }),
+        });
         let actions = semantic_actions(retained, scrollable);
         if requires_accessible_name(retained) && name.as_deref().is_none_or(str::is_empty) {
             self.record_missing_name(retained, role);
@@ -203,7 +214,13 @@ impl<'a> SemanticBuilder<'a> {
 
     fn is_focused(&self, retained: &RetainedNodeSnapshot) -> bool {
         self.interaction
-            .and_then(InteractionState::keyboard_focus)
+            .and_then(|state| {
+                if retained.kind() == ElementKind::Input {
+                    state.text_input_focus()
+                } else {
+                    state.keyboard_focus()
+                }
+            })
             .is_some_and(|target| {
                 target == InteractionTarget::new(retained.id(), retained.generation())
             })
@@ -327,6 +344,8 @@ fn semantic_bounds(retained: &RetainedNodeSnapshot, layout: &LayoutNodeSnapshot)
 fn semantic_role(retained: &RetainedNodeSnapshot, is_root: bool) -> SemanticRole {
     if is_root {
         SemanticRole::Window
+    } else if retained.kind() == ElementKind::Input {
+        SemanticRole::Textbox
     } else if retained.kind() == ElementKind::Text {
         SemanticRole::Text
     } else {
@@ -335,11 +354,18 @@ fn semantic_role(retained: &RetainedNodeSnapshot, is_root: bool) -> SemanticRole
 }
 
 fn semantic_name_and_value(retained: &RetainedNodeSnapshot) -> (Option<String>, Option<String>) {
-    if retained.kind() != ElementKind::Text {
-        return (None, None);
+    if retained.kind() == ElementKind::Input {
+        let value = retained
+            .text_block()
+            .map(|block| block.committed().to_owned())
+            .unwrap_or_default();
+        return (Some(value.clone()), Some(value));
     }
-    let value = retained.text().unwrap_or_default().to_owned();
-    (Some(value.clone()), Some(value))
+    if retained.kind() == ElementKind::Text {
+        let value = retained.text().unwrap_or_default().to_owned();
+        return (Some(value.clone()), Some(value));
+    }
+    (None, None)
 }
 
 fn semantic_actions(retained: &RetainedNodeSnapshot, scrollable: bool) -> Vec<SemanticAction> {
@@ -352,6 +378,9 @@ fn semantic_actions(retained: &RetainedNodeSnapshot, scrollable: bool) -> Vec<Se
     }
     if scrollable {
         actions.push(SemanticAction::Scroll);
+    }
+    if retained.kind() == ElementKind::Input {
+        actions.push(SemanticAction::Edit);
     }
     actions
 }
@@ -389,7 +418,15 @@ fn collect_retained_semantic_node(
         click: node.handlers().has_click(),
         key: node.handlers().has_key_handlers(),
     });
-    if node.kind() == ElementKind::Text {
+    if node.kind() == ElementKind::Input {
+        if let Some(block) = node.text_block() {
+            facts.push(SemanticSignatureFact::EditableValue {
+                len: block.committed().len(),
+                generation: block.generation().raw(),
+                composing: block.has_composition(),
+            });
+        }
+    } else if node.kind() == ElementKind::Text {
         let text = node.text().unwrap_or_default();
         facts.push(SemanticSignatureFact::TextValue {
             len: text.len(),

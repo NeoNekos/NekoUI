@@ -12,7 +12,7 @@ use crate::layout::{LayoutNodeSnapshot, LayoutRect, LayoutSize, ScrollGeometry, 
 use crate::retained::{RetainedIdentity, RetainedLayoutInput, RetainedLayoutNode};
 use crate::style::{Dimension, Display, Length, ResolvedLayoutStyle, ResolvedTextStyle};
 use crate::text::{
-    FontManager, TextGeneration, TextLayoutRef, TextLayoutResult, TextMeasureQuery,
+    FontManager, TextGeneration, TextLayoutMode, TextLayoutRef, TextLayoutResult, TextMeasureQuery,
     TextMeasureSession, TextMeasureStats,
 };
 
@@ -40,6 +40,8 @@ enum MeasureContext {
         node_generation: crate::retained::NodeGeneration,
         text: std::sync::Arc<str>,
         style: std::sync::Arc<ResolvedTextStyle>,
+        text_generation: TextGeneration,
+        layout_mode: TextLayoutMode,
         scale_generation: u64,
         scale_factor: f32,
         text_layout: Option<TextLayoutRef>,
@@ -121,6 +123,10 @@ pub(crate) fn compute(
     })
 }
 
+fn text_capable_kind(kind: ElementKind) -> bool {
+    matches!(kind, ElementKind::Text | ElementKind::Input)
+}
+
 fn build_node(
     tree: &mut TaffyTree<MeasureContext>,
     node: RetainedLayoutNode<'_>,
@@ -131,7 +137,7 @@ fn build_node(
         return Ok(None);
     }
     validate_layout_style(node.resolved_style().layout())?;
-    if node.kind() == ElementKind::Text {
+    if text_capable_kind(node.kind()) {
         validate_text_style(node)?;
     }
 
@@ -146,7 +152,7 @@ fn build_node(
 
     let style = to_taffy_style(node.resolved_style().layout(), is_root, viewport);
     let taffy_id = if children.is_empty() {
-        if node.kind() == ElementKind::Text {
+        if text_capable_kind(node.kind()) {
             tree.new_leaf_with_context(style, text_measure_context(node, viewport))
         } else {
             tree.new_leaf(style)
@@ -252,11 +258,21 @@ fn text_measure_context(node: RetainedLayoutNode<'_>, viewport: Viewport) -> Mea
     MeasureContext::Text {
         node_id: node.identity().id(),
         node_generation: node.identity().generation(),
-        text: std::sync::Arc::<str>::from(node.text().unwrap_or_default()),
+        text: std::sync::Arc::<str>::from(node.display_text().unwrap_or_default()),
         style: std::sync::Arc::new(node.resolved_style().text().clone()),
+        text_generation: node.text_generation(),
+        layout_mode: text_layout_mode(node.kind()),
         scale_generation: viewport.generation().raw(),
         scale_factor: viewport.scale_factor(),
         text_layout: None,
+    }
+}
+
+fn text_layout_mode(kind: ElementKind) -> TextLayoutMode {
+    match kind {
+        ElementKind::Text => TextLayoutMode::SoftWrap,
+        ElementKind::Input => TextLayoutMode::SingleLineInput,
+        ElementKind::Div => TextLayoutMode::SoftWrap,
     }
 }
 
@@ -283,6 +299,8 @@ fn measure_content(
             node_generation,
             text,
             style,
+            text_generation,
+            layout_mode,
             scale_generation,
             scale_factor,
             text_layout,
@@ -295,11 +313,12 @@ fn measure_content(
             let query = TextMeasureQuery {
                 node_id: *node_id,
                 node_generation: *node_generation,
-                text_generation: TextGeneration::INITIAL,
+                text_generation: *text_generation,
                 style_generation: TextGeneration::INITIAL,
                 text,
                 style,
                 available_inline_width,
+                layout_mode: *layout_mode,
                 font_generation,
                 scale_generation: *scale_generation,
                 scale_factor: *scale_factor,
@@ -467,7 +486,7 @@ fn count_snapshot(node: &LayoutNodeSnapshot) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::element::{IntoElement, div, text};
+    use crate::element::{IntoElement, div, input, text};
     use crate::error::ErrorKind;
     use crate::layout::{LayoutSize, Viewport, compute_layout};
     use crate::retained::RetainedTree;
@@ -530,5 +549,37 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.error().kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn layout_keeps_long_input_single_line_while_text_wraps() {
+        let long_text = "AAAA AAAA AAAA AAAA";
+        let mut tree = RetainedTree::default();
+        tree.diff_root(
+            div()
+                .key("root")
+                .w(px(36.0))
+                .child(input(long_text).key("field").font_size(px(12.0)))
+                .child(text(long_text).key("label").font_size(px(12.0)))
+                .into_element(),
+        );
+
+        let output = compute_layout(
+            tree.layout_input(),
+            Viewport::new(LayoutSize::new(200.0, 200.0), 1.0),
+            None,
+            &FontManager::default(),
+        )
+        .unwrap();
+        let field = output.snapshot.find_by_key("field").unwrap();
+        let label = output.snapshot.find_by_key("label").unwrap();
+        let field_metrics = field.text_layout().unwrap().metrics();
+        let label_metrics = label.text_layout().unwrap().metrics();
+
+        assert_eq!(field_metrics.line_count, 1);
+        assert!(field_metrics.width > field.content_rect().width());
+        assert!(field.border_rect().height() <= field_metrics.height + 0.01);
+        assert!(label_metrics.line_count > 1);
+        assert!(label.border_rect().height() > field.border_rect().height());
     }
 }

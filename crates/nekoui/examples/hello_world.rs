@@ -1,4 +1,5 @@
 use nekoui::prelude::*;
+use tracing_subscriber::EnvFilter;
 
 // Foundation-only example: this opens a native OS window and runs until the
 // window is closed. Windows has a private D3D11 backend that draws supported
@@ -25,10 +26,19 @@ impl Render for HelloWorld {
     }
 }
 
-fn main() -> NekoResult<()> {
-    Application::new().run(|cx| {
+fn run_example() {
+        Application::new().run(|cx| {
         cx.windows()
             .open(WindowOptions::new().title("Hello NekoUI"), |_| HelloWorld)?;
         Ok(())
-    })
+    }).unwrap();
+}
+
+fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")))
+        .with_thread_names(true)
+        .init();
+
+    run_example();
 }

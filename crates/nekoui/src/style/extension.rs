@@ -1,4 +1,4 @@
-use crate::element::{Div, Element, Text};
+use crate::element::{Div, Element, Input, Text};
 use crate::style::{Color, Dimension, Display, Length, Opacity, Overflow, StyleDeclaration};
 
 pub trait StyleExt: Sized {
@@ -210,6 +210,15 @@ impl StyleExt for Text {
     }
 }
 
+impl StyleExt for Input {
+    fn update_style<F>(mut self, update: F) -> Self
+    where
+        F: FnOnce(&mut StyleDeclaration),
+    {
+        update(self.style_mut());
+        self
+    }
+}
 impl StyleExt for Element {
     fn update_style<F>(mut self, update: F) -> Self
     where

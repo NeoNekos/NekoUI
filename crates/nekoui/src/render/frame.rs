@@ -204,6 +204,7 @@ pub(crate) enum DrawItemKind {
         text_generation: SceneInputSignature,
         text_metrics_generation: u64,
         layout: TextLayoutRef,
+        clip: Option<LayoutRect>,
         color: Color,
     },
     ClipPush,
