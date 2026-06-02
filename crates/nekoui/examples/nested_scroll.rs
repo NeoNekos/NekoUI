@@ -134,18 +134,22 @@ fn horizontal_scroll_shell() -> impl IntoElement {
 }
 
 fn run_example() {
-    Application::new().run(|cx| {
-        cx.windows()
-            .open(WindowOptions::new().title("NekoUI Nested Scroll"), |_| {
-                NestedScroll
-            })?;
-        Ok(())
-    }).unwrap();
+    Application::new()
+        .run(|cx| {
+            cx.windows()
+                .open(WindowOptions::new().title("NekoUI Nested Scroll"), |_| {
+                    NestedScroll
+                })?;
+            Ok(())
+        })
+        .unwrap();
 }
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
+        )
         .with_thread_names(true)
         .init();
 

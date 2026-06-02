@@ -24,7 +24,6 @@ fontdb.workspace = true
 image.workspace = true
 lyon_path.workspace = true
 lyon_tessellation.workspace = true
-nekoui-shader-types.workspace = true
 parking_lot.workspace = true
 raw-window-handle.workspace = true
 resvg.workspace = true
@@ -41,6 +40,9 @@ winit.workspace = true
 accesskit_winit = { workspace = true, optional = true }
 arboard = { workspace = true, optional = true }
 rfd = { workspace = true, optional = true }
+
+[build-dependencies]
+nekoui-build = { path = "../nekoui-build" }
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
@@ -59,7 +61,6 @@ objc2-metal.workspace = true
 default = []
 advanced = []
 canvas = []
-canvas-precompiled-shaders = ["canvas"]
 canvas-debug-shaders = ["canvas"]
 clipboard = ["dep:arboard"]
 dialogs = ["dep:rfd"]
@@ -77,4 +78,3 @@ video = [] # TODO
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sha2.workspace = true

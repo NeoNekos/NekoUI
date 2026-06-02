@@ -26,17 +26,17 @@ pub(super) fn glyph_mono_pixel_shader_bytes() -> NekoResult<&'static [u8]> {
 fn checked_bytes(bytes: &'static [u8], label: &'static str) -> NekoResult<&'static [u8]> {
     if bytes.is_empty() {
         return Err(NekoError::unsupported(format!(
-            "{label} is empty; generate checked .cso artifacts with the Windows manual shader validation path"
+            "{label} is empty; build.rs must generate framework shader DXBC artifacts into OUT_DIR"
         )));
     }
     if bytes.starts_with(DXBC_PLACEHOLDER_PREFIX) {
         return Err(NekoError::unsupported(format!(
-            "{label} is a placeholder; generate checked .cso artifacts with the Windows manual shader validation path"
+            "{label} is a placeholder; build.rs must fail instead of generating placeholder DXBC"
         )));
     }
     if !bytes.starts_with(DXBC_MAGIC) {
         return Err(NekoError::unsupported(format!(
-            "{label} is not a DXBC shader blob; generate checked .cso artifacts with the Windows manual shader validation path"
+            "{label} is not a DXBC shader blob; build.rs must generate valid DXBC artifacts into OUT_DIR"
         )));
     }
     Ok(bytes)

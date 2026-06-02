@@ -1689,7 +1689,6 @@ dependencies = [
  "num-traits",
  "once_cell",
  "rustc-hash 1.1.0",
- "spirv",
  "thiserror 2.0.18",
  "unicode-ident",
 ]
@@ -1726,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "nekoui"
-version = "0.0.75"
+version = "0.0.76"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -1741,7 +1740,7 @@ dependencies = [
  "image",
  "lyon_path",
  "lyon_tessellation",
- "nekoui-shader-types",
+ "nekoui-build",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
@@ -1750,7 +1749,6 @@ dependencies = [
  "raw-window-handle",
  "resvg",
  "rfd",
- "sha2",
  "slotmap",
  "smallvec",
  "swash",
@@ -1766,17 +1764,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "nekoui-shader-build"
-version = "0.0.75"
+name = "nekoui-build"
+version = "0.0.76"
 dependencies = [
  "naga",
- "nekoui-shader-types",
  "wesl",
 ]
-
-[[package]]
-name = "nekoui-shader-types"
-version = "0.0.75"
 
 [[package]]
 name = "new_debug_unreachable"
@@ -2756,17 +2749,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures",
- "digest",
-]
-
-[[package]]
 name = "sha3"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2908,15 +2890,6 @@ name = "smol_str"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa7368fcf4852a4c2dd92df0cace6a71f2091ca0a23391ce7f3a31833f1523"
-
-[[package]]
-name = "spirv"
-version = "0.4.0+sdk-1.4.341.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
-dependencies = [
- "bitflags 2.11.1",
-]
 
 [[package]]
 name = "static_assertions"

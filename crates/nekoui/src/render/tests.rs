@@ -7,7 +7,6 @@ use crate::runtime::Runtime;
 use crate::scene::ResourceDemandKind;
 use crate::style::{Color, StyleExt, opacity, px};
 use crate::window::WindowOptions;
-use nekoui_shader_types::ShaderBackendTarget;
 
 #[derive(Debug)]
 struct TestRoot {
@@ -263,217 +262,185 @@ fn rect_draw_items_preserve_color_and_order() {
 }
 
 #[test]
-fn shader_manifest_and_snapshots_are_consistent_for_solid_rect() {
-    assert_eq!(
-        crate::render::SOLID_RECT_MANIFEST.shader.as_str(),
-        "core.solid_rect"
+fn generated_framework_shader_registry_contains_required_artifacts() {
+    assert_eq!(crate::render::CORE_SHADERS.len(), 2);
+    assert_generated_shader(
+        crate::render::core_shader(crate::render::CoreShader::SolidRect),
+        "core.solid_rect",
+        24,
+        &[
+            ("LOC", 0, 0, "R32G32_FLOAT"),
+            ("LOC", 1, 8, "R32G32B32A32_FLOAT"),
+        ],
     );
-    assert_eq!(crate::render::SOLID_RECT_MANIFEST.vertex_stride, 24);
-    assert_eq!(
-        crate::render::SOLID_RECT_MANIFEST.vertex_attributes[0].offset,
-        0
+    assert_generated_shader(
+        crate::render::core_shader(crate::render::CoreShader::GlyphMono),
+        "core.glyph_mono",
+        32,
+        &[
+            ("LOC", 0, 0, "R32G32_FLOAT"),
+            ("LOC", 1, 8, "R32G32_FLOAT"),
+            ("LOC", 2, 16, "R32G32B32A32_FLOAT"),
+        ],
     );
-    assert_eq!(
-        crate::render::SOLID_RECT_MANIFEST.vertex_attributes[1].offset,
-        8
-    );
-    assert!(crate::render::SOLID_RECT_WGSL.contains("fn vs_main"));
-    assert!(crate::render::SOLID_RECT_D3D11_VERTEX_HLSL.contains("vs_main"));
-    assert!(crate::render::SOLID_RECT_D3D11_FRAGMENT_HLSL.contains("fs_main"));
-
-    assert_artifact(
-        ShaderBackendTarget::Wgsl,
-        crate::render::SOLID_RECT_WGSL.as_bytes(),
-        false,
-    );
-    assert_artifact(
-        ShaderBackendTarget::D3d11Sm5VertexHlsl,
-        crate::render::SOLID_RECT_D3D11_VERTEX_HLSL.as_bytes(),
-        false,
-    );
-    assert_artifact(
-        ShaderBackendTarget::D3d11Sm5FragmentHlsl,
-        crate::render::SOLID_RECT_D3D11_FRAGMENT_HLSL.as_bytes(),
-        false,
-    );
-    assert_artifact(
-        ShaderBackendTarget::D3d11Sm5VertexDxbc,
-        crate::render::SOLID_RECT_D3D11_VERTEX_DXBC,
-        true,
-    );
-    assert_artifact(
-        ShaderBackendTarget::D3d11Sm5FragmentDxbc,
-        crate::render::SOLID_RECT_D3D11_FRAGMENT_DXBC,
-        true,
-    );
-
-    let manifest = std::fs::read_to_string("shaders/generated/solid_rect.manifest.toml").unwrap();
-    for entry_point in crate::render::SOLID_RECT_MANIFEST.entry_points {
-        assert_manifest_entry_point(&manifest, entry_point);
-    }
-    for target in crate::render::SOLID_RECT_MANIFEST.targets {
-        assert_manifest_target(&manifest, target);
-    }
 }
 
 #[test]
-fn shader_manifest_and_snapshots_are_consistent_for_glyph_mono() {
-    assert_eq!(
-        crate::render::GLYPH_MONO_MANIFEST.shader.as_str(),
-        "core.glyph_mono"
-    );
-    assert_eq!(crate::render::GLYPH_MONO_MANIFEST.vertex_stride, 32);
-    assert_eq!(
-        crate::render::GLYPH_MONO_MANIFEST.vertex_attributes[0].offset,
-        0
-    );
-    assert_eq!(
-        crate::render::GLYPH_MONO_MANIFEST.vertex_attributes[1].offset,
-        8
-    );
-    assert_eq!(
-        crate::render::GLYPH_MONO_MANIFEST.vertex_attributes[2].offset,
-        16
-    );
+fn generated_framework_shader_artifacts_are_complete_and_distinct() {
+    assert!(crate::render::SOLID_RECT_WGSL.contains("fn vs_main"));
+    assert!(crate::render::SOLID_RECT_D3D11_VERTEX_HLSL.contains("vs_main"));
+    assert!(crate::render::SOLID_RECT_D3D11_FRAGMENT_HLSL.contains("fs_main"));
+    assert_target_dxbc_bytes(crate::render::SOLID_RECT_D3D11_VERTEX_DXBC);
+    assert_target_dxbc_bytes(crate::render::SOLID_RECT_D3D11_FRAGMENT_DXBC);
+
     assert!(crate::render::GLYPH_MONO_WGSL.contains("textureSample"));
-    assert!(crate::render::GLYPH_MONO_D3D11_VERTEX_HLSL.contains("TEXCOORD0"));
+    assert!(crate::render::SOLID_RECT_D3D11_VERTEX_HLSL.contains("LOC0"));
+    assert!(crate::render::SOLID_RECT_D3D11_VERTEX_HLSL.contains("LOC1"));
+    assert!(crate::render::GLYPH_MONO_D3D11_VERTEX_HLSL.contains("LOC0"));
+    assert!(crate::render::GLYPH_MONO_D3D11_VERTEX_HLSL.contains("LOC1"));
+    assert!(crate::render::GLYPH_MONO_D3D11_VERTEX_HLSL.contains("LOC2"));
     assert!(crate::render::GLYPH_MONO_D3D11_FRAGMENT_HLSL.contains("glyph_atlas"));
+    assert!(crate::render::GLYPH_MONO_D3D11_FRAGMENT_HLSL.contains("fs_main("));
+    assert!(crate::render::GLYPH_MONO_D3D11_FRAGMENT_HLSL.contains("SamplerState glyph_sampler"));
+    assert!(!crate::render::GLYPH_MONO_D3D11_FRAGMENT_HLSL.contains("nagaSamplerHeap"));
+    assert!(!crate::render::GLYPH_MONO_D3D11_FRAGMENT_HLSL.contains("nagaGroup0SamplerIndexArray"));
+    assert_target_dxbc_bytes(crate::render::GLYPH_MONO_D3D11_VERTEX_DXBC);
+    assert_target_dxbc_bytes(crate::render::GLYPH_MONO_D3D11_FRAGMENT_DXBC);
+
     assert_ne!(
         crate::render::GLYPH_MONO_WGSL,
         crate::render::SOLID_RECT_WGSL
     );
-    assert_ne!(
-        crate::render::GLYPH_MONO_D3D11_VERTEX_DXBC,
-        crate::render::SOLID_RECT_D3D11_VERTEX_DXBC
-    );
-    assert_ne!(
-        crate::render::GLYPH_MONO_D3D11_FRAGMENT_DXBC,
-        crate::render::SOLID_RECT_D3D11_FRAGMENT_DXBC
-    );
-
-    for (target, bytes, checked_binary) in [
-        (
-            ShaderBackendTarget::Wgsl,
-            crate::render::GLYPH_MONO_WGSL.as_bytes(),
-            false,
-        ),
-        (
-            ShaderBackendTarget::D3d11Sm5VertexHlsl,
-            crate::render::GLYPH_MONO_D3D11_VERTEX_HLSL.as_bytes(),
-            false,
-        ),
-        (
-            ShaderBackendTarget::D3d11Sm5FragmentHlsl,
-            crate::render::GLYPH_MONO_D3D11_FRAGMENT_HLSL.as_bytes(),
-            false,
-        ),
-        (
-            ShaderBackendTarget::D3d11Sm5VertexDxbc,
+    if cfg!(target_os = "windows") {
+        assert_ne!(
             crate::render::GLYPH_MONO_D3D11_VERTEX_DXBC,
-            true,
-        ),
-        (
-            ShaderBackendTarget::D3d11Sm5FragmentDxbc,
+            crate::render::SOLID_RECT_D3D11_VERTEX_DXBC
+        );
+        assert_ne!(
             crate::render::GLYPH_MONO_D3D11_FRAGMENT_DXBC,
-            true,
-        ),
-    ] {
-        assert_artifact_for_manifest(
-            &crate::render::GLYPH_MONO_MANIFEST,
-            target,
-            bytes,
-            checked_binary,
+            crate::render::SOLID_RECT_D3D11_FRAGMENT_DXBC
         );
     }
-    let manifest = std::fs::read_to_string("shaders/generated/glyph_mono.manifest.toml").unwrap();
-    for entry_point in crate::render::GLYPH_MONO_MANIFEST.entry_points {
-        assert_manifest_entry_point(&manifest, entry_point);
-    }
-    for target in crate::render::GLYPH_MONO_MANIFEST.targets {
-        assert_manifest_target(&manifest, target);
+}
+
+#[test]
+fn framework_shader_source_and_generated_artifacts_use_approved_locations() {
+    assert!(std::path::Path::new("src/platform/shader/solid_rect.wesl").is_file());
+    assert!(std::path::Path::new("src/platform/shader/glyph_mono.wesl").is_file());
+    assert!(!std::path::Path::new("shaders").exists());
+    assert!(!std::path::Path::new("../nekoui-shader-types").exists());
+    assert!(!std::path::Path::new("../nekoui-shader-build").exists());
+}
+
+#[test]
+fn build_script_dxbc_fail_fast_diagnostic_is_actionable() {
+    let build_script = build_script_sources();
+
+    assert!(build_script.contains("NEKOUI_FXC"));
+    assert!(build_script.contains("PATH"));
+    assert!(
+        build_script.contains("https://developer.microsoft.com/windows/downloads/windows-sdk/")
+    );
+    assert!(build_script.contains("https://github.com/microsoft/DirectXShaderCompiler/releases"));
+    assert!(build_script.contains("no placeholder artifact will be generated"));
+    assert!(!build_script.contains("NEKOUI_DXBC_PLACEHOLDER_V0"));
+}
+
+#[test]
+fn framework_shader_build_script_does_not_reuse_checked_in_artifacts() {
+    let render_shaders = std::fs::read_to_string("src/render/shaders.rs").unwrap();
+    let build_script = build_script_sources();
+
+    assert!(render_shaders.contains("OUT_DIR"));
+    for source in [render_shaders.as_str(), build_script.as_str()] {
+        assert!(!source.contains("shaders/generated"));
+        assert!(!source.contains("shaders/artifacts"));
+        assert!(!source.contains("shaders/framework"));
+        assert!(!source.contains("nekoui_shader_types"));
     }
 }
 
-fn assert_artifact(target: ShaderBackendTarget, bytes: &[u8], checked_binary: bool) {
-    assert_artifact_for_manifest(
-        &crate::render::SOLID_RECT_MANIFEST,
-        target,
-        bytes,
-        checked_binary,
+#[test]
+fn generated_framework_shader_metadata_reflects_glyph_resources() {
+    let shader = crate::render::core_shader(crate::render::CoreShader::GlyphMono);
+    assert_eq!(shader.d3d11_resource_bindings.len(), 2);
+    assert_eq!(
+        shader.d3d11_resource_bindings[0],
+        crate::render::D3d11ResourceBinding {
+            name: "glyph_atlas",
+            group: 0,
+            binding: 0,
+            register_class: "srv",
+            slot: crate::render::GLYPH_MONO_GLYPH_ATLAS_D3D11_SRV_SLOT,
+        }
+    );
+    assert_eq!(
+        shader.d3d11_resource_bindings[1],
+        crate::render::D3d11ResourceBinding {
+            name: "glyph_sampler",
+            group: 0,
+            binding: 1,
+            register_class: "sampler",
+            slot: crate::render::GLYPH_MONO_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT,
+        }
+    );
+    assert_eq!(crate::render::GLYPH_MONO_GLYPH_ATLAS_D3D11_SRV_SLOT, 0);
+    assert_eq!(
+        crate::render::GLYPH_MONO_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT,
+        0
     );
 }
 
-fn assert_artifact_for_manifest(
-    manifest: &nekoui_shader_types::CoreShaderManifest,
-    target: ShaderBackendTarget,
-    bytes: &[u8],
-    checked_binary: bool,
+fn build_script_sources() -> String {
+    let mut combined = std::fs::read_to_string("build.rs").unwrap();
+    for path in [
+        "../nekoui-build/src/lib.rs",
+        "../nekoui-build/src/shader/mod.rs",
+        "../nekoui-build/src/shader/discovery.rs",
+        "../nekoui-build/src/shader/dxbc.rs",
+        "../nekoui-build/src/shader/hlsl.rs",
+        "../nekoui-build/src/shader/metadata.rs",
+        "../nekoui-build/src/shader/rust_module.rs",
+    ] {
+        combined.push_str(&std::fs::read_to_string(path).unwrap());
+    }
+    combined
+}
+
+fn assert_generated_shader(
+    shader: &crate::render::CoreShaderArtifacts,
+    name: &str,
+    vertex_stride: u32,
+    attributes: &[(&str, u32, u32, &str)],
 ) {
-    let manifest = manifest
-        .targets
-        .iter()
-        .find(|candidate| candidate.target == target)
-        .unwrap();
-    assert_eq!(manifest.checked_binary, checked_binary);
-    let actual_sha256 = if checked_binary {
-        sha256_hex(bytes)
-    } else {
-        sha256_text_bytes_hex(bytes)
-    };
-    assert_eq!(actual_sha256, manifest.sha256);
-    if checked_binary {
-        assert!(bytes.starts_with(b"DXBC"));
+    assert_eq!(shader.name, name);
+    assert_eq!(shader.vertex_stride, vertex_stride);
+    assert_eq!(shader.entry_points.len(), 2);
+    assert_eq!(shader.entry_points[0].stage, "vertex");
+    assert_eq!(shader.entry_points[0].name, "vs_main");
+    assert_eq!(shader.entry_points[1].stage, "fragment");
+    assert_eq!(shader.entry_points[1].name, "fs_main");
+    assert_eq!(shader.vertex_attributes.len(), attributes.len());
+    assert!(!shader.wgsl.is_empty());
+    assert!(!shader.d3d11_vertex_hlsl.is_empty());
+    assert!(!shader.d3d11_fragment_hlsl.is_empty());
+    assert_target_dxbc_bytes(shader.d3d11_vertex_dxbc);
+    assert_target_dxbc_bytes(shader.d3d11_fragment_dxbc);
+
+    for (actual, expected) in shader.vertex_attributes.iter().zip(attributes) {
+        assert_eq!(actual.semantic, expected.0);
+        assert_eq!(actual.semantic_index, expected.1);
+        assert_eq!(actual.offset, expected.2);
+        assert_eq!(actual.format, expected.3);
     }
 }
 
-fn sha256_text_bytes_hex(bytes: &[u8]) -> String {
-    let text = std::str::from_utf8(bytes).expect("shader text artifacts should be valid UTF-8");
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    sha256_hex(normalized.as_bytes())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn assert_manifest_target(manifest: &str, target: &nekoui_shader_types::ShaderArtifactTarget) {
-    let expected_target = format!("target = \"{}\"", target.target.as_str());
-    let block = manifest
-        .split("[[targets]]")
-        .skip(1)
-        .find(|block| block.contains(&expected_target))
-        .unwrap_or_else(|| {
-            panic!(
-                "missing manifest target block for {}",
-                target.target.as_str()
-            )
-        });
-
-    assert!(block.contains(&format!("path = \"{}\"", target.path)));
-    assert!(block.contains(&format!("sha256 = \"{}\"", target.sha256)));
-    assert!(block.contains(&format!("checked_binary = {}", target.checked_binary)));
-}
-
-fn assert_manifest_entry_point(
-    manifest: &str,
-    entry_point: &nekoui_shader_types::ShaderEntryPoint,
-) {
-    let expected_stage = format!("stage = \"{}\"", entry_point.stage.as_str());
-    let block = manifest
-        .split("[[entry_points]]")
-        .skip(1)
-        .find(|block| block.contains(&expected_stage))
-        .unwrap_or_else(|| {
-            panic!(
-                "missing manifest entry point block for {}",
-                entry_point.stage.as_str()
-            )
-        });
-
-    assert!(block.contains(&format!("name = \"{}\"", entry_point.name)));
+fn assert_target_dxbc_bytes(bytes: &[u8]) {
+    if cfg!(target_os = "windows") {
+        assert!(bytes.starts_with(b"DXBC"));
+    } else {
+        assert!(bytes.is_empty());
+    }
 }
 
 #[test]
@@ -482,6 +449,9 @@ fn runtime_dependencies_do_not_include_wesl_or_naga_tooling() {
     let dependencies = manifest
         .split("[dependencies]")
         .nth(1)
+        .unwrap()
+        .split("[build-dependencies]")
+        .next()
         .unwrap()
         .split("[target.")
         .next()

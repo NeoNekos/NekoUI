@@ -1,15 +1,13 @@
 [package]
-name = "nekoui-shader-build"
+name = "nekoui-build"
+description = "build workflows tool"
 version.workspace = true
 edition.workspace = true
-authors.workspace = true
-license.workspace = true
-publish = true
+publish = false
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
 naga.workspace = true
-nekoui-shader-types.workspace = true
 wesl.workspace = true

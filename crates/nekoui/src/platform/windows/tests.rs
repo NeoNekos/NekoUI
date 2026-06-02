@@ -447,7 +447,7 @@ fn manual_windows_d3d11_resize_generation_smoke() -> NekoResult<()> {
 }
 
 #[test]
-#[ignore = "manual Windows D3D11/DXGI smoke: draws solid rects using checked shader artifacts"]
+#[ignore = "manual Windows D3D11/DXGI smoke: draws solid rects using generated framework shader artifacts"]
 fn manual_windows_d3d11_solid_rect_smoke() -> NekoResult<()> {
     run_manual_windows_backend_smoke(
         "NekoUI D3D11 solid rect smoke - expect visible dark and blue rects",

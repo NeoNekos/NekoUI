@@ -284,7 +284,7 @@ fn vertex_buffer_byte_width(vertex_capacity: usize) -> NekoResult<u32> {
 fn input_elements() -> [D3D11_INPUT_ELEMENT_DESC; 2] {
     [
         D3D11_INPUT_ELEMENT_DESC {
-            SemanticName: s!("POSITION"),
+            SemanticName: s!("LOC"),
             SemanticIndex: 0,
             Format: DXGI_FORMAT_R32G32_FLOAT,
             InputSlot: 0,
@@ -293,8 +293,8 @@ fn input_elements() -> [D3D11_INPUT_ELEMENT_DESC; 2] {
             InstanceDataStepRate: 0,
         },
         D3D11_INPUT_ELEMENT_DESC {
-            SemanticName: s!("COLOR"),
-            SemanticIndex: 0,
+            SemanticName: s!("LOC"),
+            SemanticIndex: 1,
             Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
             InputSlot: 0,
             AlignedByteOffset: SOLID_RECT_COLOR_OFFSET,
@@ -434,7 +434,7 @@ mod tests {
     use core::mem::offset_of;
 
     #[test]
-    fn vertex_layout_matches_manifest_offsets() {
+    fn vertex_layout_matches_generated_shader_offsets() {
         assert_eq!(
             size_of::<SolidRectVertex>() as u32,
             SOLID_RECT_VERTEX_STRIDE

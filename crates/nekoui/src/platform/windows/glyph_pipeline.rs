@@ -28,8 +28,9 @@ use windows::core::s;
 
 use crate::error::{NekoError, NekoResult};
 use crate::render::{
-    GLYPH_MONO_COLOR_OFFSET, GLYPH_MONO_POSITION_OFFSET, GLYPH_MONO_UV_OFFSET, PreparedFrame,
-    PreparedFrameContext,
+    GLYPH_MONO_COLOR_OFFSET, GLYPH_MONO_GLYPH_ATLAS_D3D11_SRV_SLOT,
+    GLYPH_MONO_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT, GLYPH_MONO_POSITION_OFFSET, GLYPH_MONO_UV_OFFSET,
+    PreparedFrame, PreparedFrameContext,
 };
 use crate::scene::SceneOrder;
 use crate::style::Color;
@@ -252,10 +253,13 @@ impl D3d11GlyphMonoPipeline {
             );
             device.context().VSSetShader(&self.vertex_shader, None);
             device.context().PSSetShader(&self.pixel_shader, None);
+            device.context().PSSetShaderResources(
+                GLYPH_MONO_GLYPH_ATLAS_D3D11_SRV_SLOT,
+                Some(&shader_resources),
+            );
             device
                 .context()
-                .PSSetShaderResources(0, Some(&shader_resources));
-            device.context().PSSetSamplers(0, Some(&samplers));
+                .PSSetSamplers(GLYPH_MONO_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT, Some(&samplers));
             device
                 .context()
                 .OMSetBlendState(&self.blend_state, None, u32::MAX);
@@ -476,7 +480,7 @@ fn vertex_buffer_byte_width(vertex_capacity: usize) -> NekoResult<u32> {
 fn input_elements() -> [D3D11_INPUT_ELEMENT_DESC; 3] {
     [
         D3D11_INPUT_ELEMENT_DESC {
-            SemanticName: s!("POSITION"),
+            SemanticName: s!("LOC"),
             SemanticIndex: 0,
             Format: DXGI_FORMAT_R32G32_FLOAT,
             InputSlot: 0,
@@ -485,8 +489,8 @@ fn input_elements() -> [D3D11_INPUT_ELEMENT_DESC; 3] {
             InstanceDataStepRate: 0,
         },
         D3D11_INPUT_ELEMENT_DESC {
-            SemanticName: s!("TEXCOORD"),
-            SemanticIndex: 0,
+            SemanticName: s!("LOC"),
+            SemanticIndex: 1,
             Format: DXGI_FORMAT_R32G32_FLOAT,
             InputSlot: 0,
             AlignedByteOffset: GLYPH_MONO_UV_OFFSET,
@@ -494,8 +498,8 @@ fn input_elements() -> [D3D11_INPUT_ELEMENT_DESC; 3] {
             InstanceDataStepRate: 0,
         },
         D3D11_INPUT_ELEMENT_DESC {
-            SemanticName: s!("COLOR"),
-            SemanticIndex: 0,
+            SemanticName: s!("LOC"),
+            SemanticIndex: 2,
             Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
             InputSlot: 0,
             AlignedByteOffset: GLYPH_MONO_COLOR_OFFSET,
@@ -650,7 +654,7 @@ mod tests {
     use core::mem::offset_of;
 
     #[test]
-    fn vertex_layout_matches_manifest_offsets() {
+    fn vertex_layout_matches_generated_shader_offsets() {
         assert_eq!(size_of::<GlyphVertex>() as u32, GLYPH_MONO_VERTEX_STRIDE);
         assert_eq!(
             offset_of!(GlyphVertex, position) as u32,

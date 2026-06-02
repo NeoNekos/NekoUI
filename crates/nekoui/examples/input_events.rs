@@ -225,20 +225,24 @@ fn format_key_event(event: &KeyEvent) -> String {
 }
 
 fn run_example() {
-    Application::new().run(|cx| {
-        let state = cx.new_entity(|_| InputEventsState::default());
-        cx.windows()
-            .open(WindowOptions::new().title("NekoUI Input Events"), |_| {
-                InputEventsExample { state }
-            })?;
+    Application::new()
+        .run(|cx| {
+            let state = cx.new_entity(|_| InputEventsState::default());
+            cx.windows()
+                .open(WindowOptions::new().title("NekoUI Input Events"), |_| {
+                    InputEventsExample { state }
+                })?;
 
-        Ok(())
-    }).unwrap();
+            Ok(())
+        })
+        .unwrap();
 }
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
+        )
         .with_thread_names(true)
         .init();
 

@@ -27,16 +27,20 @@ impl Render for HelloWorld {
 }
 
 fn run_example() {
-        Application::new().run(|cx| {
-        cx.windows()
-            .open(WindowOptions::new().title("Hello NekoUI"), |_| HelloWorld)?;
-        Ok(())
-    }).unwrap();
+    Application::new()
+        .run(|cx| {
+            cx.windows()
+                .open(WindowOptions::new().title("Hello NekoUI"), |_| HelloWorld)?;
+            Ok(())
+        })
+        .unwrap();
 }
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
+        )
         .with_thread_names(true)
         .init();
 

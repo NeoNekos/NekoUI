@@ -115,7 +115,7 @@ impl ActiveFrame {
             )?);
             let pipeline = glyph_pipeline.as_deref_mut().ok_or_else(|| {
                 NekoError::unsupported(
-                    "D3D11 glyph pipeline is unavailable without checked shader artifacts",
+                    "D3D11 glyph pipeline is unavailable without generated framework shader artifacts",
                 )
             })?;
             glyph_unsupported.add(pipeline.collect_glyph_draws(prepared, atlas)?);
@@ -137,7 +137,7 @@ impl ActiveFrame {
             {
                 let pipeline = solid_rect_pipeline.as_deref_mut().ok_or_else(|| {
                     NekoError::unsupported(
-                        "D3D11 solid rect pipeline is unavailable without checked shader artifacts",
+                        "D3D11 solid rect pipeline is unavailable without generated framework shader artifacts",
                     )
                 })?;
                 let end = rect_index + 1;
@@ -151,7 +151,7 @@ impl ActiveFrame {
             } else if item.kind().supported_windows_glyph_text() {
                 let pipeline = glyph_pipeline.as_deref_mut().ok_or_else(|| {
                     NekoError::unsupported(
-                        "D3D11 glyph pipeline is unavailable without checked shader artifacts",
+                        "D3D11 glyph pipeline is unavailable without generated framework shader artifacts",
                     )
                 })?;
                 let start = glyph_index;
