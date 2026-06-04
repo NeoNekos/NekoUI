@@ -4,22 +4,28 @@ use crate::error::{ErrorKind, NekoError, NekoResult};
 use crate::platform::{
     BackendFrameReceipt, BackendFrameStatus, BackendSurfaceState, Renderability,
 };
-use crate::render::PreparedFrame;
+use crate::render::{DrawItemKind, PreparedFrame};
 use crate::text::FontManager;
 use crate::window::AnyWindowHandle;
 
+use super::box_shape::{box_shape_count, collect_box_shapes, unsupported_draw_items};
+use super::clip::ClipStack;
 use super::device::D3d11DeviceState;
-use super::glyph::{GlyphAtlas, GlyphUnsupportedReport, prepare_glyph_atlas};
-use super::glyph_pipeline::D3d11GlyphMonoPipeline;
-use super::pipeline::D3d11SolidRectPipeline;
-use super::solid_rect::{collect_solid_rects, solid_rect_count, unsupported_draw_items};
+use super::glyph::{
+    GlyphAtlas, GlyphDrawFormat, GlyphDrawPlan, GlyphUnsupportedReport, prepare_glyph_atlases,
+};
+use super::glyph_pipeline::{D3d11GlyphColorPipeline, D3d11GlyphMonoPipeline};
+use super::pipeline::D3d11BoxShapePipeline;
 use super::surface::DxgiSurface;
 
 pub(super) struct FrameRecordResources<'a> {
     pub(super) font_manager: &'a FontManager,
-    pub(super) glyph_atlas: Option<&'a mut GlyphAtlas>,
-    pub(super) glyph_pipeline: Option<&'a mut D3d11GlyphMonoPipeline>,
-    pub(super) solid_rect_pipeline: Option<&'a mut D3d11SolidRectPipeline>,
+    pub(super) mono_glyph_atlas: Option<&'a mut GlyphAtlas>,
+    pub(super) color_glyph_atlas: &'a mut Option<GlyphAtlas>,
+    pub(super) mono_glyph_pipeline: &'a mut Option<D3d11GlyphMonoPipeline>,
+    pub(super) color_glyph_pipeline: &'a mut Option<D3d11GlyphColorPipeline>,
+    pub(super) glyph_draw_plan: &'a mut GlyphDrawPlan,
+    pub(super) box_shape_pipeline: Option<&'a mut D3d11BoxShapePipeline>,
 }
 
 #[derive(Clone)]
@@ -32,6 +38,8 @@ pub(super) struct FrameReport {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct FrameRecordReport {
     pub(super) glyph_unsupported: GlyphUnsupportedReport,
+    pub(super) mono_glyph_pipeline_created: bool,
+    pub(super) color_glyph_pipeline_created: bool,
 }
 
 pub(super) struct ActiveFrame {
@@ -102,76 +110,160 @@ impl ActiveFrame {
         let mut glyph_unsupported = GlyphUnsupportedReport::default();
         self.unsupported_draw_items = unsupported_draw_items(prepared);
         surface.clear(device, super::surface::WINDOWS_BACKEND_CLEAR_COLOR)?;
-        let glyph_atlas = resources.glyph_atlas;
-        let mut glyph_pipeline = resources.glyph_pipeline;
-        let glyph_draw_count = if has_supported_glyph_text(prepared) {
-            let atlas = glyph_atlas.ok_or_else(|| {
-                NekoError::unsupported("D3D11 glyph atlas is unavailable for text draw items")
+        let mono_glyph_pipeline = resources.mono_glyph_pipeline;
+        let color_glyph_pipeline = resources.color_glyph_pipeline;
+        let color_glyph_atlas = resources.color_glyph_atlas;
+        let glyph_draw_plan = resources.glyph_draw_plan;
+        let mut mono_glyph_pipeline_created = false;
+        let mut color_glyph_pipeline_created = false;
+        if has_supported_glyph_text(prepared) {
+            let mono_atlas = resources.mono_glyph_atlas.ok_or_else(|| {
+                NekoError::unsupported("D3D11 mono glyph atlas is unavailable for text draw items")
             })?;
-            glyph_unsupported.add(prepare_glyph_atlas(
+            glyph_unsupported.add(prepare_glyph_atlases(
                 prepared,
-                atlas,
+                mono_atlas,
+                color_glyph_atlas,
                 resources.font_manager,
             )?);
-            let pipeline = glyph_pipeline.as_deref_mut().ok_or_else(|| {
-                NekoError::unsupported(
-                    "D3D11 glyph pipeline is unavailable without generated framework shader artifacts",
-                )
-            })?;
-            glyph_unsupported.add(pipeline.collect_glyph_draws(prepared, atlas)?);
-            let glyph_draw_count = pipeline.glyph_draw_count();
-            if glyph_draw_count > 0 {
-                pipeline.upload_if_dirty(device, atlas)?;
+            glyph_unsupported.add(super::glyph::collect_glyph_draw_plan(
+                prepared,
+                mono_atlas,
+                color_glyph_atlas.as_ref(),
+                glyph_draw_plan,
+            )?);
+            if glyph_draw_plan.has_mono_draws() {
+                if mono_glyph_pipeline.is_none() {
+                    *mono_glyph_pipeline = Some(D3d11GlyphMonoPipeline::new(device)?);
+                    mono_glyph_pipeline_created = true;
+                }
+                let mono_pipeline = mono_glyph_pipeline.as_mut().ok_or_else(|| {
+                    NekoError::unsupported("D3D11 mono glyph pipeline is unavailable")
+                })?;
+                mono_pipeline.upload_if_dirty(device, mono_atlas)?;
             }
-            glyph_draw_count
+            if glyph_draw_plan.has_color_draws() {
+                let color_atlas = color_glyph_atlas.as_mut().ok_or_else(|| {
+                    NekoError::unsupported(
+                        "D3D11 color glyph atlas is unavailable for color glyph draw items",
+                    )
+                })?;
+                if color_glyph_pipeline.is_none() {
+                    *color_glyph_pipeline = Some(D3d11GlyphColorPipeline::new(device)?);
+                    color_glyph_pipeline_created = true;
+                }
+                let color_pipeline = color_glyph_pipeline.as_mut().ok_or_else(|| {
+                    NekoError::unsupported("D3D11 color glyph pipeline is unavailable")
+                })?;
+                color_pipeline.upload_if_dirty(device, color_atlas)?;
+            }
         } else {
-            0
+            glyph_draw_plan.clear();
         };
         self.unsupported_draw_items += glyph_unsupported.skipped_glyph_instances();
-        let rects = collect_solid_rects(prepared);
-        let mut rect_index = 0;
-        let mut glyph_index = 0;
-        let mut solid_rect_pipeline = resources.solid_rect_pipeline;
+        let shapes = collect_box_shapes(prepared);
+        let mut clip_stack = ClipStack::default();
+        let mut shape_index = 0;
+        let mut glyph_run_index = 0;
+        let mut box_shape_pipeline = resources.box_shape_pipeline;
         for item in prepared.draw_items() {
-            if matches!(item.kind(), crate::render::DrawItemKind::Rect { color } if color.srgb_channels().is_some())
-            {
-                let pipeline = solid_rect_pipeline.as_deref_mut().ok_or_else(|| {
-                    NekoError::unsupported(
-                        "D3D11 solid rect pipeline is unavailable without generated framework shader artifacts",
-                    )
-                })?;
-                let end = rect_index + 1;
-                pipeline.draw(
-                    device,
-                    surface.render_target_view()?,
-                    prepared.context(),
-                    &rects[rect_index..end],
-                )?;
-                rect_index = end;
-            } else if item.kind().supported_windows_glyph_text() {
-                let pipeline = glyph_pipeline.as_deref_mut().ok_or_else(|| {
-                    NekoError::unsupported(
-                        "D3D11 glyph pipeline is unavailable without generated framework shader artifacts",
-                    )
-                })?;
-                let start = glyph_index;
-                while glyph_index < glyph_draw_count
-                    && pipeline.glyph_draw_order(glyph_index) == item.order()
+            match item.kind() {
+                DrawItemKind::ClipPush { clip } => clip_stack.push(*clip),
+                DrawItemKind::ClipPop => clip_stack.pop(),
+                DrawItemKind::BoxShape { shape }
+                    if super::box_shape::supported_box_shape(*shape) =>
                 {
-                    glyph_index += 1;
+                    let end = shape_index + 1;
+                    if let Some(scissor) = clip_stack.active_scissor(prepared.context()) {
+                        let pipeline = box_shape_pipeline.as_deref_mut().ok_or_else(|| {
+                            NekoError::unsupported(
+                                "D3D11 box shape pipeline is unavailable without generated framework shader artifacts",
+                            )
+                        })?;
+                        pipeline.draw(
+                            device,
+                            surface.render_target_view()?,
+                            prepared.context(),
+                            &shapes[shape_index..end],
+                            scissor,
+                        )?;
+                    }
+                    shape_index = end;
                 }
-                if glyph_index > start {
-                    pipeline.draw_collected_range(
-                        device,
-                        surface.render_target_view()?,
-                        prepared.context(),
-                        start..glyph_index,
-                    )?;
+                DrawItemKind::Rect { color }
+                    if color.to_current_backend_sdr_srgb_rgba().is_some() =>
+                {
+                    let end = shape_index + 1;
+                    if let Some(scissor) = clip_stack.active_scissor(prepared.context()) {
+                        let pipeline = box_shape_pipeline.as_deref_mut().ok_or_else(|| {
+                            NekoError::unsupported(
+                                "D3D11 box shape pipeline is unavailable without generated framework shader artifacts",
+                            )
+                        })?;
+                        pipeline.draw(
+                            device,
+                            surface.render_target_view()?,
+                            prepared.context(),
+                            &shapes[shape_index..end],
+                            scissor,
+                        )?;
+                    }
+                    shape_index = end;
                 }
+                _ if item.kind().supported_windows_glyph_text() => {
+                    let scissor = clip_stack.active_scissor(prepared.context());
+                    while glyph_run_index < glyph_draw_plan.runs().len()
+                        && glyph_draw_plan.runs()[glyph_run_index].order == item.order()
+                    {
+                        if let Some(scissor) = scissor {
+                            let run = &glyph_draw_plan.runs()[glyph_run_index];
+                            match run.format {
+                                GlyphDrawFormat::MonoMask => {
+                                    let pipeline = mono_glyph_pipeline.as_mut().ok_or_else(|| {
+                                        NekoError::unsupported(
+                                            "D3D11 mono glyph pipeline is unavailable without generated framework shader artifacts",
+                                        )
+                                    })?;
+                                    pipeline.draw_glyphs(
+                                        device,
+                                        surface.render_target_view()?,
+                                        prepared.context(),
+                                        &glyph_draw_plan.mono_draws()[run.range.clone()],
+                                        scissor,
+                                    )?;
+                                }
+                                GlyphDrawFormat::ColorRgba => {
+                                    let pipeline = color_glyph_pipeline.as_mut().ok_or_else(|| {
+                                        NekoError::unsupported(
+                                            "D3D11 color glyph pipeline is unavailable without generated framework shader artifacts",
+                                        )
+                                    })?;
+                                    pipeline.draw_glyphs(
+                                        device,
+                                        surface.render_target_view()?,
+                                        prepared.context(),
+                                        &glyph_draw_plan.color_draws()[run.range.clone()],
+                                        scissor,
+                                    )?;
+                                }
+                            }
+                        }
+                        glyph_run_index += 1;
+                    }
+                }
+                _ => {}
             }
         }
+        debug_assert!(
+            clip_stack.is_empty(),
+            "prepared draw items ended with an unbalanced clip stack"
+        );
         self.phase = FramePhase::Recorded;
-        Ok(FrameRecordReport { glyph_unsupported })
+        Ok(FrameRecordReport {
+            glyph_unsupported,
+            mono_glyph_pipeline_created,
+            color_glyph_pipeline_created,
+        })
     }
 
     pub(super) fn present(self, surface: &DxgiSurface) -> FrameReport {
@@ -264,14 +356,25 @@ impl ActiveFrame {
 }
 
 pub(super) fn has_supported_glyph_text(prepared: &PreparedFrame) -> bool {
-    prepared
-        .draw_items()
-        .iter()
-        .any(|item| item.kind().supported_windows_glyph_text())
+    let mut clip_stack = ClipStack::default();
+    for item in prepared.draw_items() {
+        match item.kind() {
+            DrawItemKind::ClipPush { clip } => clip_stack.push(*clip),
+            DrawItemKind::ClipPop => clip_stack.pop(),
+            kind => {
+                if clip_stack.active_clip() != super::clip::ActiveClip::Empty
+                    && kind.supported_windows_glyph_text()
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
-pub(super) fn has_supported_solid_rects(prepared: &PreparedFrame) -> bool {
-    solid_rect_count(prepared) > 0
+pub(super) fn has_supported_box_shapes(prepared: &PreparedFrame) -> bool {
+    box_shape_count(prepared) > 0
 }
 
 struct ReceiptParts {

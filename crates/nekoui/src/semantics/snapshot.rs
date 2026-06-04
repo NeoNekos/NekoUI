@@ -233,6 +233,22 @@ impl SemanticNodeSnapshot {
             .iter()
             .find_map(|child| child.find_by_key(key))
     }
+
+    #[cfg(test)]
+    fn bounds_for_retained_target(
+        &self,
+        target: crate::interaction::InteractionTarget,
+    ) -> Option<LayoutRect> {
+        if self.id.retained_id == target.node_id()
+            && self.id.retained_generation == target.node_generation()
+        {
+            return Some(self.bounds);
+        }
+
+        self.children
+            .iter()
+            .find_map(|child| child.bounds_for_retained_target(target))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -280,5 +296,15 @@ impl SemanticTreeSnapshot {
     #[cfg(test)]
     pub(crate) fn find_by_key(&self, key: &str) -> Option<&SemanticNodeSnapshot> {
         self.root.as_ref().and_then(|root| root.find_by_key(key))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bounds_for_retained_target(
+        &self,
+        target: crate::interaction::InteractionTarget,
+    ) -> Option<LayoutRect> {
+        self.root
+            .as_ref()
+            .and_then(|root| root.bounds_for_retained_target(target))
     }
 }

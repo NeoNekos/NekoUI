@@ -1,10 +1,6 @@
 use nekoui::prelude::*;
 use tracing_subscriber::EnvFilter;
 
-// Foundation-only example: this opens a native OS window and runs until the
-// window is closed. Windows has a private D3D11 backend that draws supported
-// sRGB solid rectangles plus v0 static monochrome glyph masks.
-
 #[derive(Debug)]
 struct HelloWorld;
 
@@ -20,9 +16,15 @@ impl Render for HelloWorld {
                     .w(px(300.))
                     .h(px(50.))
                     .m(px(20.))
+                    .radius(px(8.))
                     .bg(Color::rgb(0x00, 0xFA, 0xFF)),
             )
-            .child(text("Hello NekoUI").font_size(px(18.0)))
+            // .child(text("Hello NekoUI 🍥🔴🔵🟢😅❇️ Test words").font_size(px(24.0)))
+            .child(text("The longest word 你好世界这段是中文，こんにちはこの段落は日本語です in any of the major \
+            English language dictionaries is pneumonoultramicroscopicsilicovolcanoconiosis, a word that \
+            refers to a lung disease contracted from the inhalation of very fine silica particles, 🍥🔴🔵🟢😅❇️ \
+            a url https://github.com/Yamrc/NekoUI/blob/master/crates/nekoui/examples/hello_world.rs#L25, \
+            specifically from a volcano; medically, it is the same as silicosis.").font_size(px(24.0)))
     }
 }
 

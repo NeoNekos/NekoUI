@@ -12,8 +12,8 @@ use crate::layout::{LayoutNodeSnapshot, LayoutRect, LayoutSize, ScrollGeometry, 
 use crate::retained::{RetainedIdentity, RetainedLayoutInput, RetainedLayoutNode};
 use crate::style::{Dimension, Display, Length, ResolvedLayoutStyle, ResolvedTextStyle};
 use crate::text::{
-    FontManager, TextGeneration, TextLayoutMode, TextLayoutRef, TextLayoutResult, TextMeasureQuery,
-    TextMeasureSession, TextMeasureStats,
+    FontManager, TextGeneration, TextInlineConstraint, TextLayoutMode, TextLayoutRef,
+    TextLayoutResult, TextMeasureQuery, TextMeasureSession, TextMeasureStats,
 };
 
 use super::snapshot::LayoutBoxes;
@@ -113,8 +113,11 @@ pub(crate) fn compute(
         });
     }
 
-    let root_snapshot =
-        materialize_node(&tree, &built_root, LayoutOrigin::ZERO).map_err(RawLayoutError::Plain)?;
+    let root_snapshot = materialize_node(&tree, &built_root, LayoutOrigin::ZERO, &mut text_session)
+        .map_err(|error| RawLayoutError::WithTextStats {
+            error,
+            text_measure: Box::new(text_session.stats()),
+        })?;
     let node_count = count_snapshot(&root_snapshot);
     Ok(RawLayoutOutput {
         root: Some(root_snapshot),
@@ -192,6 +195,7 @@ fn to_taffy_style(style: &ResolvedLayoutStyle, is_root: bool, viewport: Viewport
         },
         padding: to_taffy_padding(style.padding()),
         margin: to_taffy_margin(style.margin()),
+        border: to_taffy_border(style.border_width()),
         gap: TaffySize {
             width: LengthPercentage::length(gap),
             height: LengthPercentage::length(gap),
@@ -207,6 +211,7 @@ fn validate_layout_style(style: &ResolvedLayoutStyle) -> NekoResult<()> {
     style.height().validate_for_layout("height")?;
     validate_edges(style.padding(), "padding")?;
     validate_edges(style.margin(), "margin")?;
+    validate_edges(style.border_width(), "border width")?;
     style.gap().validate_non_negative("gap")?;
     Ok(())
 }
@@ -251,6 +256,15 @@ fn to_taffy_margin(edges: crate::style::Edges<Length>) -> TaffyRect<LengthPercen
         right: LengthPercentageAuto::length(edges.right.as_px()),
         top: LengthPercentageAuto::length(edges.top.as_px()),
         bottom: LengthPercentageAuto::length(edges.bottom.as_px()),
+    }
+}
+
+fn to_taffy_border(edges: crate::style::Edges<Length>) -> TaffyRect<LengthPercentage> {
+    TaffyRect {
+        left: LengthPercentage::length(edges.left.as_px()),
+        right: LengthPercentage::length(edges.right.as_px()),
+        top: LengthPercentage::length(edges.top.as_px()),
+        bottom: LengthPercentage::length(edges.bottom.as_px()),
     }
 }
 
@@ -305,10 +319,10 @@ fn measure_content(
             scale_factor,
             text_layout,
         }) => {
-            let available_inline_width = match available_space.width {
-                AvailableSpace::Definite(available) => Some(available),
-                AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
-            };
+            let inline_constraint = known_dimensions
+                .width
+                .map(TextInlineConstraint::Definite)
+                .unwrap_or_else(|| text_inline_constraint(available_space.width));
             let font_generation = text_session.font_generation();
             let query = TextMeasureQuery {
                 node_id: *node_id,
@@ -317,7 +331,7 @@ fn measure_content(
                 style_generation: TextGeneration::INITIAL,
                 text,
                 style,
-                available_inline_width,
+                inline_constraint,
                 layout_mode: *layout_mode,
                 font_generation,
                 scale_generation: *scale_generation,
@@ -373,6 +387,14 @@ fn measure_content(
     }
 }
 
+fn text_inline_constraint(available: AvailableSpace) -> TextInlineConstraint {
+    match available {
+        AvailableSpace::MinContent => TextInlineConstraint::MinContent,
+        AvailableSpace::MaxContent => TextInlineConstraint::MaxContent,
+        AvailableSpace::Definite(width) => TextInlineConstraint::Definite(width),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LayoutOrigin {
     x: f32,
@@ -387,6 +409,7 @@ fn materialize_node(
     tree: &TaffyTree<MeasureContext>,
     built: &BuiltNode,
     parent_origin: LayoutOrigin,
+    text_session: &mut TextMeasureSession<'_>,
 ) -> NekoResult<LayoutNodeSnapshot> {
     let layout = tree
         .layout(built.taffy_id)
@@ -433,6 +456,7 @@ fn materialize_node(
                     x: border_x,
                     y: border_y,
                 },
+                text_session,
             )
         })
         .collect::<NekoResult<Vec<_>>>()?;
@@ -442,11 +466,11 @@ fn materialize_node(
         content_rect,
         conservative_content_extent(content_rect, content_size, &children),
     );
-    let text_layout = tree
-        .get_node_context(built.taffy_id)
-        .and_then(|context| match context {
-            MeasureContext::Text { text_layout, .. } => text_layout.clone(),
-        });
+    let text_layout = materialized_text_layout(
+        tree.get_node_context(built.taffy_id),
+        content_rect.width(),
+        text_session,
+    )?;
 
     Ok(LayoutNodeSnapshot::new(
         built.identity.id(),
@@ -463,6 +487,54 @@ fn materialize_node(
         },
         children,
     ))
+}
+
+fn materialized_text_layout(
+    context: Option<&MeasureContext>,
+    final_inline_width: f32,
+    text_session: &mut TextMeasureSession<'_>,
+) -> NekoResult<Option<TextLayoutRef>> {
+    let Some(MeasureContext::Text {
+        node_id,
+        node_generation,
+        text,
+        style,
+        text_generation,
+        layout_mode,
+        scale_generation,
+        scale_factor,
+        ..
+    }) = context
+    else {
+        return Ok(None);
+    };
+    let query = TextMeasureQuery {
+        node_id: *node_id,
+        node_generation: *node_generation,
+        text_generation: *text_generation,
+        style_generation: TextGeneration::INITIAL,
+        text,
+        style,
+        inline_constraint: TextInlineConstraint::Definite(final_inline_width),
+        layout_mode: *layout_mode,
+        font_generation: text_session.font_generation(),
+        scale_generation: *scale_generation,
+        scale_factor: *scale_factor,
+    };
+
+    match text_session.layout(query) {
+        TextLayoutResult::Ready(layout) => Ok(Some(layout)),
+        TextLayoutResult::Deferred(dependency) => Err(NekoError::diagnostic(format!(
+            "text measurement deferred during layout materialization: {} ({})",
+            dependency.kind().as_str(),
+            dependency.reason()
+        ))),
+        TextLayoutResult::Failed(error) => Err(NekoError::diagnostic(format!(
+            "text measurement failed during layout materialization: {} ({})",
+            error.kind().as_str(),
+            error.message()
+        ))),
+    }
 }
 
 fn conservative_content_extent(
@@ -536,6 +608,51 @@ mod tests {
     }
 
     #[test]
+    fn border_width_reserves_space_inside_border_box() {
+        let mut tree = RetainedTree::default();
+        tree.diff_root(
+            div()
+                .key("root")
+                .w(px(120.0))
+                .h(px(80.0))
+                .border_width(px(10.0))
+                .p(px(5.0))
+                .into_element(),
+        );
+
+        let output = compute_layout(
+            tree.layout_input(),
+            Viewport::new(LayoutSize::new(300.0, 100.0), 1.0),
+            None,
+            &FontManager::default(),
+        )
+        .unwrap();
+        let root = output.snapshot.root().unwrap();
+
+        assert_eq!(root.border_rect().width(), 120.0);
+        assert_eq!(root.padding_rect().x(), 10.0);
+        assert_eq!(root.padding_rect().width(), 100.0);
+        assert_eq!(root.content_rect().x(), 15.0);
+        assert_eq!(root.content_rect().width(), 90.0);
+    }
+
+    #[test]
+    fn invalid_border_width_is_rejected_before_taffy() {
+        let mut tree = RetainedTree::default();
+        tree.diff_root(div().key("root").border_width(px(f32::NAN)).into_element());
+
+        let error = compute_layout(
+            tree.layout_input(),
+            Viewport::new(LayoutSize::new(300.0, 100.0), 1.0),
+            None,
+            &FontManager::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error().kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn invalid_length_is_rejected_before_taffy() {
         let mut tree = RetainedTree::default();
         tree.diff_root(div().key("root").w(px(f32::INFINITY)).into_element());
@@ -578,8 +695,41 @@ mod tests {
 
         assert_eq!(field_metrics.line_count, 1);
         assert!(field_metrics.width > field.content_rect().width());
-        assert!(field.border_rect().height() <= field_metrics.height + 0.01);
         assert!(label_metrics.line_count > 1);
         assert!(label.border_rect().height() > field.border_rect().height());
+    }
+
+    #[test]
+    fn narrow_emoji_text_auto_height_pushes_following_sibling_below_line_boxes() {
+        let mut tree = RetainedTree::default();
+        tree.diff_root(
+            div()
+                .key("root")
+                .w(px(36.0))
+                .child(text("😀 😀 😀 😀").key("label").font_size(px(32.0)))
+                .child(div().key("after").h(px(10.0)))
+                .into_element(),
+        );
+
+        let output = compute_layout(
+            tree.layout_input(),
+            Viewport::new(LayoutSize::new(200.0, 240.0), 1.0),
+            None,
+            &FontManager::default(),
+        )
+        .unwrap();
+        let label = output.snapshot.find_by_key("label").unwrap();
+        let after = output.snapshot.find_by_key("after").unwrap();
+        let text_layout = label.text_layout().unwrap();
+        let metrics = text_layout.metrics();
+        let final_line = text_layout.lines().last().unwrap();
+
+        assert!(metrics.line_count > 1);
+        assert!((metrics.height - (final_line.top() + final_line.height())).abs() < 0.01);
+        assert!(label.border_rect().height() + 0.01 >= metrics.height);
+        assert!(
+            after.border_rect().y() + 0.01
+                >= label.border_rect().y() + label.border_rect().height()
+        );
     }
 }

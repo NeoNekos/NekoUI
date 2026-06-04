@@ -1,6 +1,6 @@
 use crate::diagnostic::{DirtyLane, DirtyLanes};
 use crate::error::NekoResult;
-use crate::style::{Color, Dimension, Edges, Length, Opacity};
+use crate::style::{Color, CornerRadii, Dimension, Edges, Length, Opacity};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 #[non_exhaustive]
@@ -36,6 +36,7 @@ pub struct LayoutStyleDeclaration {
     height: Option<Dimension>,
     padding: Edges<Option<Length>>,
     margin: Edges<Option<Length>>,
+    border_width: Edges<Option<Length>>,
     gap: Option<Length>,
     overflow: Option<Overflow>,
 }
@@ -48,6 +49,7 @@ impl Default for LayoutStyleDeclaration {
             height: None,
             padding: Edges::all(None),
             margin: Edges::all(None),
+            border_width: Edges::all(None),
             gap: None,
             overflow: None,
         }
@@ -75,6 +77,10 @@ impl LayoutStyleDeclaration {
         self.margin
     }
 
+    pub fn border_width(&self) -> Edges<Option<Length>> {
+        self.border_width
+    }
+
     pub fn gap(&self) -> Option<Length> {
         self.gap
     }
@@ -87,12 +93,22 @@ impl LayoutStyleDeclaration {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VisualStyleDeclaration {
     background: Option<Color>,
+    border_color: Option<Color>,
+    corner_radius: CornerRadii<Option<Length>>,
     opacity: Option<Opacity>,
 }
 
 impl VisualStyleDeclaration {
     pub fn background(&self) -> Option<Color> {
         self.background
+    }
+
+    pub fn border_color(&self) -> Option<Color> {
+        self.border_color
+    }
+
+    pub fn corner_radius(&self) -> CornerRadii<Option<Length>> {
+        self.corner_radius
     }
 
     pub fn opacity(&self) -> Option<Opacity> {
@@ -155,6 +171,7 @@ impl StyleDeclaration {
         }
         validate_optional_length_edges(self.layout.padding, "padding")?;
         validate_optional_length_edges(self.layout.margin, "margin")?;
+        validate_optional_length_edges(self.layout.border_width, "border width")?;
         if let Some(gap) = self.layout.gap {
             gap.validate_non_negative("gap")?;
         }
@@ -167,6 +184,10 @@ impl StyleDeclaration {
         if let Some(background) = self.visual.background {
             background.validate_input()?;
         }
+        if let Some(border_color) = self.visual.border_color {
+            border_color.validate_input()?;
+        }
+        validate_optional_corner_radii(self.visual.corner_radius, "corner radius")?;
         if let Some(text_color) = self.text.text_color {
             text_color.validate_input()?;
         }
@@ -198,6 +219,11 @@ impl StyleDeclaration {
         self
     }
 
+    pub fn border_width(mut self, value: impl Into<Length>) -> Self {
+        self.set_border_width(value.into());
+        self
+    }
+
     pub fn gap(mut self, value: impl Into<Length>) -> Self {
         self.set_gap(value.into());
         self
@@ -221,6 +247,29 @@ impl StyleDeclaration {
     pub fn background(mut self, value: Color) -> Self {
         self.set_background(value);
         self
+    }
+
+    pub fn border_color(mut self, value: Color) -> Self {
+        self.set_border_color(value);
+        self
+    }
+
+    pub fn border(mut self, width: impl Into<Length>, color: Color) -> Self {
+        self.set_border(width.into(), color);
+        self
+    }
+
+    pub fn corner_radius(mut self, value: impl Into<Length>) -> Self {
+        self.set_corner_radius(value.into());
+        self
+    }
+
+    pub fn radius(self, value: impl Into<Length>) -> Self {
+        self.corner_radius(value)
+    }
+
+    pub fn rounded(self, value: impl Into<Length>) -> Self {
+        self.corner_radius(value)
     }
 
     pub fn opacity(mut self, value: impl Into<Opacity>) -> Self {
@@ -307,6 +356,10 @@ impl StyleDeclaration {
         self.layout.margin.left = Some(value);
     }
 
+    pub(crate) fn set_border_width(&mut self, value: Length) {
+        self.layout.border_width = Edges::all(Some(value));
+    }
+
     pub(crate) fn set_gap(&mut self, value: Length) {
         self.layout.gap = Some(value);
     }
@@ -325,6 +378,19 @@ impl StyleDeclaration {
 
     pub(crate) fn set_background(&mut self, value: Color) {
         self.visual.background = Some(value);
+    }
+
+    pub(crate) fn set_border_color(&mut self, value: Color) {
+        self.visual.border_color = Some(value);
+    }
+
+    pub(crate) fn set_border(&mut self, width: Length, color: Color) {
+        self.set_border_width(width);
+        self.set_border_color(color);
+    }
+
+    pub(crate) fn set_corner_radius(&mut self, value: Length) {
+        self.visual.corner_radius = CornerRadii::all(Some(value));
     }
 
     pub(crate) fn set_opacity(&mut self, value: Opacity) {
@@ -398,10 +464,31 @@ fn validate_optional_length_edges(
     Ok(())
 }
 
+fn validate_optional_corner_radii(
+    radii: CornerRadii<Option<Length>>,
+    label: &'static str,
+) -> NekoResult<()> {
+    if let Some(top_left) = radii.top_left {
+        top_left.validate_non_negative(label)?;
+    }
+    if let Some(top_right) = radii.top_right {
+        top_right.validate_non_negative(label)?;
+    }
+    if let Some(bottom_right) = radii.bottom_right {
+        bottom_right.validate_non_negative(label)?;
+    }
+    if let Some(bottom_left) = radii.bottom_left {
+        bottom_left.validate_non_negative(label)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::diagnostic::DirtyLane;
-    use crate::style::{Color, Display, Overflow, StyleDeclaration, TextOverflow, fill, px};
+    use crate::style::{
+        Color, CornerRadii, Display, Edges, Overflow, StyleDeclaration, TextOverflow, fill, px,
+    };
 
     #[test]
     fn canonical_and_alias_expansion_is_longhand_ordered() {
@@ -410,6 +497,11 @@ mod tests {
             .padding_left(px(4.0))
             .margin(px(10.0))
             .margin_left(px(6.0))
+            .border_width(px(2.0))
+            .border(px(3.0), Color::rgb(8, 9, 10))
+            .corner_radius(px(5.0))
+            .radius(px(6.0))
+            .rounded(px(7.0))
             .gap(px(3.0))
             .overflow(Overflow::Scroll);
         let padding = style.layout().padding();
@@ -421,6 +513,12 @@ mod tests {
         assert_eq!(padding.left, Some(px(4.0)));
         assert_eq!(margin.top, Some(px(10.0)));
         assert_eq!(margin.left, Some(px(6.0)));
+        assert_eq!(style.layout().border_width(), Edges::all(Some(px(3.0))));
+        assert_eq!(style.visual().border_color(), Some(Color::rgb(8, 9, 10)));
+        assert_eq!(
+            style.visual().corner_radius(),
+            CornerRadii::all(Some(px(7.0)))
+        );
         assert_eq!(style.layout().gap(), Some(px(3.0)));
         assert_eq!(style.layout().overflow(), Some(Overflow::Scroll));
     }
@@ -438,6 +536,11 @@ mod tests {
         let base = StyleDeclaration::default();
         let visual = base.clone().background(Color::rgb(1, 2, 3)).opacity(0.5);
         let layout = base.clone().width(fill()).gap(px(8.0));
+        let border_layout = base.clone().border_width(px(2.0));
+        let border_visual = base
+            .clone()
+            .border_color(Color::rgb(4, 5, 6))
+            .rounded(px(6.0));
         let text = base.clone().font_size(px(18.0));
 
         let visual_lanes = visual.dirty_lanes_since(&base);
@@ -450,6 +553,15 @@ mod tests {
         assert!(layout_lanes.contains(DirtyLane::Layout.flag()));
         assert!(layout_lanes.contains(DirtyLane::Semantics.flag()));
         assert!(!layout_lanes.contains(DirtyLane::Text.flag()));
+
+        let border_layout_lanes = border_layout.dirty_lanes_since(&base);
+        assert!(border_layout_lanes.contains(DirtyLane::Layout.flag()));
+        assert!(border_layout_lanes.contains(DirtyLane::Semantics.flag()));
+        assert!(border_layout_lanes.contains(DirtyLane::Paint.flag()));
+
+        let border_visual_lanes = border_visual.dirty_lanes_since(&base);
+        assert!(border_visual_lanes.contains(DirtyLane::Paint.flag()));
+        assert!(!border_visual_lanes.contains(DirtyLane::Layout.flag()));
 
         let text_lanes = text.dirty_lanes_since(&base);
         assert!(text_lanes.contains(DirtyLane::Text.flag()));

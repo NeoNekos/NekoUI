@@ -1,7 +1,7 @@
 use crate::layout::LayoutRect;
 use crate::retained::{NodeGeneration, RetainedNodeId};
 use crate::scene::SceneInputSignature;
-use crate::style::Color;
+use crate::style::{Color, CornerRadii, Edges, Length, Opacity};
 use crate::text::TextLayoutRef;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -17,8 +17,58 @@ impl SceneOrder {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxShape {
+    fill: Option<Color>,
+    border_color: Option<Color>,
+    border_width: Edges<Length>,
+    corner_radius: CornerRadii<Length>,
+    opacity: Opacity,
+}
+
+impl BoxShape {
+    pub(crate) fn new(
+        fill: Option<Color>,
+        border_color: Option<Color>,
+        border_width: Edges<Length>,
+        corner_radius: CornerRadii<Length>,
+        opacity: Opacity,
+    ) -> Self {
+        Self {
+            fill,
+            border_color,
+            border_width,
+            corner_radius,
+            opacity,
+        }
+    }
+
+    pub fn fill(self) -> Option<Color> {
+        self.fill
+    }
+
+    pub fn border_color(self) -> Option<Color> {
+        self.border_color
+    }
+
+    pub fn border_width(self) -> Edges<Length> {
+        self.border_width
+    }
+
+    pub fn corner_radius(self) -> CornerRadii<Length> {
+        self.corner_radius
+    }
+
+    pub fn opacity(self) -> Opacity {
+        self.opacity
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaintFragmentKind {
+    BoxShape {
+        shape: BoxShape,
+    },
     Rect {
         color: Color,
     },

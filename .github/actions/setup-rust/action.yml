@@ -29,6 +29,23 @@ runs:
           libxcb-shape0-dev \
           libxcb-xfixes0-dev
 
+    - name: step::discover_fxc
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+        $fxc = Get-ChildItem -LiteralPath $kitsRoot -Recurse -Filter fxc.exe -ErrorAction SilentlyContinue |
+          Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
+          Sort-Object FullName -Descending |
+          Select-Object -First 1
+
+        if (-not $fxc) {
+          throw "fxc.exe was not found under $kitsRoot. Install the Windows SDK or set NEKOUI_FXC."
+        }
+
+        "NEKOUI_FXC=$($fxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        Split-Path -Parent $fxc.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
     - name: step::install_rust_with_components
       if: inputs.components != ''
       uses: dtolnay/rust-toolchain@stable

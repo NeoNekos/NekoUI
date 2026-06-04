@@ -235,6 +235,81 @@ fn scroll_offsets_map_child_coordinates() {
 }
 
 #[test]
+fn nested_scroll_offsets_accumulate_for_semantic_bounds() {
+    let mut tree = RetainedTree::default();
+    tree.diff_root(
+        div()
+            .key("outer")
+            .w(px(100.0))
+            .h(px(100.0))
+            .overflow(Overflow::Scroll)
+            .child(text("top").key("top").h(px(40.0)))
+            .child(
+                div()
+                    .key("inner")
+                    .w(px(120.0))
+                    .h(px(60.0))
+                    .overflow(Overflow::Scroll)
+                    .child(text("spacer").key("spacer").w(px(40.0)).h(px(30.0)))
+                    .child(text("target").key("target").w(px(160.0)).h(px(100.0))),
+            )
+            .into_element(),
+    );
+    let retained = tree.snapshot();
+    let style = tree.style_snapshot();
+    let layout = compute_layout(
+        tree.layout_input(),
+        Viewport::new(LayoutSize::new(300.0, 200.0), 1.0),
+        None,
+        &FontManager::default(),
+    )
+    .unwrap()
+    .snapshot;
+    let outer = retained.find_by_key("outer").unwrap();
+    let inner = retained.find_by_key("inner").unwrap();
+    let target_layout = layout.find_by_key("target").unwrap();
+    let mut interaction = InteractionState::default();
+    interaction.set_scroll_offset(
+        InteractionTarget::new(outer.id(), outer.generation()),
+        LayoutPoint::new(0.0, 30.0),
+    );
+    interaction.set_scroll_offset(
+        InteractionTarget::new(inner.id(), inner.generation()),
+        LayoutPoint::new(12.0, 8.0),
+    );
+
+    let snapshot = build_semantic_snapshot(SemanticBuildInput {
+        retained: &retained,
+        style: &style,
+        layout: &layout,
+        interaction: Some(&interaction),
+    })
+    .snapshot;
+    let target = snapshot.find_by_key("target").unwrap();
+
+    assert_eq!(
+        target.bounds(),
+        target_layout.content_rect().translate(-12.0, -38.0)
+    );
+    assert!(snapshot.find_by_key("outer").unwrap().state().scrollable());
+    assert!(snapshot.find_by_key("inner").unwrap().state().scrollable());
+    assert!(
+        snapshot
+            .find_by_key("outer")
+            .unwrap()
+            .actions()
+            .contains(&SemanticAction::Scroll)
+    );
+    assert!(
+        snapshot
+            .find_by_key("inner")
+            .unwrap()
+            .actions()
+            .contains(&SemanticAction::Scroll)
+    );
+}
+
+#[test]
 fn generation_publish_validation_detects_stale_inputs() {
     let mut tree = RetainedTree::default();
     tree.diff_root(

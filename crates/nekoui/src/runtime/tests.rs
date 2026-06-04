@@ -9,9 +9,9 @@ use crate::interaction::{
     ImeInput, ImePreeditInput, Key, KeyEvent, KeyInput, Modifiers, PhysicalKey, PointerInput,
     ScrollDelta, ScrollPhase, TextInput, TextRange, WheelInput, WindowFocusInput,
 };
-use crate::layout::LayoutPoint;
 use crate::layout::LayoutSize;
 use crate::layout::text_viewport_placement;
+use crate::layout::{LayoutPoint, LayoutRect};
 use crate::platform::{ImePlatformRequest, PlatformFact};
 use crate::runtime::Runtime;
 use crate::runtime::command::RuntimeCommand;
@@ -2173,6 +2173,72 @@ fn ime_preedit_and_commit_update_text_input_and_candidate_rect_from_text_layout(
 }
 
 #[test]
+fn ime_cursor_area_refreshes_after_text_mutation_redraw_not_before() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(div().key("root").child(input("hi").key("field")))
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    let initial_cursor_area = runtime
+        .take_platform_ime_requests(window.into())
+        .unwrap()
+        .into_iter()
+        .find_map(|request| match request {
+            ImePlatformRequest::CursorArea { rect } => Some(rect),
+            _ => None,
+        })
+        .expect("text input focus should publish initial cursor area");
+
+    runtime
+        .ingest_platform_fact(PlatformFact::ImeInput {
+            handle: window.into(),
+            input: ImeInput::Preedit(ImePreeditInput::new(
+                "文",
+                Some(TextRange::collapsed("文".len())),
+            )),
+        })
+        .unwrap();
+    assert!(
+        runtime
+            .take_platform_ime_requests(window.into())
+            .unwrap()
+            .into_iter()
+            .all(|request| !matches!(request, ImePlatformRequest::CursorArea { .. }))
+    );
+
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+    let refreshed_cursor_area = runtime
+        .take_platform_ime_requests(window.into())
+        .unwrap()
+        .into_iter()
+        .find_map(|request| match request {
+            ImePlatformRequest::CursorArea { rect } => Some(rect),
+            _ => None,
+        })
+        .expect("new layout publication should refresh cursor area");
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let field_layout = layout.find_by_key("field").unwrap();
+    let expected = text_viewport_placement(
+        ElementKind::Input,
+        field_layout.content_rect(),
+        field_layout.text_layout().unwrap(),
+    )
+    .visible_caret_rect();
+
+    assert_ne!(refreshed_cursor_area, initial_cursor_area);
+    assert_eq!(refreshed_cursor_area, expected);
+}
+
+#[test]
 fn ime_candidate_rect_for_long_input_uses_visible_caret() {
     let mut runtime = Runtime::new();
     let window = runtime
@@ -2211,6 +2277,89 @@ fn ime_candidate_rect_for_long_input_uses_visible_caret() {
     assert_eq!(cursor_area, placement.visible_caret_rect());
     assert!(cursor_area.x() >= content.x());
     assert!(cursor_area.x() + cursor_area.width() <= content.x() + content.width());
+}
+
+#[test]
+fn ime_candidate_rect_for_tiny_input_is_clamped_to_viewport() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div().key("root").child(
+                    input("AAAA AAAA AAAA")
+                        .key("field")
+                        .w(px(0.5))
+                        .font_size(px(12.0)),
+                ),
+            )
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(0.25, 1.0)))
+        .unwrap();
+
+    let cursor_area = runtime
+        .ime_requests(window)
+        .unwrap()
+        .into_iter()
+        .find_map(|request| match request {
+            ImePlatformRequest::CursorArea { rect } => Some(rect),
+            _ => None,
+        })
+        .expect("text input focus should publish a cursor area");
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let field_layout = layout.find_by_key("field").unwrap();
+    let content = field_layout.content_rect();
+    let text_layout = field_layout.text_layout().unwrap();
+    let placement = text_viewport_placement(ElementKind::Input, content, text_layout);
+
+    assert_eq!(cursor_area, placement.visible_caret_rect());
+    assert!(cursor_area.x() >= content.x());
+    assert!(cursor_area.x() + cursor_area.width() <= content.x() + content.width());
+    assert_eq!(cursor_area.width(), content.width());
+}
+
+#[test]
+fn ime_candidate_rect_for_emoji_input_uses_effective_line_box() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div().key("root").child(
+                    input("Hello 😀")
+                        .key("field")
+                        .h(px(120.0))
+                        .font_size(px(48.0)),
+                ),
+            )
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+
+    let cursor_area = runtime
+        .ime_requests(window)
+        .unwrap()
+        .into_iter()
+        .find_map(|request| match request {
+            ImePlatformRequest::CursorArea { rect } => Some(rect),
+            _ => None,
+        })
+        .expect("text input focus should publish a cursor area");
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let field_layout = layout.find_by_key("field").unwrap();
+    let text_layout = field_layout.text_layout().unwrap();
+    let placement =
+        text_viewport_placement(ElementKind::Input, field_layout.content_rect(), text_layout);
+    let line = text_layout.lines()[0];
+
+    assert_eq!(text_layout.metrics().line_count, 1);
+    assert!(line.height() >= line.required_height());
+    assert_eq!(cursor_area, placement.visible_caret_rect());
+    assert_eq!(cursor_area.height(), line.height());
 }
 
 #[test]
@@ -2299,6 +2448,74 @@ fn ime_disabled_after_commit_keeps_text_input_focus_and_does_not_disable_platfor
                         .is_some_and(|value| value != "none")
             })
     );
+}
+
+#[test]
+fn ime_disabled_after_active_preedit_refreshes_cursor_area_after_redraw_not_before() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(div().key("root").child(input("hi").key("field")))
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    let _ = runtime.take_platform_ime_requests(window.into()).unwrap();
+    runtime
+        .ingest_platform_fact(PlatformFact::ImeInput {
+            handle: window.into(),
+            input: ImeInput::Preedit(ImePreeditInput::new(
+                "文",
+                Some(TextRange::collapsed("文".len())),
+            )),
+        })
+        .unwrap();
+    let _ = runtime.take_platform_ime_requests(window.into()).unwrap();
+
+    runtime
+        .ingest_platform_fact(PlatformFact::ImeInput {
+            handle: window.into(),
+            input: ImeInput::Disabled,
+        })
+        .unwrap();
+    let immediate_requests = runtime.take_platform_ime_requests(window.into()).unwrap();
+    assert!(
+        immediate_requests
+            .iter()
+            .any(|request| matches!(request, ImePlatformRequest::Allowed { allowed: true }))
+    );
+    assert!(
+        immediate_requests
+            .iter()
+            .all(|request| !matches!(request, ImePlatformRequest::CursorArea { .. }))
+    );
+
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+    let refreshed_cursor_area = runtime
+        .take_platform_ime_requests(window.into())
+        .unwrap()
+        .into_iter()
+        .find_map(|request| match request {
+            ImePlatformRequest::CursorArea { rect } => Some(rect),
+            _ => None,
+        })
+        .expect("new layout publication should refresh cursor area after disabled preedit clear");
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let field_layout = layout.find_by_key("field").unwrap();
+    let expected = text_viewport_placement(
+        ElementKind::Input,
+        field_layout.content_rect(),
+        field_layout.text_layout().unwrap(),
+    )
+    .visible_caret_rect();
+
+    assert_eq!(refreshed_cursor_area, expected);
 }
 
 #[test]
@@ -2929,6 +3146,196 @@ fn scroll_offset_change_does_not_advance_layout_generation() {
             .map(|entry| entry.node_id()),
         Some(content_id)
     );
+}
+
+#[test]
+fn scroll_geometry_probe_reports_surface_geometry_after_scroll_without_layout() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div()
+                    .key("scroll")
+                    .w(px(100.0))
+                    .h(px(50.0))
+                    .overflow(Overflow::Scroll)
+                    .child(input("hello").key("field").h(px(20.0)))
+                    .child(text("filler").key("filler").h(px(100.0))),
+            )
+        })
+        .unwrap();
+    let retained = runtime.retained_snapshot(window).unwrap();
+    let scroll = retained.find_by_key("scroll").unwrap();
+    let field = retained.find_by_key("field").unwrap();
+    let scroll_target =
+        crate::interaction::InteractionTarget::new(scroll.id(), scroll.generation());
+    let field_target = crate::interaction::InteractionTarget::new(field.id(), field.generation());
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    let _ = runtime.take_platform_ime_requests(window.into()).unwrap();
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+    runtime
+        .pointer_input(window, PointerInput::move_to(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    runtime
+        .state_mut()
+        .scheduler_mut()
+        .take_dirty_lanes(window.id(), DirtyLanes::all());
+    runtime.state_mut().clear_consumed_dirty_lanes(window.id());
+
+    let layout_before = runtime.layout_snapshot(window).unwrap();
+    let field_layout = layout_before.find_by_key("field").unwrap();
+    let field_border_before = field_layout.border_rect();
+    let expected_cursor_before = text_viewport_placement(
+        ElementKind::Input,
+        field_layout.content_rect(),
+        field_layout.text_layout().unwrap(),
+    )
+    .visible_caret_rect();
+    let layout_generation_before = layout_before.generation();
+    let scene_generation_before = runtime.scene_snapshot(window).unwrap().generation();
+    let report_before = runtime.performance_report();
+
+    runtime
+        .wheel_input(
+            window,
+            WheelInput::new(ScrollDelta::pixels(0.0, 10.0), ScrollPhase::Moved),
+        )
+        .unwrap();
+
+    let after_wheel_probe = runtime
+        .scroll_geometry_probe(
+            window,
+            scroll_target,
+            field_target,
+            LayoutPoint::new(1.0, 1.0),
+        )
+        .unwrap();
+    let scroll_geometry = after_wheel_probe
+        .scroll
+        .expect("scroll target should report layout scroll geometry");
+    let expected_cursor_after = expected_cursor_before.translate(0.0, -10.0);
+    let lanes_after_wheel = runtime.state().reported_dirty_lanes(window.id());
+    let report_after_wheel = runtime.performance_report();
+
+    assert_eq!(
+        runtime.layout_snapshot(window).unwrap().generation(),
+        layout_generation_before
+    );
+    assert_eq!(
+        runtime.scene_snapshot(window).unwrap().generation(),
+        scene_generation_before
+    );
+    assert_eq!(
+        report_after_wheel.layout.pass_count,
+        report_before.layout.pass_count
+    );
+    assert_eq!(
+        report_after_wheel.scene.compile_count,
+        report_before.scene.compile_count
+    );
+    assert_eq!(after_wheel_probe.scroll_target, scroll_target);
+    assert_eq!(after_wheel_probe.observed_target, field_target);
+    assert_eq!(
+        scroll_geometry.viewport,
+        LayoutRect::new(0.0, 0.0, 100.0, 50.0)
+    );
+    assert_eq!(scroll_geometry.content_extent.height(), 120.0);
+    assert_eq!(scroll_geometry.max_offset.y(), 70.0);
+    assert_eq!(
+        after_wheel_probe.current_offset,
+        LayoutPoint::new(0.0, 10.0)
+    );
+    assert_eq!(
+        after_wheel_probe.ime_caret_rect,
+        Some(expected_cursor_after)
+    );
+    assert_eq!(
+        after_wheel_probe.ime_candidate_rect,
+        Some(expected_cursor_after)
+    );
+    assert!(lanes_after_wheel.contains(DirtyLane::Paint.flag()));
+    assert!(lanes_after_wheel.contains(DirtyLane::Semantics.flag()));
+    assert!(!lanes_after_wheel.contains(DirtyLane::Layout.flag()));
+
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+
+    let after_redraw_probe = runtime
+        .scroll_geometry_probe(
+            window,
+            scroll_target,
+            field_target,
+            LayoutPoint::new(1.0, 1.0),
+        )
+        .unwrap();
+    let report_after_redraw = runtime.performance_report();
+    let diagnostics = runtime.diagnostics().snapshot();
+
+    assert_eq!(
+        runtime.layout_snapshot(window).unwrap().generation(),
+        layout_generation_before
+    );
+    assert_eq!(
+        report_after_redraw.layout.pass_count,
+        report_before.layout.pass_count
+    );
+    assert!(report_after_redraw.scene.compile_count > report_after_wheel.scene.compile_count);
+    assert_eq!(
+        after_redraw_probe.current_offset,
+        LayoutPoint::new(0.0, 10.0)
+    );
+    assert_eq!(after_redraw_probe.hit_target, Some(field_target));
+    assert!(after_redraw_probe.hit_path.contains(&scroll_target));
+    assert!(after_redraw_probe.hit_path.contains(&field_target));
+    assert!(
+        after_redraw_probe
+            .paint_bounds
+            .contains(&expected_cursor_after)
+    );
+    assert_eq!(
+        after_redraw_probe.semantic_bounds,
+        Some(field_border_before.translate(0.0, -10.0))
+    );
+    assert_eq!(
+        after_redraw_probe.ime_candidate_rect,
+        Some(expected_cursor_after)
+    );
+    assert!(diagnostics.records().iter().any(|record| {
+        record.operation == "ime.cursor_area"
+            && record
+                .fields
+                .get("target_id")
+                .is_some_and(|value| value == &field.id().raw().to_string())
+            && record
+                .fields
+                .get("rect_y")
+                .is_some_and(|value| value == &expected_cursor_after.y().to_string())
+    }));
+    assert!(diagnostics.records().iter().any(|record| {
+        record.operation == "scroll.offset"
+            && record
+                .fields
+                .get("target_id")
+                .is_some_and(|value| value == &scroll.id().raw().to_string())
+            && record
+                .fields
+                .get("new_y")
+                .is_some_and(|value| value == "10")
+            && record
+                .fields
+                .get("max_y")
+                .is_some_and(|value| value == "70")
+    }));
 }
 
 #[test]

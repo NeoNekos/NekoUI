@@ -18,8 +18,10 @@ use crate::interaction::{
     PointerEvent, PointerInput, PointerInputKind, ScrollDelta, TextInput, TextInputPurpose,
     TextRange, WheelInput, WindowFocusInput,
 };
+#[cfg(test)]
+use crate::layout::ScrollGeometry;
 use crate::layout::{
-    LayoutNodeSnapshot, LayoutPassStats, LayoutPoint, LayoutSize, compute_layout,
+    LayoutNodeSnapshot, LayoutPassStats, LayoutPoint, LayoutRect, LayoutSize, compute_layout,
     text_viewport_placement,
 };
 #[cfg(target_os = "windows")]
@@ -59,6 +61,40 @@ pub(crate) struct Runtime {
     render_prepare_duration: Duration,
     transaction_depth: usize,
     drain_depth: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ScrollGeometryProbe {
+    pub(crate) scroll_target: InteractionTarget,
+    pub(crate) observed_target: InteractionTarget,
+    pub(crate) scroll: Option<ScrollGeometryProbeScroll>,
+    pub(crate) current_offset: LayoutPoint,
+    pub(crate) hit_target: Option<InteractionTarget>,
+    pub(crate) hit_path: Vec<InteractionTarget>,
+    pub(crate) paint_bounds: Vec<LayoutRect>,
+    pub(crate) semantic_bounds: Option<LayoutRect>,
+    pub(crate) ime_caret_rect: Option<LayoutRect>,
+    pub(crate) ime_candidate_rect: Option<LayoutRect>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScrollGeometryProbeScroll {
+    pub(crate) viewport: LayoutRect,
+    pub(crate) content_extent: LayoutSize,
+    pub(crate) max_offset: LayoutPoint,
+}
+
+#[cfg(test)]
+impl ScrollGeometryProbeScroll {
+    fn new(geometry: ScrollGeometry) -> Self {
+        Self {
+            viewport: geometry.viewport(),
+            content_extent: geometry.content_extent(),
+            max_offset: geometry.max_offset(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Runtime {
@@ -440,6 +476,83 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(crate) fn scroll_geometry_probe(
+        &self,
+        handle: impl Into<AnyWindowHandle>,
+        scroll_target: InteractionTarget,
+        observed_target: InteractionTarget,
+        hit_position: LayoutPoint,
+    ) -> NekoResult<ScrollGeometryProbe> {
+        let handle = handle.into();
+        self.state.validate_window(handle)?;
+        let scroll = self
+            .layout_scroll_geometry(handle, scroll_target)?
+            .map(ScrollGeometryProbeScroll::new);
+        let current_offset = self
+            .state
+            .interaction(handle.id())
+            .map_or(LayoutPoint::ZERO, |state| {
+                state.scroll_offset(scroll_target)
+            });
+        let hit_entry = self.hit_entry_at(handle, hit_position);
+        let hit_target = hit_entry
+            .as_ref()
+            .map(|entry| InteractionTarget::new(entry.node_id(), entry.node_generation()));
+        let hit_path = hit_entry
+            .as_ref()
+            .map(|entry| {
+                entry
+                    .path()
+                    .iter()
+                    .map(|path| InteractionTarget::new(path.node_id(), path.node_generation()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let paint_bounds = self
+            .state
+            .scene_snapshot(handle.id())
+            .map(|scene| {
+                scene
+                    .fragments()
+                    .iter()
+                    .filter(|fragment| {
+                        fragment.node_id() == observed_target.node_id()
+                            && fragment.node_generation() == observed_target.node_generation()
+                    })
+                    .map(|fragment| fragment.rect())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let semantic_bounds = self
+            .state
+            .semantic_snapshot(handle.id())
+            .and_then(|snapshot| snapshot.bounds_for_retained_target(observed_target));
+        let ime_caret_rect = self.text_input_cursor_area(handle, observed_target);
+        let ime_candidate_rect = self
+            .state
+            .peek_ime_requests(handle.id())
+            .iter()
+            .rev()
+            .find_map(|request| match request {
+                ImePlatformRequest::CursorArea { rect } => Some(*rect),
+                _ => None,
+            });
+
+        Ok(ScrollGeometryProbe {
+            scroll_target,
+            observed_target,
+            scroll,
+            current_offset,
+            hit_target,
+            hit_path,
+            paint_bounds,
+            semantic_bounds,
+            ime_caret_rect,
+            ime_candidate_rect,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn window_focus_changed(
         &mut self,
         handle: impl Into<AnyWindowHandle>,
@@ -673,6 +786,7 @@ impl Runtime {
                     draw_item_count: self.state.last_frame_graph().draw_item_count,
                     upload_intent_count: self.state.last_frame_graph().upload_intent_count,
                     layer_count: self.state.last_frame_graph().layer_count,
+                    box_shape_count: self.state.last_frame_graph().box_shape_count,
                     unsupported_fragment_count: self
                         .state
                         .last_frame_graph()
@@ -1342,6 +1456,7 @@ impl Runtime {
                     .interaction(handle.id())
                     .and_then(|state| state.text_input_focus());
                 self.record_ime_transition(handle, "disabled", target, "accepted");
+                let mut text_or_layout_changed = false;
                 if let Some(target) = target
                     && matches!(
                         self.state
@@ -1351,14 +1466,16 @@ impl Runtime {
                     )
                 {
                     self.mark_text_target_changed(handle, target);
-                    self.refresh_text_input_cursor_area(handle);
+                    text_or_layout_changed = true;
                 }
                 if target.is_some() {
                     self.state.push_ime_request(
                         handle.id(),
                         ImePlatformRequest::Allowed { allowed: true },
                     );
-                    self.refresh_text_input_cursor_area(handle);
+                    if !text_or_layout_changed {
+                        self.refresh_text_input_cursor_area(handle);
+                    }
                 }
                 Ok(())
             }
@@ -1441,6 +1558,33 @@ impl Runtime {
         );
     }
 
+    fn record_ime_cursor_area(
+        &mut self,
+        handle: AnyWindowHandle,
+        target: InteractionTarget,
+        rect: LayoutRect,
+    ) {
+        self.diagnostics.record(
+            DiagnosticRecord::new(
+                DiagnosticArea::Input,
+                DiagnosticSeverity::Info,
+                ErrorKind::Diagnostic,
+                "ime.cursor_area",
+                "IME candidate cursor area refreshed",
+            )
+            .with_field("window", handle.id().raw().to_string())
+            .with_field("target_id", target.node_id().raw().to_string())
+            .with_field(
+                "target_generation",
+                target.node_generation().raw().to_string(),
+            )
+            .with_field("rect_x", rect.x().to_string())
+            .with_field("rect_y", rect.y().to_string())
+            .with_field("rect_width", rect.width().to_string())
+            .with_field("rect_height", rect.height().to_string()),
+        );
+    }
+
     fn apply_text_commit(
         &mut self,
         handle: AnyWindowHandle,
@@ -1503,7 +1647,6 @@ impl Runtime {
         match result {
             Ok(Some(TextEditOutcome::Mutated)) => {
                 self.mark_text_target_changed(handle, target);
-                self.refresh_text_input_cursor_area(handle);
                 self.record_text_edit(handle, Some(target), kind, "mutated", text_len, None);
             }
             Ok(Some(TextEditOutcome::Unchanged)) => {
@@ -1608,6 +1751,7 @@ impl Runtime {
         };
         if let Some(rect) = self.text_input_cursor_area(handle, target) {
             self.state.replace_ime_candidate_rect(handle.id(), rect);
+            self.record_ime_cursor_area(handle, target, rect);
         }
     }
 
@@ -2480,6 +2624,7 @@ impl Runtime {
             .with_field("draw_item_count", stats.draw_item_count.to_string())
             .with_field("upload_intent_count", stats.upload_intent_count.to_string())
             .with_field("layer_count", stats.layer_count.to_string())
+            .with_field("box_shape_count", stats.box_shape_count.to_string())
             .with_field(
                 "unsupported_fragment_count",
                 stats.unsupported_fragment_count.to_string(),

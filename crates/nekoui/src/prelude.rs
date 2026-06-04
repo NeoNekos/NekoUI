@@ -10,7 +10,7 @@ pub use crate::interaction::{
 };
 pub use crate::layout::LayoutPoint;
 pub use crate::style::{
-    Color, ColorSpace, Dimension, Display, Length, Opacity, Overflow, StyleExt, TextOverflow, auto,
-    fill, opacity, px,
+    Color, ColorSpace, CornerRadii, Dimension, Display, Length, Opacity, Overflow, StyleExt,
+    TextOverflow, auto, fill, opacity, px, rgb, rgba,
 };
 pub use crate::window::{WindowHandle, WindowOptions};

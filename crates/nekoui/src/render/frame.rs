@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::layout::{LayoutRect, LayoutSize, Viewport, ViewportGeneration};
 use crate::platform::PhysicalSize;
 use crate::scene::{
-    PaintScene, ResourceDemandKind, SceneGeneration, SceneInputSignature, SceneOrder,
+    BoxShape, PaintScene, ResourceDemandKind, SceneGeneration, SceneInputSignature, SceneOrder,
 };
 use crate::style::Color;
 use crate::text::{TextGlyphDemand, TextLayoutRef};
@@ -197,6 +197,9 @@ impl DrawItem {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum DrawItemKind {
+    BoxShape {
+        shape: BoxShape,
+    },
     Rect {
         color: Color,
     },
@@ -207,7 +210,9 @@ pub(crate) enum DrawItemKind {
         clip: Option<LayoutRect>,
         color: Color,
     },
-    ClipPush,
+    ClipPush {
+        clip: LayoutRect,
+    },
     ClipPop,
     Unsupported {
         capability: &'static str,
@@ -269,7 +274,7 @@ impl UploadIntent {
         &self.expected_generation
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, target_os = "windows"))]
     pub(crate) fn dependent_draw_orders(&self) -> &[SceneOrder] {
         &self.dependent_draw_orders
     }
@@ -285,9 +290,13 @@ impl DrawItemKind {
     pub(crate) fn supported_windows_glyph_text(&self) -> bool {
         match self {
             Self::Text { layout, color, .. } => {
-                color.srgb_channels().is_some() && !layout.glyphs().is_empty()
+                color.to_current_backend_sdr_srgb_rgba().is_some() && !layout.glyphs().is_empty()
             }
-            Self::Rect { .. } | Self::ClipPush | Self::ClipPop | Self::Unsupported { .. } => false,
+            Self::BoxShape { .. }
+            | Self::Rect { .. }
+            | Self::ClipPush { .. }
+            | Self::ClipPop
+            | Self::Unsupported { .. } => false,
         }
     }
 }
@@ -314,6 +323,7 @@ pub struct FrameGraphStats {
     pub draw_item_count: usize,
     pub upload_intent_count: usize,
     pub layer_count: usize,
+    pub box_shape_count: usize,
     pub unsupported_fragment_count: usize,
     pub stale_drop_count: u64,
     pub duration: Duration,

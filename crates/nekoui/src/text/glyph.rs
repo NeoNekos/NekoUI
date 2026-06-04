@@ -5,7 +5,7 @@ use crate::retained::{NodeGeneration, RetainedNodeId};
 use crate::style::TextOverflow;
 
 use super::font::FontGeneration;
-use super::measure::{TextGeneration, TextLayoutMode, TextMetrics};
+use super::measure::{TextGeneration, TextInlineConstraintKey, TextLayoutMode, TextMetrics};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct TextLayoutGeneration(u64);
@@ -32,7 +32,7 @@ pub(crate) struct TextLayoutKey {
     pub(crate) text_generation: TextGeneration,
     pub(crate) style_generation: TextGeneration,
     pub(crate) text_hash: u64,
-    pub(crate) available_inline_width_bits: Option<u32>,
+    pub(crate) inline_constraint: TextInlineConstraintKey,
     pub(crate) layout_mode: TextLayoutMode,
     pub(crate) font_size_bits: u32,
     pub(crate) max_lines: Option<usize>,
@@ -107,22 +107,104 @@ impl GlyphInstance {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TextLineMetrics {
+    top: f32,
+    baseline: f32,
+    height: f32,
+    max_ascent: f32,
+    max_descent: f32,
+}
+
+impl TextLineMetrics {
+    pub(crate) fn new(
+        top: f32,
+        baseline: f32,
+        height: f32,
+        max_ascent: f32,
+        max_descent: f32,
+    ) -> Self {
+        Self {
+            top,
+            baseline,
+            height,
+            max_ascent,
+            max_descent,
+        }
+    }
+
+    pub(crate) fn top(self) -> f32 {
+        self.top
+    }
+
+    pub(crate) fn baseline(self) -> f32 {
+        self.baseline
+    }
+
+    pub(crate) fn height(self) -> f32 {
+        self.height
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_ascent(self) -> f32 {
+        self.max_ascent
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_descent(self) -> f32 {
+        self.max_descent
+    }
+
+    #[cfg(test)]
+    pub(crate) fn required_height(self) -> f32 {
+        self.max_ascent + self.max_descent
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextLayoutData {
     generation: TextLayoutGeneration,
     key: TextLayoutKey,
     scale_factor: f32,
     metrics: TextMetrics,
+    lines: Arc<[TextLineMetrics]>,
     trailing_caret_rect: LayoutRect,
     glyphs: Arc<[GlyphInstance]>,
     demands: Arc<[GlyphDemand]>,
 }
 
 impl TextLayoutData {
+    #[cfg(all(test, target_os = "windows"))]
     pub(crate) fn new(
         generation: TextLayoutGeneration,
         key: TextLayoutKey,
         metrics: TextMetrics,
+        trailing_caret_rect: LayoutRect,
+        glyphs: Arc<[GlyphInstance]>,
+        demands: Arc<[GlyphDemand]>,
+    ) -> Self {
+        Self::new_with_lines(
+            generation,
+            key,
+            metrics,
+            Arc::from([TextLineMetrics::new(
+                0.0,
+                metrics.baseline,
+                metrics.height,
+                metrics.baseline,
+                (metrics.height - metrics.baseline).max(0.0),
+            )]),
+            trailing_caret_rect,
+            glyphs,
+            demands,
+        )
+    }
+
+    pub(crate) fn new_with_lines(
+        generation: TextLayoutGeneration,
+        key: TextLayoutKey,
+        metrics: TextMetrics,
+        lines: Arc<[TextLineMetrics]>,
         trailing_caret_rect: LayoutRect,
         glyphs: Arc<[GlyphInstance]>,
         demands: Arc<[GlyphDemand]>,
@@ -133,6 +215,7 @@ impl TextLayoutData {
             key,
             scale_factor,
             metrics,
+            lines,
             trailing_caret_rect,
             glyphs,
             demands,
@@ -170,6 +253,10 @@ impl TextLayoutRef {
         self.data.trailing_caret_rect
     }
 
+    pub(crate) fn lines(&self) -> &[TextLineMetrics] {
+        &self.data.lines
+    }
+
     #[cfg(any(test, target_os = "windows"))]
     pub(crate) fn scale_factor(&self) -> f32 {
         self.data.scale_factor
@@ -203,9 +290,41 @@ impl TextGlyphDemand {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GlyphBitmapFormat {
+    MaskR8,
+    ColorRgba8,
+}
+
+#[cfg(target_os = "windows")]
+impl GlyphBitmapFormat {
+    pub(crate) const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::MaskR8 => 1,
+            Self::ColorRgba8 => 4,
+        }
+    }
+
+    pub(crate) const fn malformed_content_kind(self) -> &'static str {
+        match self {
+            Self::MaskR8 => "malformed_glyph_bitmap",
+            Self::ColorRgba8 => "malformed_color_glyph_bitmap",
+        }
+    }
+
+    pub(crate) const fn empty_content_kind(self) -> &'static str {
+        match self {
+            Self::MaskR8 => "empty_glyph_bitmap",
+            Self::ColorRgba8 => "empty_color_glyph_bitmap",
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GlyphBitmap {
     key: GlyphKey,
+    format: GlyphBitmapFormat,
     width: u32,
     height: u32,
     left: i32,
@@ -223,14 +342,58 @@ impl GlyphBitmap {
         top: i32,
         pixels: Arc<[u8]>,
     ) -> Self {
+        Self::new_with_format(
+            key,
+            GlyphBitmapFormat::MaskR8,
+            width,
+            height,
+            left,
+            top,
+            pixels,
+        )
+    }
+
+    pub(crate) fn new_color_rgba8(
+        key: GlyphKey,
+        width: u32,
+        height: u32,
+        left: i32,
+        top: i32,
+        pixels: Arc<[u8]>,
+    ) -> Self {
+        Self::new_with_format(
+            key,
+            GlyphBitmapFormat::ColorRgba8,
+            width,
+            height,
+            left,
+            top,
+            pixels,
+        )
+    }
+
+    fn new_with_format(
+        key: GlyphKey,
+        format: GlyphBitmapFormat,
+        width: u32,
+        height: u32,
+        left: i32,
+        top: i32,
+        pixels: Arc<[u8]>,
+    ) -> Self {
         Self {
             key,
+            format,
             width,
             height,
             left,
             top,
             pixels,
         }
+    }
+
+    pub(crate) fn format(&self) -> GlyphBitmapFormat {
+        self.format
     }
 
     pub(crate) fn width(&self) -> u32 {

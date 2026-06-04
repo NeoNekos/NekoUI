@@ -89,3 +89,28 @@ impl<T: Default + Copy> Default for Edges<T> {
         Self::all(T::default())
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CornerRadii<T> {
+    pub top_left: T,
+    pub top_right: T,
+    pub bottom_right: T,
+    pub bottom_left: T,
+}
+
+impl<T: Copy> CornerRadii<T> {
+    pub fn all(value: T) -> Self {
+        Self {
+            top_left: value,
+            top_right: value,
+            bottom_right: value,
+            bottom_left: value,
+        }
+    }
+}
+
+impl<T: Default + Copy> Default for CornerRadii<T> {
+    fn default() -> Self {
+        Self::all(T::default())
+    }
+}

@@ -8,7 +8,7 @@ mod paint;
 
 pub use damage::{DamageReason, DamageRegion};
 pub use diagnostic::{ResourceDemandKind, SceneCompileStats, SceneDiagnostic, SceneResourceDemand};
-pub use fragment::{PaintFragment, PaintFragmentKind, SceneOrder};
+pub use fragment::{BoxShape, PaintFragment, PaintFragmentKind, SceneOrder};
 pub use generation::{SceneGeneration, SceneInputSignature, SceneSignatureFact};
 pub(crate) use hit_test::HitTestPathNode;
 pub use hit_test::{HitTestEntry, HitTestScene};
@@ -19,7 +19,10 @@ pub(crate) use compile::{
     scene_publish_is_current_with_interaction,
 };
 #[cfg(test)]
-pub(crate) use compile::{scene_generation_for_inputs, scene_publish_is_current};
+pub(crate) use compile::{
+    compile_scene_with_test_text_layout_debug_probe, scene_generation_for_inputs,
+    scene_publish_is_current,
+};
 
 #[cfg(test)]
 mod tests;

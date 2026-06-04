@@ -146,23 +146,27 @@ impl FontManager {
         else {
             return Err(crate::text::GlyphRasterError::MissingGlyph);
         };
-        if image.content != SwashContent::Mask {
-            return Err(crate::text::GlyphRasterError::UnsupportedContent(
-                match image.content {
-                    SwashContent::Mask => "mask",
-                    SwashContent::SubpixelMask => "subpixel_mask",
-                    SwashContent::Color => "color_glyph",
-                },
-            ));
+        match image.content {
+            SwashContent::Mask => Ok(crate::text::GlyphBitmap::new(
+                key,
+                image.placement.width,
+                image.placement.height,
+                image.placement.left,
+                image.placement.top,
+                Arc::from(image.data.as_slice()),
+            )),
+            SwashContent::Color => Ok(crate::text::GlyphBitmap::new_color_rgba8(
+                key,
+                image.placement.width,
+                image.placement.height,
+                image.placement.left,
+                image.placement.top,
+                Arc::from(image.data.as_slice()),
+            )),
+            SwashContent::SubpixelMask => Err(crate::text::GlyphRasterError::UnsupportedContent(
+                "subpixel_mask",
+            )),
         }
-        Ok(crate::text::GlyphBitmap::new(
-            key,
-            image.placement.width,
-            image.placement.height,
-            image.placement.left,
-            image.placement.top,
-            Arc::from(image.data.as_slice()),
-        ))
     }
 
     #[cfg(test)]

@@ -1,12 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
 
 use crate::error::{NekoError, NekoResult};
 use crate::layout::LayoutRect;
 use crate::render::{DrawItemKind, PreparedFrame};
 use crate::style::Color;
 use crate::text::{
-    FontManager, GlyphBitmap, GlyphInstance, GlyphKey, GlyphRasterError, TextLayoutRef,
+    FontManager, GlyphBitmap, GlyphBitmapFormat, GlyphInstance, GlyphKey, GlyphRasterError,
+    TextLayoutRef,
 };
+
+use super::clip::{ActiveClip, ClipStack};
 
 pub(super) const GLYPH_ATLAS_WIDTH: u32 = 1024;
 pub(super) const GLYPH_ATLAS_HEIGHT: u32 = 1024;
@@ -19,6 +23,82 @@ pub(super) struct GlyphDraw {
     pub(super) rect: LayoutRect,
     pub(super) uv: GlyphUv,
     pub(super) color: Color,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GlyphDrawFormat {
+    MonoMask,
+    ColorRgba,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct GlyphDrawPlan {
+    mono_draws: Vec<GlyphDraw>,
+    color_draws: Vec<GlyphDraw>,
+    runs: Vec<GlyphDrawRun>,
+}
+
+impl GlyphDrawPlan {
+    pub(super) fn clear(&mut self) {
+        self.mono_draws.clear();
+        self.color_draws.clear();
+        self.runs.clear();
+    }
+
+    pub(super) fn has_mono_draws(&self) -> bool {
+        !self.mono_draws.is_empty()
+    }
+
+    pub(super) fn has_color_draws(&self) -> bool {
+        !self.color_draws.is_empty()
+    }
+
+    pub(super) fn runs(&self) -> &[GlyphDrawRun] {
+        &self.runs
+    }
+
+    pub(super) fn mono_draws(&self) -> &[GlyphDraw] {
+        &self.mono_draws
+    }
+
+    pub(super) fn color_draws(&self) -> &[GlyphDraw] {
+        &self.color_draws
+    }
+
+    fn push(&mut self, format: GlyphDrawFormat, draw: GlyphDraw) {
+        let index = match format {
+            GlyphDrawFormat::MonoMask => {
+                let index = self.mono_draws.len();
+                self.mono_draws.push(draw);
+                index
+            }
+            GlyphDrawFormat::ColorRgba => {
+                let index = self.color_draws.len();
+                self.color_draws.push(draw);
+                index
+            }
+        };
+        if let Some(run) = self.runs.last_mut()
+            && run.order == draw.order
+            && run.format == format
+            && run.range.end == index
+        {
+            run.range.end += 1;
+            return;
+        }
+        self.runs.push(GlyphDrawRun {
+            order: draw.order,
+            format,
+            range: index..index + 1,
+        });
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GlyphDrawRun {
+    pub(super) order: crate::scene::SceneOrder,
+    pub(super) format: GlyphDrawFormat,
+    pub(super) range: Range<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -128,6 +208,7 @@ impl GlyphAtlasEntry {
 
 #[derive(Clone, Debug)]
 pub(super) struct GlyphAtlas {
+    format: GlyphBitmapFormat,
     width: u32,
     height: u32,
     pixels: Vec<u8>,
@@ -141,11 +222,21 @@ pub(super) struct GlyphAtlas {
 
 impl GlyphAtlas {
     pub(super) fn new(width: u32, height: u32) -> NekoResult<Self> {
+        Self::new_with_format(GlyphBitmapFormat::MaskR8, width, height)
+    }
+
+    pub(super) fn new_color_rgba8(width: u32, height: u32) -> NekoResult<Self> {
+        Self::new_with_format(GlyphBitmapFormat::ColorRgba8, width, height)
+    }
+
+    fn new_with_format(format: GlyphBitmapFormat, width: u32, height: u32) -> NekoResult<Self> {
         let len = width
             .checked_mul(height)
+            .and_then(|value| value.checked_mul(format.bytes_per_pixel() as u32))
             .and_then(|value| usize::try_from(value).ok())
             .ok_or_else(|| NekoError::resource_failure("glyph atlas page is too large"))?;
         Ok(Self {
+            format,
             width,
             height,
             pixels: vec![0; len],
@@ -158,6 +249,12 @@ impl GlyphAtlas {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn format(&self) -> GlyphBitmapFormat {
+        self.format
+    }
+
+    #[cfg(test)]
     pub(super) fn ensure_glyph(
         &mut self,
         key: GlyphKey,
@@ -184,6 +281,25 @@ impl GlyphAtlas {
                 ));
             }
         };
+        self.ensure_bitmap(key, bitmap)
+    }
+
+    fn ensure_bitmap(
+        &mut self,
+        key: GlyphKey,
+        bitmap: GlyphBitmap,
+    ) -> NekoResult<GlyphAtlasOutcome> {
+        if let Some(entry) = self.entries.get(&key).copied() {
+            return Ok(GlyphAtlasOutcome::Ready(entry));
+        }
+        if let Some(reason) = self.skipped.get(&key).copied() {
+            return Ok(GlyphAtlasOutcome::Unsupported(reason));
+        }
+        if bitmap.format() != self.format {
+            let reason = GlyphSkipReason::UnsupportedContent("glyph_bitmap_format_mismatch");
+            self.remember_skip(key, reason);
+            return Ok(GlyphAtlasOutcome::Unsupported(reason));
+        }
         if let Some(reason) = bitmap_skip_reason(&bitmap)? {
             self.remember_skip(key, reason);
             return Ok(GlyphAtlasOutcome::Unsupported(reason));
@@ -205,6 +321,10 @@ impl GlyphAtlas {
         &self.pixels
     }
 
+    pub(super) fn bytes_per_pixel(&self) -> usize {
+        self.format.bytes_per_pixel()
+    }
+
     pub(super) fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
     }
@@ -223,9 +343,22 @@ impl GlyphAtlas {
         let offset = y
             .checked_mul(self.width)
             .and_then(|value| value.checked_add(x))
+            .and_then(|value| value.checked_mul(self.bytes_per_pixel() as u32))
             .and_then(|value| usize::try_from(value).ok())
             .expect("test glyph atlas pixel coordinate is out of bounds");
         self.pixels[offset]
+    }
+
+    #[cfg(test)]
+    pub(super) fn pixel_bytes(&self, x: u32, y: u32) -> &[u8] {
+        let start = y
+            .checked_mul(self.width)
+            .and_then(|value| value.checked_add(x))
+            .and_then(|value| value.checked_mul(self.bytes_per_pixel() as u32))
+            .and_then(|value| usize::try_from(value).ok())
+            .expect("test glyph atlas pixel coordinate is out of bounds");
+        let end = start + self.bytes_per_pixel();
+        &self.pixels[start..end]
     }
 
     fn allocate(&mut self, bitmap: &GlyphBitmap) -> NekoResult<GlyphAllocation> {
@@ -296,11 +429,16 @@ impl GlyphAtlas {
             .map_err(|_| NekoError::resource_failure("glyph bitmap width exceeds usize"))?;
         let height = usize::try_from(bitmap.height())
             .map_err(|_| NekoError::resource_failure("glyph bitmap height exceeds usize"))?;
+        let row_bytes = checked_usize_mul(
+            width,
+            bitmap.format().bytes_per_pixel(),
+            "glyph bitmap row size overflows usize",
+        )?;
         let expected_len =
-            checked_usize_mul(width, height, "glyph bitmap mask size overflows usize")?;
+            checked_usize_mul(row_bytes, height, "glyph bitmap byte size overflows usize")?;
         if bitmap.pixels().len() != expected_len {
             return Err(NekoError::resource_failure(
-                "glyph bitmap mask size does not match placement",
+                "glyph bitmap byte size does not match placement",
             ));
         }
         let entry_right =
@@ -317,25 +455,42 @@ impl GlyphAtlas {
         }
         let atlas_width = usize::try_from(self.width)
             .map_err(|_| NekoError::resource_failure("glyph atlas width exceeds usize"))?;
+        let atlas_row_bytes = checked_usize_mul(
+            atlas_width,
+            self.bytes_per_pixel(),
+            "glyph atlas row size overflows usize",
+        )?;
         let entry_x = usize::try_from(entry.x)
             .map_err(|_| NekoError::resource_failure("glyph atlas entry x exceeds usize"))?;
+        let entry_x_bytes = checked_usize_mul(
+            entry_x,
+            self.bytes_per_pixel(),
+            "glyph atlas entry byte x overflows usize",
+        )?;
         let entry_y = usize::try_from(entry.y)
             .map_err(|_| NekoError::resource_failure("glyph atlas entry y exceeds usize"))?;
         for row in 0..height {
             let dst_y = checked_usize_add(entry_y, row, "glyph bitmap destination y overflow")?;
-            let dst_row_start =
-                checked_usize_mul(dst_y, atlas_width, "glyph bitmap destination row overflow")?;
+            let dst_row_start = checked_usize_mul(
+                dst_y,
+                atlas_row_bytes,
+                "glyph bitmap destination row overflow",
+            )?;
             let dst_start = checked_usize_add(
                 dst_row_start,
-                entry_x,
+                entry_x_bytes,
                 "glyph bitmap destination start overflow",
             )?;
-            let dst_end =
-                checked_usize_add(dst_start, width, "glyph bitmap destination end overflow")?;
-            let src_start = checked_usize_mul(row, width, "glyph bitmap source row overflow")?;
-            let src_end = checked_usize_add(src_start, width, "glyph bitmap source end overflow")?;
+            let dst_end = checked_usize_add(
+                dst_start,
+                row_bytes,
+                "glyph bitmap destination end overflow",
+            )?;
+            let src_start = checked_usize_mul(row, row_bytes, "glyph bitmap source row overflow")?;
+            let src_end =
+                checked_usize_add(src_start, row_bytes, "glyph bitmap source end overflow")?;
             let source = bitmap.pixels().get(src_start..src_end).ok_or_else(|| {
-                NekoError::resource_failure("glyph bitmap mask size does not match placement")
+                NekoError::resource_failure("glyph bitmap byte size does not match placement")
             })?;
             let destination = self.pixels.get_mut(dst_start..dst_end).ok_or_else(|| {
                 NekoError::resource_failure("glyph bitmap placement exceeds atlas bounds")
@@ -368,17 +523,22 @@ fn u32_add_exceeds_bound(left: u32, right: u32, bound: u32) -> bool {
 fn bitmap_skip_reason(bitmap: &GlyphBitmap) -> NekoResult<Option<GlyphSkipReason>> {
     if bitmap.is_empty() {
         return Ok(Some(GlyphSkipReason::UnsupportedContent(
-            "empty_glyph_bitmap",
+            bitmap.format().empty_content_kind(),
         )));
     }
     let width = usize::try_from(bitmap.width())
         .map_err(|_| NekoError::resource_failure("glyph bitmap width exceeds usize"))?;
     let height = usize::try_from(bitmap.height())
         .map_err(|_| NekoError::resource_failure("glyph bitmap height exceeds usize"))?;
-    let expected_len = checked_usize_mul(width, height, "glyph bitmap mask size overflows usize")?;
+    let pixel_count = checked_usize_mul(width, height, "glyph bitmap pixel count overflows usize")?;
+    let expected_len = checked_usize_mul(
+        pixel_count,
+        bitmap.format().bytes_per_pixel(),
+        "glyph bitmap byte size overflows usize",
+    )?;
     if bitmap.pixels().len() != expected_len {
         return Ok(Some(GlyphSkipReason::UnsupportedContent(
-            "malformed_glyph_bitmap",
+            bitmap.format().malformed_content_kind(),
         )));
     }
     Ok(None)
@@ -389,16 +549,25 @@ enum GlyphAllocation {
     Unsupported(GlyphSkipReason),
 }
 
+#[cfg(test)]
 pub(super) fn prepare_glyph_atlas(
     prepared: &PreparedFrame,
     atlas: &mut GlyphAtlas,
     font_manager: &FontManager,
 ) -> NekoResult<GlyphUnsupportedReport> {
     let mut report = GlyphUnsupportedReport::default();
+    let visible_text_orders = visible_text_draw_orders(prepared);
     for intent in prepared.upload_plan().intents() {
         let Some(glyphs) = intent.glyphs() else {
             continue;
         };
+        if !intent
+            .dependent_draw_orders()
+            .iter()
+            .any(|order| visible_text_orders.contains(order))
+        {
+            continue;
+        }
         for demand in glyphs.layout().glyph_demands() {
             if let GlyphAtlasOutcome::Unsupported(reason) =
                 atlas.ensure_glyph(demand.key(), |key| font_manager.rasterize_glyph(key))?
@@ -410,6 +579,91 @@ pub(super) fn prepare_glyph_atlas(
     Ok(report)
 }
 
+pub(super) fn prepare_glyph_atlases(
+    prepared: &PreparedFrame,
+    mono_atlas: &mut GlyphAtlas,
+    color_atlas: &mut Option<GlyphAtlas>,
+    font_manager: &FontManager,
+) -> NekoResult<GlyphUnsupportedReport> {
+    let mut report = GlyphUnsupportedReport::default();
+    let visible_text_orders = visible_text_draw_orders(prepared);
+    for intent in prepared.upload_plan().intents() {
+        let Some(glyphs) = intent.glyphs() else {
+            continue;
+        };
+        if !intent
+            .dependent_draw_orders()
+            .iter()
+            .any(|order| visible_text_orders.contains(order))
+        {
+            continue;
+        }
+        for demand in glyphs.layout().glyph_demands() {
+            let key = demand.key();
+            if mono_atlas.entries.contains_key(&key)
+                || color_atlas
+                    .as_ref()
+                    .is_some_and(|atlas| atlas.entries.contains_key(&key))
+            {
+                continue;
+            }
+            if let Some(reason) = mono_atlas
+                .skipped
+                .get(&key)
+                .or_else(|| {
+                    color_atlas
+                        .as_ref()
+                        .and_then(|atlas| atlas.skipped.get(&key))
+                })
+                .copied()
+            {
+                report.note_skip(reason);
+                continue;
+            }
+            let bitmap = match font_manager.rasterize_glyph(key) {
+                Ok(bitmap) => bitmap,
+                Err(GlyphRasterError::MissingGlyph) => {
+                    let reason = GlyphSkipReason::MissingGlyph;
+                    mono_atlas.remember_skip(key, reason);
+                    if let Some(color_atlas) = color_atlas.as_mut() {
+                        color_atlas.remember_skip(key, reason);
+                    }
+                    report.note_skip(reason);
+                    continue;
+                }
+                Err(GlyphRasterError::UnsupportedContent(kind)) => {
+                    let reason = GlyphSkipReason::UnsupportedContent(kind);
+                    mono_atlas.remember_skip(key, reason);
+                    if let Some(color_atlas) = color_atlas.as_mut() {
+                        color_atlas.remember_skip(key, reason);
+                    }
+                    report.note_skip(reason);
+                    continue;
+                }
+            };
+            let target = match bitmap.format() {
+                GlyphBitmapFormat::MaskR8 => &mut *mono_atlas,
+                GlyphBitmapFormat::ColorRgba8 => {
+                    if color_atlas.is_none() {
+                        *color_atlas = Some(GlyphAtlas::new_color_rgba8(
+                            GLYPH_ATLAS_WIDTH,
+                            GLYPH_ATLAS_HEIGHT,
+                        )?);
+                    }
+                    color_atlas.as_mut().ok_or_else(|| {
+                        NekoError::resource_failure("color glyph atlas was not materialized")
+                    })?
+                }
+            };
+            if let GlyphAtlasOutcome::Unsupported(reason) = target.ensure_bitmap(key, bitmap)? {
+                report.note_skip(reason);
+            }
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(test)]
 pub(super) fn collect_glyph_draws(
     prepared: &PreparedFrame,
     atlas: &GlyphAtlas,
@@ -417,35 +671,125 @@ pub(super) fn collect_glyph_draws(
 ) -> NekoResult<GlyphUnsupportedReport> {
     draws.clear();
     let mut unsupported = GlyphUnsupportedReport::default();
+    let mut clip_stack = ClipStack::default();
     for item in prepared.draw_items() {
-        let DrawItemKind::Text {
-            layout,
-            clip,
-            color,
-            ..
-        } = item.kind()
-        else {
-            continue;
-        };
-        if color.srgb_channels().is_none() {
-            continue;
+        match item.kind() {
+            DrawItemKind::ClipPush { clip } => clip_stack.push(*clip),
+            DrawItemKind::ClipPop => clip_stack.pop(),
+            DrawItemKind::Text {
+                layout,
+                clip,
+                color,
+                ..
+            } => {
+                if color.to_current_backend_sdr_srgb_rgba().is_none() {
+                    continue;
+                }
+                let Some(clip) = glyph_clip(*clip, clip_stack.active_clip()) else {
+                    continue;
+                };
+                push_layout_draws(
+                    draws,
+                    &mut unsupported,
+                    GlyphDrawContext {
+                        order: item.order(),
+                        origin: item.rect(),
+                        clip,
+                    },
+                    layout,
+                    *color,
+                    atlas,
+                )?;
+            }
+            DrawItemKind::BoxShape { .. }
+            | DrawItemKind::Rect { .. }
+            | DrawItemKind::Unsupported { .. } => {}
         }
-        push_layout_draws(
-            draws,
-            &mut unsupported,
-            GlyphDrawContext {
-                order: item.order(),
-                origin: item.rect(),
-                clip: *clip,
-            },
-            layout,
-            *color,
-            atlas,
-        )?;
     }
     Ok(unsupported)
 }
 
+pub(super) fn collect_glyph_draw_plan(
+    prepared: &PreparedFrame,
+    mono_atlas: &GlyphAtlas,
+    color_atlas: Option<&GlyphAtlas>,
+    plan: &mut GlyphDrawPlan,
+) -> NekoResult<GlyphUnsupportedReport> {
+    plan.clear();
+    let mut unsupported = GlyphUnsupportedReport::default();
+    let mut clip_stack = ClipStack::default();
+    for item in prepared.draw_items() {
+        match item.kind() {
+            DrawItemKind::ClipPush { clip } => clip_stack.push(*clip),
+            DrawItemKind::ClipPop => clip_stack.pop(),
+            DrawItemKind::Text {
+                layout,
+                clip,
+                color,
+                ..
+            } => {
+                if color.to_current_backend_sdr_srgb_rgba().is_none() {
+                    continue;
+                }
+                let Some(clip) = glyph_clip(*clip, clip_stack.active_clip()) else {
+                    continue;
+                };
+                push_layout_draw_plan(
+                    plan,
+                    &mut unsupported,
+                    GlyphDrawContext {
+                        order: item.order(),
+                        origin: item.rect(),
+                        clip,
+                    },
+                    layout,
+                    *color,
+                    mono_atlas,
+                    color_atlas,
+                )?;
+            }
+            DrawItemKind::BoxShape { .. }
+            | DrawItemKind::Rect { .. }
+            | DrawItemKind::Unsupported { .. } => {}
+        }
+    }
+    Ok(unsupported)
+}
+
+fn visible_text_draw_orders(prepared: &PreparedFrame) -> BTreeSet<crate::scene::SceneOrder> {
+    let mut visible = BTreeSet::new();
+    let mut clip_stack = ClipStack::default();
+    for item in prepared.draw_items() {
+        match item.kind() {
+            DrawItemKind::ClipPush { clip } => clip_stack.push(*clip),
+            DrawItemKind::ClipPop => clip_stack.pop(),
+            DrawItemKind::Text { color, clip, .. }
+                if color.to_current_backend_sdr_srgb_rgba().is_some()
+                    && glyph_clip(*clip, clip_stack.active_clip()).is_some() =>
+            {
+                visible.insert(item.order());
+            }
+            DrawItemKind::BoxShape { .. }
+            | DrawItemKind::Rect { .. }
+            | DrawItemKind::Text { .. }
+            | DrawItemKind::Unsupported { .. } => {}
+        }
+    }
+    visible
+}
+
+fn glyph_clip(text_clip: Option<LayoutRect>, scene_clip: ActiveClip) -> Option<Option<LayoutRect>> {
+    match (text_clip, scene_clip) {
+        (_, ActiveClip::Empty) => None,
+        (None, ActiveClip::Unclipped) => Some(None),
+        (Some(clip), ActiveClip::Unclipped) | (None, ActiveClip::Rect(clip)) => Some(Some(clip)),
+        (Some(text_clip), ActiveClip::Rect(scene_clip)) => {
+            text_clip.intersect(scene_clip).map(Some)
+        }
+    }
+}
+
+#[cfg(test)]
 fn push_layout_draws(
     draws: &mut Vec<GlyphDraw>,
     unsupported: &mut GlyphUnsupportedReport,
@@ -481,6 +825,81 @@ fn push_layout_draws(
         });
     }
     Ok(())
+}
+
+fn push_layout_draw_plan(
+    plan: &mut GlyphDrawPlan,
+    unsupported: &mut GlyphUnsupportedReport,
+    context: GlyphDrawContext,
+    layout: &TextLayoutRef,
+    color: Color,
+    mono_atlas: &GlyphAtlas,
+    color_atlas: Option<&GlyphAtlas>,
+) -> NekoResult<()> {
+    let scale_factor = layout.scale_factor();
+    for glyph in layout.glyphs() {
+        let Some((format, entry, atlas_width, atlas_height)) =
+            glyph_entry(glyph.key(), mono_atlas, color_atlas, unsupported)
+        else {
+            continue;
+        };
+        if entry.width == 0 || entry.height == 0 {
+            continue;
+        }
+        let rect = glyph_rect(context.origin, *glyph, entry, scale_factor);
+        let uv = entry.uv(atlas_width, atlas_height)?;
+        let Some((rect, uv)) = clip_glyph_draw(rect, uv, context.clip) else {
+            continue;
+        };
+        plan.push(
+            format,
+            GlyphDraw {
+                order: context.order,
+                rect,
+                uv,
+                color,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn glyph_entry(
+    key: GlyphKey,
+    mono_atlas: &GlyphAtlas,
+    color_atlas: Option<&GlyphAtlas>,
+    unsupported: &mut GlyphUnsupportedReport,
+) -> Option<(GlyphDrawFormat, GlyphAtlasEntry, u32, u32)> {
+    if let Some(entry) = mono_atlas.entries.get(&key).copied() {
+        return Some((
+            GlyphDrawFormat::MonoMask,
+            entry,
+            mono_atlas.width,
+            mono_atlas.height,
+        ));
+    }
+    if let Some(color_atlas) = color_atlas
+        && let Some(entry) = color_atlas.entries.get(&key).copied()
+    {
+        return Some((
+            GlyphDrawFormat::ColorRgba,
+            entry,
+            color_atlas.width,
+            color_atlas.height,
+        ));
+    }
+    if let Some(reason) = mono_atlas
+        .skipped
+        .get(&key)
+        .or_else(|| color_atlas.and_then(|atlas| atlas.skipped.get(&key)))
+        .copied()
+    {
+        unsupported.note_skip(reason);
+        unsupported.skipped_cached_glyph_instances += 1;
+    } else {
+        unsupported.missing_atlas_entries += 1;
+    }
+    None
 }
 
 fn clip_glyph_draw(
@@ -535,7 +954,10 @@ mod tests {
     use crate::retained::{NodeGeneration, RetainedNodeId};
     use crate::style::{ResolvedStyle, StyleDeclaration, StyleExt, px};
     use crate::text::{GlyphBitmap, GlyphRasterError};
-    use crate::text::{TextGeneration, TextLayoutResult, TextMeasureQuery, TextMeasureSession};
+    use crate::text::{
+        TextGeneration, TextInlineConstraint, TextLayoutResult, TextMeasureQuery,
+        TextMeasureSession,
+    };
     use crate::window::WindowOptions;
 
     #[derive(Debug)]
@@ -614,7 +1036,7 @@ mod tests {
             style_generation: TextGeneration::INITIAL,
             text: "A",
             style: style.text(),
-            available_inline_width: None,
+            inline_constraint: TextInlineConstraint::MaxContent,
             layout_mode: crate::text::TextLayoutMode::SoftWrap,
             font_generation: session.font_generation(),
             scale_generation: 1,
@@ -641,6 +1063,7 @@ mod tests {
             bitmap.pixels().len(),
             bitmap.width() as usize * bitmap.height() as usize
         );
+        assert_eq!(bitmap.format(), GlyphBitmapFormat::MaskR8);
         assert!(bitmap.pixels().iter().any(|pixel| *pixel > 0));
     }
 
@@ -680,7 +1103,7 @@ mod tests {
             .unwrap();
         let unsupported = atlas
             .ensure_glyph(unsupported_key, |_| {
-                Err(GlyphRasterError::UnsupportedContent("color_glyph"))
+                Err(GlyphRasterError::UnsupportedContent("subpixel_mask"))
             })
             .unwrap();
 
@@ -690,7 +1113,7 @@ mod tests {
         );
         assert_eq!(
             unsupported,
-            GlyphAtlasOutcome::Unsupported(GlyphSkipReason::UnsupportedContent("color_glyph"))
+            GlyphAtlasOutcome::Unsupported(GlyphSkipReason::UnsupportedContent("subpixel_mask"))
         );
         assert_eq!(
             atlas
@@ -704,7 +1127,7 @@ mod tests {
                     "unsupported glyph should be cached"
                 ))
                 .unwrap(),
-            GlyphAtlasOutcome::Unsupported(GlyphSkipReason::UnsupportedContent("color_glyph"))
+            GlyphAtlasOutcome::Unsupported(GlyphSkipReason::UnsupportedContent("subpixel_mask"))
         );
         assert!(atlas.pixels().iter().all(|pixel| *pixel == 0));
     }
@@ -889,6 +1312,190 @@ mod tests {
     }
 
     #[test]
+    fn color_glyph_bitmaps_are_accepted_as_rgba8_and_preserve_channel_order() {
+        let mut atlas = GlyphAtlas::new_color_rgba8(8, 8).unwrap();
+        let key = test_glyph_key(1);
+        let bitmap = GlyphBitmap::new_color_rgba8(
+            key,
+            2,
+            1,
+            0,
+            0,
+            std::sync::Arc::from([10_u8, 20, 30, 40, 50, 60, 70, 80]),
+        );
+
+        let entry = match atlas.ensure_glyph(key, |_| Ok(bitmap)).unwrap() {
+            GlyphAtlasOutcome::Ready(entry) => entry,
+            GlyphAtlasOutcome::Unsupported(_) => unreachable!(),
+        };
+
+        assert_eq!(atlas.format(), GlyphBitmapFormat::ColorRgba8);
+        assert_eq!(entry.width, 2);
+        assert_eq!(entry.height, 1);
+        assert_eq!(atlas.pixel_bytes(entry.x, entry.y), &[10, 20, 30, 40]);
+        assert_eq!(atlas.pixel_bytes(entry.x + 1, entry.y), &[50, 60, 70, 80]);
+    }
+
+    #[test]
+    fn malformed_color_glyph_bitmaps_are_rejected_without_poisoning_mono_atlas() {
+        let mut mono_atlas = GlyphAtlas::new(8, 8).unwrap();
+        let mut color_atlas = GlyphAtlas::new_color_rgba8(8, 8).unwrap();
+        let mono_key = test_glyph_key(1);
+        let color_key = test_glyph_key(2);
+        let mono = GlyphBitmap::new(mono_key, 1, 1, 0, 0, std::sync::Arc::from([7_u8]));
+        let malformed_color =
+            GlyphBitmap::new_color_rgba8(color_key, 2, 2, 0, 0, std::sync::Arc::from([1_u8, 2, 3]));
+
+        assert!(matches!(
+            mono_atlas.ensure_glyph(mono_key, |_| Ok(mono)).unwrap(),
+            GlyphAtlasOutcome::Ready(_)
+        ));
+        assert_eq!(
+            color_atlas
+                .ensure_glyph(color_key, |_| Ok(malformed_color))
+                .unwrap(),
+            GlyphAtlasOutcome::Unsupported(GlyphSkipReason::UnsupportedContent(
+                "malformed_color_glyph_bitmap"
+            ))
+        );
+
+        assert!(mono_atlas.entries.contains_key(&mono_key));
+        assert!(!mono_atlas.skipped.contains_key(&color_key));
+        assert!(color_atlas.pixels().iter().all(|pixel| *pixel == 0));
+    }
+
+    #[test]
+    fn color_atlas_empty_oversize_and_full_paths_are_nonfatal() {
+        let mut atlas = GlyphAtlas::new_color_rgba8(8, 8).unwrap();
+        let first_key = test_glyph_key(1);
+        let empty_key = test_glyph_key(2);
+        let oversize_key = test_glyph_key(3);
+        let first = GlyphBitmap::new_color_rgba8(
+            first_key,
+            2,
+            2,
+            0,
+            0,
+            std::sync::Arc::from([5_u8; 2 * 2 * 4]),
+        );
+        let first_entry = match atlas.ensure_glyph(first_key, |_| Ok(first)).unwrap() {
+            GlyphAtlasOutcome::Ready(entry) => entry,
+            GlyphAtlasOutcome::Unsupported(_) => unreachable!(),
+        };
+        assert_eq!(
+            atlas
+                .ensure_glyph(empty_key, |_| {
+                    Ok(GlyphBitmap::new_color_rgba8(
+                        empty_key,
+                        0,
+                        0,
+                        0,
+                        0,
+                        std::sync::Arc::from([]),
+                    ))
+                })
+                .unwrap(),
+            GlyphAtlasOutcome::Unsupported(GlyphSkipReason::UnsupportedContent(
+                "empty_color_glyph_bitmap"
+            ))
+        );
+        assert_eq!(
+            atlas
+                .ensure_glyph(oversize_key, |_| {
+                    Ok(GlyphBitmap::new_color_rgba8(
+                        oversize_key,
+                        7,
+                        1,
+                        0,
+                        0,
+                        std::sync::Arc::from([9_u8; 7 * 4]),
+                    ))
+                })
+                .unwrap(),
+            GlyphAtlasOutcome::Unsupported(GlyphSkipReason::ExceedsAtlasPage)
+        );
+        assert_eq!(
+            atlas.ensure_glyph(first_key, |_| unreachable!()).unwrap(),
+            GlyphAtlasOutcome::Ready(first_entry)
+        );
+
+        let mut full_atlas = GlyphAtlas::new_color_rgba8(4, 4).unwrap();
+        let full_first_key = test_glyph_key(4);
+        let full_second_key = test_glyph_key(5);
+        assert!(matches!(
+            full_atlas
+                .ensure_glyph(full_first_key, |_| {
+                    Ok(GlyphBitmap::new_color_rgba8(
+                        full_first_key,
+                        1,
+                        1,
+                        0,
+                        0,
+                        std::sync::Arc::from([1_u8, 2, 3, 4]),
+                    ))
+                })
+                .unwrap(),
+            GlyphAtlasOutcome::Ready(_)
+        ));
+        assert_eq!(
+            full_atlas
+                .ensure_glyph(full_second_key, |_| {
+                    Ok(GlyphBitmap::new_color_rgba8(
+                        full_second_key,
+                        1,
+                        1,
+                        0,
+                        0,
+                        std::sync::Arc::from([5_u8, 6, 7, 8]),
+                    ))
+                })
+                .unwrap(),
+            GlyphAtlasOutcome::Unsupported(GlyphSkipReason::AtlasFull)
+        );
+        assert!(!full_atlas.skipped.contains_key(&full_second_key));
+    }
+
+    #[test]
+    fn mono_and_color_atlas_paths_stay_distinct() {
+        let mut mono_atlas = GlyphAtlas::new(8, 8).unwrap();
+        let mut color_atlas = GlyphAtlas::new_color_rgba8(8, 8).unwrap();
+        let mono_key = test_glyph_key(1);
+        let color_key = test_glyph_key(2);
+
+        mono_atlas
+            .ensure_glyph(mono_key, |_| {
+                Ok(GlyphBitmap::new(
+                    mono_key,
+                    1,
+                    1,
+                    0,
+                    0,
+                    std::sync::Arc::from([11_u8]),
+                ))
+            })
+            .unwrap();
+        color_atlas
+            .ensure_glyph(color_key, |_| {
+                Ok(GlyphBitmap::new_color_rgba8(
+                    color_key,
+                    1,
+                    1,
+                    0,
+                    0,
+                    std::sync::Arc::from([1_u8, 2, 3, 4]),
+                ))
+            })
+            .unwrap();
+
+        assert!(mono_atlas.entries.contains_key(&mono_key));
+        assert!(!mono_atlas.entries.contains_key(&color_key));
+        assert!(color_atlas.entries.contains_key(&color_key));
+        assert!(!color_atlas.entries.contains_key(&mono_key));
+        assert_eq!(mono_atlas.bytes_per_pixel(), 1);
+        assert_eq!(color_atlas.bytes_per_pixel(), 4);
+    }
+
+    #[test]
     fn zero_ink_nonzero_glyph_bitmaps_are_legitimate_atlas_entries() {
         let mut atlas = GlyphAtlas::new(8, 8).unwrap();
         let key = test_glyph_key(1);
@@ -938,6 +1545,37 @@ mod tests {
     }
 
     #[test]
+    fn collect_glyph_draws_accepts_oklch_text_color() {
+        let mut atlas = GlyphAtlas::new(16, 16).unwrap();
+        let key = test_glyph_key(1);
+        let bitmap = GlyphBitmap::new(key, 8, 4, 0, 0, std::sync::Arc::from([7_u8; 32]));
+        atlas.ensure_glyph(key, |_| Ok(bitmap)).unwrap();
+        let layout = test_text_layout(
+            std::sync::Arc::from([GlyphInstance::new(key, 0, 0)]),
+            std::sync::Arc::from([crate::text::GlyphDemand::new(key)]),
+        );
+        let prepared = prepared_frame_with_draw_items(vec![crate::render::DrawItem::new(
+            crate::scene::SceneOrder::new(1),
+            1,
+            LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::Text {
+                text_generation: crate::scene::SceneInputSignature::default(),
+                text_metrics_generation: 1,
+                layout,
+                clip: None,
+                color: Color::oklch(0.5, 0.1, 120.0),
+            },
+        )]);
+        let mut draws = Vec::new();
+
+        let unsupported = collect_glyph_draws(&prepared, &atlas, &mut draws).unwrap();
+
+        assert!(unsupported.is_empty());
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].color, Color::oklch(0.5, 0.1, 120.0));
+    }
+
+    #[test]
     fn clipped_glyph_draws_adjust_rect_and_uv_to_text_clip() {
         let mut atlas = GlyphAtlas::new(16, 16).unwrap();
         let key = test_glyph_key(1);
@@ -974,6 +1612,50 @@ mod tests {
     }
 
     #[test]
+    fn glyph_draws_use_intersection_of_scene_clip_and_text_clip() {
+        let mut atlas = GlyphAtlas::new(16, 16).unwrap();
+        let key = test_glyph_key(1);
+        let bitmap = GlyphBitmap::new(key, 8, 4, 0, 0, std::sync::Arc::from([7_u8; 32]));
+        atlas.ensure_glyph(key, |_| Ok(bitmap)).unwrap();
+        let layout = test_text_layout(
+            std::sync::Arc::from([GlyphInstance::new(key, 0, 0)]),
+            std::sync::Arc::from([crate::text::GlyphDemand::new(key)]),
+        );
+        let prepared = prepared_frame_with_draw_items(vec![
+            crate::render::DrawItem::new(
+                crate::scene::SceneOrder::new(1),
+                1,
+                LayoutRect::new(0.0, 2.0, 4.0, 2.0),
+                DrawItemKind::ClipPush {
+                    clip: LayoutRect::new(0.0, 2.0, 4.0, 2.0),
+                },
+            ),
+            text_draw_item_with_clip(
+                crate::scene::SceneOrder::new(2),
+                layout,
+                Some(LayoutRect::new(2.0, 1.0, 5.0, 3.0)),
+            ),
+            crate::render::DrawItem::new(
+                crate::scene::SceneOrder::new(3),
+                1,
+                LayoutRect::new(0.0, 2.0, 4.0, 2.0),
+                DrawItemKind::ClipPop,
+            ),
+        ]);
+        let mut draws = Vec::new();
+
+        let unsupported = collect_glyph_draws(&prepared, &atlas, &mut draws).unwrap();
+
+        assert!(unsupported.is_empty());
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].rect, LayoutRect::new(2.0, 2.0, 2.0, 2.0));
+        assert_eq!(draws[0].uv.left, 0.25);
+        assert_eq!(draws[0].uv.top, 0.25);
+        assert_eq!(draws[0].uv.right, 0.375);
+        assert_eq!(draws[0].uv.bottom, 0.375);
+    }
+
+    #[test]
     fn fully_clipped_glyph_draws_are_skipped_without_unsupported_diagnostics() {
         let mut atlas = GlyphAtlas::new(16, 16).unwrap();
         let key = test_glyph_key(1);
@@ -999,6 +1681,53 @@ mod tests {
             &atlas,
         )
         .unwrap();
+
+        assert!(draws.is_empty());
+        assert!(unsupported.is_empty());
+    }
+
+    #[test]
+    fn fully_scene_clipped_glyph_draws_are_skipped_without_atlas_diagnostics() {
+        let atlas = GlyphAtlas::new(16, 16).unwrap();
+        let key = test_glyph_key(1);
+        let layout = test_text_layout(
+            std::sync::Arc::from([GlyphInstance::new(key, 0, 0)]),
+            std::sync::Arc::from([crate::text::GlyphDemand::new(key)]),
+        );
+        let prepared = prepared_frame_with_draw_items(vec![
+            crate::render::DrawItem::new(
+                crate::scene::SceneOrder::new(1),
+                1,
+                LayoutRect::new(0.0, 0.0, 1.0, 1.0),
+                DrawItemKind::ClipPush {
+                    clip: LayoutRect::new(0.0, 0.0, 1.0, 1.0),
+                },
+            ),
+            crate::render::DrawItem::new(
+                crate::scene::SceneOrder::new(2),
+                1,
+                LayoutRect::new(10.0, 10.0, 1.0, 1.0),
+                DrawItemKind::ClipPush {
+                    clip: LayoutRect::new(10.0, 10.0, 1.0, 1.0),
+                },
+            ),
+            text_draw_item(crate::scene::SceneOrder::new(3), layout),
+            crate::render::DrawItem::new(
+                crate::scene::SceneOrder::new(4),
+                1,
+                LayoutRect::new(10.0, 10.0, 1.0, 1.0),
+                DrawItemKind::ClipPop,
+            ),
+            crate::render::DrawItem::new(
+                crate::scene::SceneOrder::new(5),
+                1,
+                LayoutRect::new(0.0, 0.0, 1.0, 1.0),
+                DrawItemKind::ClipPop,
+            ),
+        ]);
+        let mut draws = Vec::new();
+
+        let unsupported = collect_glyph_draws(&prepared, &atlas, &mut draws).unwrap();
 
         assert!(draws.is_empty());
         assert!(unsupported.is_empty());
@@ -1135,6 +1864,163 @@ mod tests {
     }
 
     #[test]
+    fn collect_glyph_draw_plan_preserves_mixed_color_and_mono_glyph_order() {
+        let mut mono_atlas = GlyphAtlas::new(16, 16).unwrap();
+        let mut color_atlas = GlyphAtlas::new_color_rgba8(16, 16).unwrap();
+        let mono_key = test_glyph_key(1);
+        let color_key = test_glyph_key(2);
+        mono_atlas
+            .ensure_glyph(mono_key, |_| {
+                Ok(GlyphBitmap::new(
+                    mono_key,
+                    1,
+                    1,
+                    0,
+                    0,
+                    std::sync::Arc::from([7_u8]),
+                ))
+            })
+            .unwrap();
+        color_atlas
+            .ensure_glyph(color_key, |_| {
+                Ok(GlyphBitmap::new_color_rgba8(
+                    color_key,
+                    1,
+                    1,
+                    0,
+                    0,
+                    std::sync::Arc::from([1_u8, 2, 3, 4]),
+                ))
+            })
+            .unwrap();
+        let layout = test_text_layout(
+            std::sync::Arc::from([
+                GlyphInstance::new(mono_key, 0, 0),
+                GlyphInstance::new(color_key, 8, 0),
+                GlyphInstance::new(mono_key, 16, 0),
+            ]),
+            std::sync::Arc::from([
+                crate::text::GlyphDemand::new(mono_key),
+                crate::text::GlyphDemand::new(color_key),
+            ]),
+        );
+        let prepared = prepared_frame_for_layout(layout);
+        let mut plan = GlyphDrawPlan::default();
+
+        let unsupported =
+            collect_glyph_draw_plan(&prepared, &mono_atlas, Some(&color_atlas), &mut plan).unwrap();
+
+        assert!(unsupported.is_empty());
+        assert_eq!(plan.mono_draws().len(), 2);
+        assert_eq!(plan.color_draws().len(), 1);
+        assert!(plan.has_mono_draws());
+        assert!(plan.has_color_draws());
+        assert_eq!(plan.runs().len(), 3);
+        assert_eq!(plan.runs()[0].format, GlyphDrawFormat::MonoMask);
+        assert_eq!(plan.runs()[0].range, 0..1);
+        assert_eq!(plan.runs()[1].format, GlyphDrawFormat::ColorRgba);
+        assert_eq!(plan.runs()[1].range, 0..1);
+        assert_eq!(plan.runs()[2].format, GlyphDrawFormat::MonoMask);
+        assert_eq!(plan.runs()[2].range, 1..2);
+        assert!(plan.mono_draws()[0].rect.x() < plan.color_draws()[0].rect.x());
+        assert!(plan.color_draws()[0].rect.x() < plan.mono_draws()[1].rect.x());
+    }
+
+    #[test]
+    fn mono_only_glyph_draw_plan_does_not_require_color_atlas() {
+        let mut mono_atlas = GlyphAtlas::new(16, 16).unwrap();
+        let key = test_glyph_key(1);
+        mono_atlas
+            .ensure_glyph(key, |_| {
+                Ok(GlyphBitmap::new(
+                    key,
+                    1,
+                    1,
+                    0,
+                    0,
+                    std::sync::Arc::from([7_u8]),
+                ))
+            })
+            .unwrap();
+        let layout = test_text_layout(
+            std::sync::Arc::from([GlyphInstance::new(key, 0, 0)]),
+            std::sync::Arc::from([crate::text::GlyphDemand::new(key)]),
+        );
+        let prepared = prepared_frame_for_layout(layout);
+        let mut plan = GlyphDrawPlan::default();
+
+        let unsupported = collect_glyph_draw_plan(&prepared, &mono_atlas, None, &mut plan).unwrap();
+
+        assert!(unsupported.is_empty());
+        assert!(plan.has_mono_draws());
+        assert!(!plan.has_color_draws());
+        assert_eq!(plan.runs().len(), 1);
+        assert_eq!(plan.runs()[0].format, GlyphDrawFormat::MonoMask);
+    }
+
+    #[test]
+    fn color_glyph_draw_plan_respects_scene_and_text_clip_collection() {
+        let mono_atlas = GlyphAtlas::new(16, 16).unwrap();
+        let mut color_atlas = GlyphAtlas::new_color_rgba8(16, 16).unwrap();
+        let key = test_glyph_key(1);
+        color_atlas
+            .ensure_glyph(key, |_| {
+                Ok(GlyphBitmap::new_color_rgba8(
+                    key,
+                    8,
+                    4,
+                    0,
+                    0,
+                    std::sync::Arc::from([9_u8; 8 * 4 * 4]),
+                ))
+            })
+            .unwrap();
+        let layout = test_text_layout(
+            std::sync::Arc::from([GlyphInstance::new(key, 0, 0)]),
+            std::sync::Arc::from([crate::text::GlyphDemand::new(key)]),
+        );
+        let prepared = prepared_frame_with_draw_items(vec![
+            crate::render::DrawItem::new(
+                crate::scene::SceneOrder::new(1),
+                1,
+                LayoutRect::new(0.0, 2.0, 4.0, 2.0),
+                DrawItemKind::ClipPush {
+                    clip: LayoutRect::new(0.0, 2.0, 4.0, 2.0),
+                },
+            ),
+            text_draw_item_with_clip(
+                crate::scene::SceneOrder::new(2),
+                layout,
+                Some(LayoutRect::new(2.0, 1.0, 5.0, 3.0)),
+            ),
+            crate::render::DrawItem::new(
+                crate::scene::SceneOrder::new(3),
+                1,
+                LayoutRect::new(0.0, 2.0, 4.0, 2.0),
+                DrawItemKind::ClipPop,
+            ),
+        ]);
+        let mut plan = GlyphDrawPlan::default();
+
+        let unsupported =
+            collect_glyph_draw_plan(&prepared, &mono_atlas, Some(&color_atlas), &mut plan).unwrap();
+
+        assert!(unsupported.is_empty());
+        assert!(plan.mono_draws().is_empty());
+        assert_eq!(plan.color_draws().len(), 1);
+        assert_eq!(plan.runs().len(), 1);
+        assert_eq!(plan.runs()[0].format, GlyphDrawFormat::ColorRgba);
+        assert_eq!(
+            plan.color_draws()[0].rect,
+            LayoutRect::new(2.0, 2.0, 2.0, 2.0)
+        );
+        assert_eq!(plan.color_draws()[0].uv.left, 0.25);
+        assert_eq!(plan.color_draws()[0].uv.top, 0.25);
+        assert_eq!(plan.color_draws()[0].uv.right, 0.375);
+        assert_eq!(plan.color_draws()[0].uv.bottom, 0.375);
+    }
+
+    #[test]
     fn invalid_atlas_entry_uv_returns_resource_failure() {
         let entry = GlyphAtlasEntry {
             x: u32::MAX,
@@ -1188,7 +2074,7 @@ mod tests {
             text_generation: TextGeneration::INITIAL,
             style_generation: TextGeneration::INITIAL,
             text_hash: 1,
-            available_inline_width_bits: None,
+            inline_constraint: TextInlineConstraint::MaxContent.cache_key(),
             layout_mode: crate::text::TextLayoutMode::SoftWrap,
             font_size_bits: 12.0_f32.to_bits(),
             max_lines: None,
@@ -1218,6 +2104,14 @@ mod tests {
         order: crate::scene::SceneOrder,
         layout: crate::text::TextLayoutRef,
     ) -> crate::render::DrawItem {
+        text_draw_item_with_clip(order, layout, None)
+    }
+
+    fn text_draw_item_with_clip(
+        order: crate::scene::SceneOrder,
+        layout: crate::text::TextLayoutRef,
+        clip: Option<LayoutRect>,
+    ) -> crate::render::DrawItem {
         crate::render::DrawItem::new(
             order,
             order.raw(),
@@ -1226,7 +2120,7 @@ mod tests {
                 text_generation: crate::scene::SceneInputSignature::default(),
                 text_metrics_generation: 1,
                 layout,
-                clip: None,
+                clip,
                 color: Color::rgb(1, 2, 3),
             },
         )
@@ -1268,6 +2162,7 @@ mod tests {
                 draw_item_count,
                 upload_intent_count: 0,
                 layer_count: 0,
+                box_shape_count: 0,
                 unsupported_fragment_count: 0,
                 stale_drop_count: 0,
                 duration: std::time::Duration::ZERO,

@@ -1,11 +1,11 @@
 use crate::app::{Context, Render};
 use crate::element::{Element, IntoElement, div, input, text};
-use crate::layout::LayoutSize;
+use crate::layout::{LayoutRect, LayoutSize};
 use crate::platform::{PhysicalSize, PlatformFact, Renderability};
 use crate::render::{DrawItemKind, RenderPass, prepare_frame_graph};
 use crate::runtime::Runtime;
 use crate::scene::ResourceDemandKind;
-use crate::style::{Color, StyleExt, opacity, px};
+use crate::style::{Color, Overflow, StyleExt, opacity, px};
 use crate::window::WindowOptions;
 
 #[derive(Debug)]
@@ -58,6 +58,55 @@ fn prepared_frame_preserves_scene_order_in_draw_items() {
 
     assert_eq!(draw_orders, scene_orders);
     assert_eq!(frame.stats().draw_item_count, scene.fragments().len());
+}
+
+#[test]
+fn clip_push_payload_and_order_survive_scene_to_render() {
+    let scene = compile_scene(
+        div().key("root").child(
+            div()
+                .key("clipper")
+                .w(px(100.0))
+                .h(px(80.0))
+                .overflow(Overflow::Scroll)
+                .child(text("inside").key("label").h(px(160.0))),
+        ),
+    );
+    let frame = prepare_frame_graph(&scene);
+    let scene_clips = scene
+        .fragments()
+        .iter()
+        .filter_map(|fragment| match fragment.kind() {
+            crate::scene::PaintFragmentKind::ClipPush { clip } => Some((fragment.order(), *clip)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let draw_clips = frame
+        .draw_items()
+        .iter()
+        .filter_map(|item| match item.kind() {
+            DrawItemKind::ClipPush { clip } => Some((item.order(), *clip)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let clip_push_order = draw_clips[0].0;
+    let text_order = frame
+        .draw_items()
+        .iter()
+        .find(|item| matches!(item.kind(), DrawItemKind::Text { .. }))
+        .unwrap()
+        .order();
+    let clip_pop_order = frame
+        .draw_items()
+        .iter()
+        .find(|item| matches!(item.kind(), DrawItemKind::ClipPop))
+        .unwrap()
+        .order();
+
+    assert_eq!(draw_clips, scene_clips);
+    assert_eq!(draw_clips[0].1, LayoutRect::new(0.0, 0.0, 100.0, 80.0));
+    assert!(clip_push_order.raw() < text_order.raw());
+    assert!(text_order.raw() < clip_pop_order.raw());
 }
 
 #[test]
@@ -137,6 +186,23 @@ fn input_text_draw_items_carry_private_content_clip() {
     assert!(text.0.is_some());
     assert_eq!(text.0.unwrap().width(), 36.0);
     assert!(text.1.x() <= text.0.unwrap().x());
+}
+
+#[test]
+fn ordinary_text_draw_items_carry_private_content_clip() {
+    let scene = compile_scene(text("AAAA AAAA AAAA").w(px(36.0)));
+    let frame = prepare_frame_graph(&scene);
+    let text = frame
+        .draw_items()
+        .iter()
+        .find_map(|item| match item.kind() {
+            DrawItemKind::Text { clip, .. } => Some(*clip),
+            _ => None,
+        })
+        .unwrap();
+
+    assert!(text.is_some());
+    assert_eq!(text.unwrap().width(), 36.0);
 }
 
 #[test]
@@ -235,7 +301,7 @@ fn draw_items_retain_fragment_bounds_for_backend_prepare() {
 }
 
 #[test]
-fn rect_draw_items_preserve_color_and_order() {
+fn box_shape_draw_items_preserve_fill_and_order() {
     let scene = compile_scene(
         div()
             .key("root")
@@ -244,33 +310,67 @@ fn rect_draw_items_preserve_color_and_order() {
             .child(div().key("second").bg(Color::rgb(8, 9, 10))),
     );
     let frame = prepare_frame_graph(&scene);
-    let rects = frame
+    let shapes = frame
         .draw_items()
         .iter()
         .filter_map(|item| match item.kind() {
-            DrawItemKind::Rect { color } => Some((item.order(), *color)),
+            DrawItemKind::BoxShape { shape } => Some((item.order(), shape.fill().unwrap())),
             _ => None,
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(rects.len(), 3);
-    assert_eq!(rects[0].1, Color::rgb(1, 2, 3));
-    assert_eq!(rects[1].1, Color::rgba(4, 5, 6, 7));
-    assert_eq!(rects[2].1, Color::rgb(8, 9, 10));
-    assert!(rects[0].0.raw() < rects[1].0.raw());
-    assert!(rects[1].0.raw() < rects[2].0.raw());
+    assert_eq!(shapes.len(), 3);
+    assert_eq!(shapes[0].1, Color::rgb(1, 2, 3));
+    assert_eq!(shapes[1].1, Color::rgba(4, 5, 6, 7));
+    assert_eq!(shapes[2].1, Color::rgb(8, 9, 10));
+    assert!(shapes[0].0.raw() < shapes[1].0.raw());
+    assert!(shapes[1].0.raw() < shapes[2].0.raw());
+}
+
+#[test]
+fn box_shape_draw_items_preserve_opacity_and_stats_count_prepared_shapes() {
+    let scene = compile_scene(
+        div()
+            .key("root")
+            .child(
+                div()
+                    .key("transparent")
+                    .bg(Color::rgb(1, 2, 3))
+                    .opacity(opacity(0.25)),
+            )
+            .child(div().key("wide-color").bg(Color::oklch(0.5, 0.1, 120.0))),
+    );
+    let frame = prepare_frame_graph(&scene);
+    let shapes = frame
+        .draw_items()
+        .iter()
+        .filter_map(|item| match item.kind() {
+            DrawItemKind::BoxShape { shape } => Some(*shape),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(shapes.len(), 2);
+    assert_eq!(shapes[0].opacity(), opacity(0.25));
+    assert_eq!(shapes[1].fill(), Some(Color::oklch(0.5, 0.1, 120.0)));
+    assert_eq!(frame.stats().box_shape_count, shapes.len());
 }
 
 #[test]
 fn generated_framework_shader_registry_contains_required_artifacts() {
-    assert_eq!(crate::render::CORE_SHADERS.len(), 2);
+    assert_eq!(crate::render::CORE_SHADERS.len(), 3);
     assert_generated_shader(
-        crate::render::core_shader(crate::render::CoreShader::SolidRect),
-        "core.solid_rect",
-        24,
+        crate::render::core_shader(crate::render::CoreShader::BoxShape),
+        "core.box_shape",
+        96,
         &[
             ("LOC", 0, 0, "R32G32_FLOAT"),
-            ("LOC", 1, 8, "R32G32B32A32_FLOAT"),
+            ("LOC", 1, 8, "R32G32_FLOAT"),
+            ("LOC", 2, 16, "R32G32B32A32_FLOAT"),
+            ("LOC", 3, 32, "R32G32B32A32_FLOAT"),
+            ("LOC", 4, 48, "R32G32B32A32_FLOAT"),
+            ("LOC", 5, 64, "R32G32B32A32_FLOAT"),
+            ("LOC", 6, 80, "R32G32B32A32_FLOAT"),
         ],
     );
     assert_generated_shader(
@@ -283,19 +383,34 @@ fn generated_framework_shader_registry_contains_required_artifacts() {
             ("LOC", 2, 16, "R32G32B32A32_FLOAT"),
         ],
     );
+    assert_generated_shader(
+        crate::render::core_shader(crate::render::CoreShader::GlyphColor),
+        "core.glyph_color",
+        32,
+        &[
+            ("LOC", 0, 0, "R32G32_FLOAT"),
+            ("LOC", 1, 8, "R32G32_FLOAT"),
+            ("LOC", 2, 16, "R32G32B32A32_FLOAT"),
+        ],
+    );
 }
 
 #[test]
 fn generated_framework_shader_artifacts_are_complete_and_distinct() {
-    assert!(crate::render::SOLID_RECT_WGSL.contains("fn vs_main"));
-    assert!(crate::render::SOLID_RECT_D3D11_VERTEX_HLSL.contains("vs_main"));
-    assert!(crate::render::SOLID_RECT_D3D11_FRAGMENT_HLSL.contains("fs_main"));
-    assert_target_dxbc_bytes(crate::render::SOLID_RECT_D3D11_VERTEX_DXBC);
-    assert_target_dxbc_bytes(crate::render::SOLID_RECT_D3D11_FRAGMENT_DXBC);
+    assert!(crate::render::BOX_SHAPE_WGSL.contains("fn vs_main"));
+    assert!(crate::render::BOX_SHAPE_D3D11_VERTEX_HLSL.contains("vs_main"));
+    assert!(crate::render::BOX_SHAPE_D3D11_FRAGMENT_HLSL.contains("fs_main"));
+    assert_target_dxbc_bytes(crate::render::BOX_SHAPE_D3D11_VERTEX_DXBC);
+    assert_target_dxbc_bytes(crate::render::BOX_SHAPE_D3D11_FRAGMENT_DXBC);
 
     assert!(crate::render::GLYPH_MONO_WGSL.contains("textureSample"));
-    assert!(crate::render::SOLID_RECT_D3D11_VERTEX_HLSL.contains("LOC0"));
-    assert!(crate::render::SOLID_RECT_D3D11_VERTEX_HLSL.contains("LOC1"));
+    assert!(crate::render::BOX_SHAPE_D3D11_VERTEX_HLSL.contains("LOC0"));
+    assert!(crate::render::BOX_SHAPE_D3D11_VERTEX_HLSL.contains("LOC1"));
+    assert!(crate::render::BOX_SHAPE_D3D11_VERTEX_HLSL.contains("LOC2"));
+    assert!(crate::render::BOX_SHAPE_D3D11_VERTEX_HLSL.contains("LOC3"));
+    assert!(crate::render::BOX_SHAPE_D3D11_VERTEX_HLSL.contains("LOC4"));
+    assert!(crate::render::BOX_SHAPE_D3D11_VERTEX_HLSL.contains("LOC5"));
+    assert!(crate::render::BOX_SHAPE_D3D11_VERTEX_HLSL.contains("LOC6"));
     assert!(crate::render::GLYPH_MONO_D3D11_VERTEX_HLSL.contains("LOC0"));
     assert!(crate::render::GLYPH_MONO_D3D11_VERTEX_HLSL.contains("LOC1"));
     assert!(crate::render::GLYPH_MONO_D3D11_VERTEX_HLSL.contains("LOC2"));
@@ -307,26 +422,71 @@ fn generated_framework_shader_artifacts_are_complete_and_distinct() {
     assert_target_dxbc_bytes(crate::render::GLYPH_MONO_D3D11_VERTEX_DXBC);
     assert_target_dxbc_bytes(crate::render::GLYPH_MONO_D3D11_FRAGMENT_DXBC);
 
+    assert!(crate::render::GLYPH_COLOR_WGSL.contains("textureSample"));
+    assert!(crate::render::GLYPH_COLOR_WGSL.contains("sampled.rgb"));
+    assert!(!crate::render::GLYPH_COLOR_WGSL.contains("input.color.rgb"));
+    assert!(crate::render::GLYPH_COLOR_D3D11_VERTEX_HLSL.contains("LOC0"));
+    assert!(crate::render::GLYPH_COLOR_D3D11_VERTEX_HLSL.contains("LOC1"));
+    assert!(crate::render::GLYPH_COLOR_D3D11_VERTEX_HLSL.contains("LOC2"));
+    assert!(crate::render::GLYPH_COLOR_D3D11_FRAGMENT_HLSL.contains("glyph_atlas"));
+    assert!(crate::render::GLYPH_COLOR_D3D11_FRAGMENT_HLSL.contains("fs_main("));
+    assert!(crate::render::GLYPH_COLOR_D3D11_FRAGMENT_HLSL.contains("SamplerState glyph_sampler"));
+    assert_target_dxbc_bytes(crate::render::GLYPH_COLOR_D3D11_VERTEX_DXBC);
+    assert_target_dxbc_bytes(crate::render::GLYPH_COLOR_D3D11_FRAGMENT_DXBC);
+
     assert_ne!(
         crate::render::GLYPH_MONO_WGSL,
-        crate::render::SOLID_RECT_WGSL
+        crate::render::BOX_SHAPE_WGSL
+    );
+    assert_ne!(
+        crate::render::GLYPH_COLOR_WGSL,
+        crate::render::GLYPH_MONO_WGSL
     );
     if cfg!(target_os = "windows") {
         assert_ne!(
             crate::render::GLYPH_MONO_D3D11_VERTEX_DXBC,
-            crate::render::SOLID_RECT_D3D11_VERTEX_DXBC
+            crate::render::BOX_SHAPE_D3D11_VERTEX_DXBC
         );
         assert_ne!(
             crate::render::GLYPH_MONO_D3D11_FRAGMENT_DXBC,
-            crate::render::SOLID_RECT_D3D11_FRAGMENT_DXBC
+            crate::render::BOX_SHAPE_D3D11_FRAGMENT_DXBC
+        );
+        assert_ne!(
+            crate::render::GLYPH_COLOR_D3D11_FRAGMENT_DXBC,
+            crate::render::GLYPH_MONO_D3D11_FRAGMENT_DXBC
         );
     }
 }
 
 #[test]
+fn box_shape_shader_source_matches_straight_alpha_blend_contract() {
+    let source = std::fs::read_to_string("src/platform/shader/box_shape.wesl").unwrap();
+
+    assert_box_shape_shader_uses_straight_alpha(&source);
+    assert_box_shape_shader_uses_straight_alpha(crate::render::BOX_SHAPE_WGSL);
+    assert_box_shape_shader_carries_per_edge_and_corner_payload(&source);
+    assert_box_shape_shader_carries_per_edge_and_corner_payload(crate::render::BOX_SHAPE_WGSL);
+}
+
+fn assert_box_shape_shader_uses_straight_alpha(source: &str) {
+    assert!(source.contains("border_alpha > 0.0"));
+    assert!(source.contains("output_rgb"));
+    assert!(source.contains("return vec4<f32>(output_rgb, output_alpha)"));
+    assert!(!source.contains("let fill = input.fill_color * fill_alpha"));
+    assert!(!source.contains("return fill + border"));
+}
+
+fn assert_box_shape_shader_carries_per_edge_and_corner_payload(source: &str) {
+    assert!(source.contains("corner_radii: vec4<f32>"));
+    assert!(source.contains("border_widths: vec4<f32>"));
+    assert!(source.contains("inner_corner_radii(corner_radii, border_widths)"));
+}
+
+#[test]
 fn framework_shader_source_and_generated_artifacts_use_approved_locations() {
-    assert!(std::path::Path::new("src/platform/shader/solid_rect.wesl").is_file());
+    assert!(std::path::Path::new("src/platform/shader/box_shape.wesl").is_file());
     assert!(std::path::Path::new("src/platform/shader/glyph_mono.wesl").is_file());
+    assert!(std::path::Path::new("src/platform/shader/glyph_color.wesl").is_file());
     assert!(!std::path::Path::new("shaders").exists());
     assert!(!std::path::Path::new("../nekoui-shader-types").exists());
     assert!(!std::path::Path::new("../nekoui-shader-build").exists());
@@ -362,7 +522,23 @@ fn framework_shader_build_script_does_not_reuse_checked_in_artifacts() {
 
 #[test]
 fn generated_framework_shader_metadata_reflects_glyph_resources() {
-    let shader = crate::render::core_shader(crate::render::CoreShader::GlyphMono);
+    assert_glyph_resource_bindings(
+        crate::render::core_shader(crate::render::CoreShader::GlyphMono),
+        crate::render::GLYPH_MONO_GLYPH_ATLAS_D3D11_SRV_SLOT,
+        crate::render::GLYPH_MONO_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT,
+    );
+    assert_glyph_resource_bindings(
+        crate::render::core_shader(crate::render::CoreShader::GlyphColor),
+        crate::render::GLYPH_COLOR_GLYPH_ATLAS_D3D11_SRV_SLOT,
+        crate::render::GLYPH_COLOR_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT,
+    );
+}
+
+fn assert_glyph_resource_bindings(
+    shader: &crate::render::CoreShaderArtifacts,
+    atlas_slot: u32,
+    sampler_slot: u32,
+) {
     assert_eq!(shader.d3d11_resource_bindings.len(), 2);
     assert_eq!(
         shader.d3d11_resource_bindings[0],
@@ -371,7 +547,7 @@ fn generated_framework_shader_metadata_reflects_glyph_resources() {
             group: 0,
             binding: 0,
             register_class: "srv",
-            slot: crate::render::GLYPH_MONO_GLYPH_ATLAS_D3D11_SRV_SLOT,
+            slot: atlas_slot,
         }
     );
     assert_eq!(
@@ -381,14 +557,11 @@ fn generated_framework_shader_metadata_reflects_glyph_resources() {
             group: 0,
             binding: 1,
             register_class: "sampler",
-            slot: crate::render::GLYPH_MONO_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT,
+            slot: sampler_slot,
         }
     );
-    assert_eq!(crate::render::GLYPH_MONO_GLYPH_ATLAS_D3D11_SRV_SLOT, 0);
-    assert_eq!(
-        crate::render::GLYPH_MONO_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT,
-        0
-    );
+    assert_eq!(atlas_slot, 0);
+    assert_eq!(sampler_slot, 0);
 }
 
 fn build_script_sources() -> String {

@@ -136,6 +136,11 @@ pub trait StyleExt: Sized {
         self.margin_left(value)
     }
 
+    fn border_width(self, value: impl Into<Length>) -> Self {
+        let value = value.into();
+        self.update_style(|style| style.set_border_width(value))
+    }
+
     fn gap(self, value: impl Into<Length>) -> Self {
         let value = value.into();
         self.update_style(|style| style.set_gap(value))
@@ -169,6 +174,28 @@ pub trait StyleExt: Sized {
 
     fn bg(self, value: Color) -> Self {
         self.background(value)
+    }
+
+    fn border_color(self, value: Color) -> Self {
+        self.update_style(|style| style.set_border_color(value))
+    }
+
+    fn border(self, width: impl Into<Length>, color: Color) -> Self {
+        let width = width.into();
+        self.update_style(|style| style.set_border(width, color))
+    }
+
+    fn corner_radius(self, value: impl Into<Length>) -> Self {
+        let value = value.into();
+        self.update_style(|style| style.set_corner_radius(value))
+    }
+
+    fn radius(self, value: impl Into<Length>) -> Self {
+        self.corner_radius(value)
+    }
+
+    fn rounded(self, value: impl Into<Length>) -> Self {
+        self.corner_radius(value)
     }
 
     fn opacity(self, value: impl Into<Opacity>) -> Self {
@@ -232,7 +259,7 @@ impl StyleExt for Element {
 #[cfg(test)]
 mod tests {
     use crate::element::{IntoElement, div};
-    use crate::style::{Color, Dimension, Overflow, StyleExt, fill, px};
+    use crate::style::{Color, CornerRadii, Dimension, Edges, Overflow, StyleExt, fill, px};
 
     #[test]
     fn style_extension_methods_write_canonical_declaration() {
@@ -243,6 +270,12 @@ mod tests {
             .margin(px(16.0))
             .m(px(10.0))
             .ml(px(6.0))
+            .border_width(px(2.0))
+            .border_color(Color::rgb(1, 1, 1))
+            .border(px(3.0), Color::rgb(7, 8, 9))
+            .corner_radius(px(4.0))
+            .radius(px(5.0))
+            .rounded(px(6.0))
             .gap(px(2.0))
             .overflow(Overflow::Scroll)
             .width(fill())
@@ -258,6 +291,18 @@ mod tests {
         assert_eq!(padding.left, Some(px(4.0)));
         assert_eq!(margin.top, Some(px(10.0)));
         assert_eq!(margin.left, Some(px(6.0)));
+        assert_eq!(
+            element.style().layout().border_width(),
+            Edges::all(Some(px(3.0)))
+        );
+        assert_eq!(
+            element.style().visual().border_color(),
+            Some(Color::rgb(7, 8, 9))
+        );
+        assert_eq!(
+            element.style().visual().corner_radius(),
+            CornerRadii::all(Some(px(6.0)))
+        );
         assert_eq!(element.style().layout().gap(), Some(px(2.0)));
         assert_eq!(element.style().layout().overflow(), Some(Overflow::Scroll));
         assert_eq!(element.style().layout().width(), Some(Dimension::Fill));

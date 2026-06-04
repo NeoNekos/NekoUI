@@ -9,7 +9,7 @@ use crate::retained::{NodeGeneration, RetainedNodeId};
 use crate::style::{ResolvedTextStyle, TextOverflow};
 use crate::text::{
     FontGeneration, FontManager, GlyphDemand, GlyphInstance, GlyphKey, TextLayoutData,
-    TextLayoutGeneration, TextLayoutKey, TextLayoutRef,
+    TextLayoutGeneration, TextLayoutKey, TextLayoutRef, TextLineMetrics,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -94,6 +94,32 @@ impl TextLayoutMode {
             Self::SingleLineInput => Some(line_height),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum TextInlineConstraint {
+    MinContent,
+    MaxContent,
+    Definite(f32),
+}
+
+impl TextInlineConstraint {
+    pub(crate) fn cache_key(self) -> TextInlineConstraintKey {
+        match self {
+            Self::MinContent => TextInlineConstraintKey::MinContent,
+            Self::MaxContent => TextInlineConstraintKey::MaxContent,
+            Self::Definite(width) => TextInlineConstraintKey::Definite {
+                width_bits: width.to_bits(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) enum TextInlineConstraintKey {
+    MinContent,
+    MaxContent,
+    Definite { width_bits: u32 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -278,7 +304,7 @@ pub(crate) struct TextMeasureQuery<'a> {
     pub(crate) style_generation: TextGeneration,
     pub(crate) text: &'a str,
     pub(crate) style: &'a ResolvedTextStyle,
-    pub(crate) available_inline_width: Option<f32>,
+    pub(crate) inline_constraint: TextInlineConstraint,
     pub(crate) layout_mode: TextLayoutMode,
     pub(crate) font_generation: FontGeneration,
     pub(crate) scale_generation: u64,
@@ -327,7 +353,7 @@ struct MemoKey {
     node_generation: NodeGeneration,
     text_generation: TextGeneration,
     style_generation: TextGeneration,
-    available_inline_width_bits: Option<u32>,
+    inline_constraint: TextInlineConstraintKey,
     layout_mode: TextLayoutMode,
     font_size_bits: u32,
     line_height_policy: TextLineHeightPolicy,
@@ -349,10 +375,7 @@ impl Ord for MemoKey {
             .then_with(|| self.node_generation.cmp(&other.node_generation))
             .then_with(|| self.text_generation.cmp(&other.text_generation))
             .then_with(|| self.style_generation.cmp(&other.style_generation))
-            .then_with(|| {
-                self.available_inline_width_bits
-                    .cmp(&other.available_inline_width_bits)
-            })
+            .then_with(|| self.inline_constraint.cmp(&other.inline_constraint))
             .then_with(|| self.layout_mode.rank().cmp(&other.layout_mode.rank()))
             .then_with(|| self.font_size_bits.cmp(&other.font_size_bits))
             .then_with(|| {
@@ -563,7 +586,7 @@ impl MemoKey {
             node_generation: query.node_generation,
             text_generation: query.text_generation,
             style_generation: query.style_generation,
-            available_inline_width_bits: query.available_inline_width.map(f32::to_bits),
+            inline_constraint: query.inline_constraint.cache_key(),
             layout_mode: query.layout_mode,
             font_size_bits: query.style.font_size().as_px().to_bits(),
             line_height_policy: TextLineHeightPolicy::DEFAULT,
@@ -583,84 +606,46 @@ fn layout_uncached(
     font_manager: &FontManager,
 ) -> Result<TextLayoutRef, TextMeasureError> {
     let font_size = query.style.font_size().as_px();
-    let line_height = font_size * 1.2;
-    let metrics = cosmic_text::Metrics::new(font_size, line_height);
-    let buffer = font_manager.with_font_system(|font_system| {
-        let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
-        buffer.set_wrap(font_system, query.layout_mode.wrap());
-        buffer.set_size(
-            font_system,
-            query.available_inline_width,
-            query.layout_mode.height_limit(line_height),
-        );
-        buffer.set_text(
-            font_system,
-            query.text,
-            &cosmic_text::Attrs::new().weight(cosmic_text::Weight::NORMAL),
-            cosmic_text::Shaping::Advanced,
-            None,
-        );
-        buffer.shape_until_scroll(font_system, true);
-        buffer
-    });
-
-    let mut glyphs = Vec::new();
-    let mut demands = Vec::new();
-    let mut demanded_keys = BTreeSet::new();
-    let mut width = 0.0_f32;
-    let mut max_content_width = 0.0_f32;
-    let mut min_content_width = 0.0_f32;
-    let mut height = 0.0_f32;
-    let mut baseline = 0.0_f32;
-    let mut line_count = 0_usize;
-    let mut visible_trailing_caret_rect = LayoutRect::ZERO;
-
-    for run in buffer.layout_runs() {
-        line_count += 1;
-        if line_count == 1 {
-            baseline = run.line_y;
-        }
-        width = width.max(run.line_w);
-        max_content_width = max_content_width.max(run.line_w);
-        min_content_width = min_content_width.max(min_run_width(run.glyphs));
-        height = height.max(run.line_top + run.line_height);
-        if query
-            .style
-            .max_lines()
-            .is_none_or(|max_lines| line_count <= max_lines.max(1))
-        {
-            visible_trailing_caret_rect = LayoutRect::new(
-                trailing_run_advance(run.glyphs),
-                run.line_top,
-                1.0,
-                run.line_height.max(1.0),
-            );
-        }
-        for glyph in run.glyphs {
-            let physical = glyph.physical((0.0, run.line_y), query.scale_factor);
-            let key = GlyphKey::new(physical.cache_key, query.scale_factor);
-            glyphs.push(GlyphInstance::new(key, physical.x, physical.y));
-            if demanded_keys.insert(key) {
-                demands.push(GlyphDemand::new(key));
-            }
-        }
-    }
-
-    let mut line_count = line_count.max(1);
-    if let Some(max_lines) = query.style.max_lines() {
-        let max_lines = max_lines.max(1);
-        if line_count > max_lines {
-            line_count = max_lines;
-            height = line_height * max_lines as f32;
-        }
-    }
-    if query.text.is_empty() {
-        height = line_height;
-        baseline = font_size * 0.8;
-        visible_trailing_caret_rect = LayoutRect::new(0.0, 0.0, 1.0, line_height.max(1.0));
-    } else if visible_trailing_caret_rect == LayoutRect::ZERO {
-        visible_trailing_caret_rect = LayoutRect::new(width, 0.0, 1.0, height.max(1.0));
-    }
+    let default_line_height = default_line_height(font_size);
+    let default_baseline = default_baseline(font_size, default_line_height);
+    let metrics = cosmic_text::Metrics::new(font_size, default_line_height);
+    let text = layout_text(query);
+    let max_visible_lines = match query.layout_mode {
+        TextLayoutMode::SingleLineInput => Some(1),
+        TextLayoutMode::SoftWrap => query.style.max_lines().map(|max_lines| max_lines.max(1)),
+    };
+    let intrinsic_buffer = text_layout_buffer(
+        font_manager,
+        metrics,
+        query,
+        text.as_ref(),
+        default_line_height,
+        None,
+    );
+    let intrinsic = intrinsic_widths(&intrinsic_buffer, max_visible_lines);
+    let final_buffer_width = match query.inline_constraint {
+        TextInlineConstraint::MinContent => Some(intrinsic.min_content_width),
+        TextInlineConstraint::MaxContent => None,
+        TextInlineConstraint::Definite(width) => Some(width),
+    };
+    let final_buffer = match final_buffer_width {
+        None => intrinsic_buffer,
+        Some(width) => text_layout_buffer(
+            font_manager,
+            metrics,
+            query,
+            text.as_ref(),
+            default_line_height,
+            Some(width),
+        ),
+    };
+    let collected = collect_text_layout(
+        &final_buffer,
+        query.scale_factor,
+        default_line_height,
+        default_baseline,
+        max_visible_lines,
+    );
 
     let layout_key = TextLayoutKey {
         node_id: query.node_id,
@@ -668,7 +653,7 @@ fn layout_uncached(
         text_generation: query.text_generation,
         style_generation: query.style_generation,
         text_hash: stable_text_hash(query.text),
-        available_inline_width_bits: query.available_inline_width.map(f32::to_bits),
+        inline_constraint: query.inline_constraint.cache_key(),
         layout_mode: query.layout_mode,
         font_size_bits: query.style.font_size().as_px().to_bits(),
         max_lines: query.style.max_lines(),
@@ -679,21 +664,208 @@ fn layout_uncached(
     };
     let generation = TextLayoutGeneration::from_layout_key(&layout_key);
     let metrics = TextMetrics {
-        width,
-        min_content_width,
-        max_content_width,
-        height,
-        baseline,
-        line_count,
+        width: collected.width,
+        min_content_width: intrinsic.min_content_width,
+        max_content_width: intrinsic.max_content_width,
+        height: collected.height,
+        baseline: collected.baseline,
+        line_count: collected.line_count,
     };
-    Ok(TextLayoutRef::new(TextLayoutData::new(
+    Ok(TextLayoutRef::new(TextLayoutData::new_with_lines(
         generation,
         layout_key,
         metrics,
-        visible_trailing_caret_rect,
-        Arc::from(glyphs),
-        Arc::from(demands),
+        Arc::from(collected.lines),
+        collected.trailing_caret_rect,
+        Arc::from(collected.glyphs),
+        Arc::from(collected.demands),
     )))
+}
+
+fn layout_text<'a>(query: &'a TextMeasureQuery<'a>) -> Cow<'a, str> {
+    match query.layout_mode {
+        TextLayoutMode::SoftWrap => Cow::Borrowed(query.text),
+        TextLayoutMode::SingleLineInput => {
+            if query.text.contains(['\r', '\n']) {
+                Cow::Owned(
+                    query
+                        .text
+                        .chars()
+                        .map(|ch| if matches!(ch, '\r' | '\n') { ' ' } else { ch })
+                        .collect(),
+                )
+            } else {
+                Cow::Borrowed(query.text)
+            }
+        }
+    }
+}
+
+fn text_layout_buffer(
+    font_manager: &FontManager,
+    metrics: cosmic_text::Metrics,
+    query: &TextMeasureQuery<'_>,
+    text: &str,
+    default_line_height: f32,
+    inline_width: Option<f32>,
+) -> cosmic_text::Buffer {
+    font_manager.with_font_system(|font_system| {
+        let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
+        buffer.set_wrap(font_system, query.layout_mode.wrap());
+        buffer.set_size(
+            font_system,
+            inline_width,
+            query.layout_mode.height_limit(default_line_height),
+        );
+        buffer.set_text(
+            font_system,
+            text,
+            &cosmic_text::Attrs::new().weight(cosmic_text::Weight::NORMAL),
+            cosmic_text::Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(font_system, true);
+        buffer
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IntrinsicWidths {
+    min_content_width: f32,
+    max_content_width: f32,
+}
+
+fn intrinsic_widths(
+    buffer: &cosmic_text::Buffer,
+    max_visible_lines: Option<usize>,
+) -> IntrinsicWidths {
+    let mut min_content_width = 0.0_f32;
+    let mut max_content_width = 0.0_f32;
+    let mut visible_line_count = 0_usize;
+
+    'lines: for line in &buffer.lines {
+        let Some(layout_lines) = line.layout_opt() else {
+            continue;
+        };
+        for layout_line in layout_lines {
+            if max_visible_lines.is_some_and(|max_lines| visible_line_count >= max_lines) {
+                break 'lines;
+            }
+            visible_line_count += 1;
+            max_content_width = max_content_width.max(layout_line.w);
+            min_content_width = min_content_width.max(min_run_width(&layout_line.glyphs));
+        }
+    }
+
+    IntrinsicWidths {
+        min_content_width,
+        max_content_width,
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct CollectedTextLayout {
+    width: f32,
+    height: f32,
+    baseline: f32,
+    line_count: usize,
+    lines: Vec<TextLineMetrics>,
+    trailing_caret_rect: LayoutRect,
+    glyphs: Vec<GlyphInstance>,
+    demands: Vec<GlyphDemand>,
+}
+
+fn collect_text_layout(
+    buffer: &cosmic_text::Buffer,
+    scale_factor: f32,
+    default_line_height: f32,
+    default_baseline: f32,
+    max_visible_lines: Option<usize>,
+) -> CollectedTextLayout {
+    let mut glyphs = Vec::new();
+    let mut demands = Vec::new();
+    let mut demanded_keys = BTreeSet::new();
+    let mut width = 0.0_f32;
+    let mut height = 0.0_f32;
+    let mut baseline = 0.0_f32;
+    let mut visible_line_count = 0_usize;
+    let mut next_line_top = 0.0_f32;
+    let mut line_metrics = Vec::new();
+    let mut visible_trailing_caret_rect = LayoutRect::ZERO;
+
+    'lines: for line in &buffer.lines {
+        let Some(layout_lines) = line.layout_opt() else {
+            continue;
+        };
+        for layout_line in layout_lines {
+            if max_visible_lines.is_some_and(|max_lines| visible_line_count >= max_lines) {
+                break 'lines;
+            }
+            let effective_line = effective_line_metrics(
+                next_line_top,
+                layout_line
+                    .line_height_opt
+                    .unwrap_or(default_line_height)
+                    .max(default_line_height),
+                default_baseline,
+                layout_line.max_ascent,
+                layout_line.max_descent,
+            );
+            next_line_top += effective_line.height();
+            visible_line_count += 1;
+            width = width.max(layout_line.w);
+            if visible_line_count == 1 {
+                baseline = effective_line.baseline();
+            }
+            height = effective_line.top() + effective_line.height();
+            visible_trailing_caret_rect = LayoutRect::new(
+                trailing_run_advance(&layout_line.glyphs),
+                effective_line.top(),
+                1.0,
+                effective_line.height().max(1.0),
+            );
+            for glyph in &layout_line.glyphs {
+                let physical = glyph.physical(
+                    (0.0, effective_line.baseline() * scale_factor),
+                    scale_factor,
+                );
+                let key = GlyphKey::new(physical.cache_key, scale_factor);
+                glyphs.push(GlyphInstance::new(key, physical.x, physical.y));
+                if demanded_keys.insert(key) {
+                    demands.push(GlyphDemand::new(key));
+                }
+            }
+            line_metrics.push(effective_line);
+        }
+    }
+
+    let line_count = visible_line_count.max(1);
+    if line_metrics.is_empty() {
+        let empty_line = effective_line_metrics(
+            0.0,
+            default_line_height,
+            default_baseline,
+            default_baseline,
+            (default_line_height - default_baseline).max(0.0),
+        );
+        height = empty_line.height();
+        baseline = empty_line.baseline();
+        visible_trailing_caret_rect = LayoutRect::new(0.0, 0.0, 1.0, empty_line.height().max(1.0));
+        line_metrics.push(empty_line);
+    } else if visible_trailing_caret_rect == LayoutRect::ZERO {
+        visible_trailing_caret_rect = LayoutRect::new(width, 0.0, 1.0, height.max(1.0));
+    }
+
+    CollectedTextLayout {
+        width,
+        height,
+        baseline,
+        line_count,
+        lines: line_metrics,
+        trailing_caret_rect: visible_trailing_caret_rect,
+        glyphs,
+        demands,
+    }
 }
 
 fn trailing_run_advance(glyphs: &[cosmic_text::LayoutGlyph]) -> f32 {
@@ -705,6 +877,33 @@ fn trailing_run_advance(glyphs: &[cosmic_text::LayoutGlyph]) -> f32 {
 
 fn min_run_width(glyphs: &[cosmic_text::LayoutGlyph]) -> f32 {
     glyphs.iter().map(|glyph| glyph.w).fold(0.0_f32, f32::max)
+}
+
+fn default_line_height(font_size: f32) -> f32 {
+    font_size * 1.2
+}
+
+fn default_baseline(font_size: f32, line_height: f32) -> f32 {
+    (font_size * 0.8).min(line_height)
+}
+
+pub(crate) fn effective_line_metrics(
+    top: f32,
+    default_line_height: f32,
+    default_baseline: f32,
+    max_ascent: f32,
+    max_descent: f32,
+) -> TextLineMetrics {
+    let fallback_ascent = max_ascent.max(0.0);
+    let fallback_descent = max_descent.max(0.0);
+    let fallback_height = fallback_ascent + fallback_descent;
+    let height = default_line_height.max(fallback_height).max(0.0);
+    let baseline = if fallback_height > 0.0 {
+        top + ((height - fallback_height) / 2.0).max(0.0) + fallback_ascent
+    } else {
+        top + default_baseline.min(height)
+    };
+    TextLineMetrics::new(top, baseline, height, fallback_ascent, fallback_descent)
 }
 
 fn stable_text_hash(text: &str) -> u64 {

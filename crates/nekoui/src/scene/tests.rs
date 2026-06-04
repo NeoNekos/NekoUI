@@ -7,7 +7,8 @@ use crate::platform::PlatformFact;
 use crate::runtime::Runtime;
 use crate::scene::{
     DamageReason, PaintFragmentKind, ResourceDemandKind, SceneCompileInput, compile_scene,
-    scene_generation_for_inputs, scene_publish_is_current,
+    compile_scene_with_test_text_layout_debug_probe, scene_generation_for_inputs,
+    scene_publish_is_current,
 };
 use crate::style::{Color, Display, Overflow, StyleExt, opacity, px};
 use crate::window::WindowOptions;
@@ -39,6 +40,30 @@ fn compile_root(root: impl crate::element::IntoElement) -> crate::scene::PaintSc
     runtime.scene_snapshot(window).unwrap()
 }
 
+fn compile_root_with_test_text_layout_debug_probe(
+    root: impl crate::element::IntoElement,
+    enabled: bool,
+) -> crate::scene::PaintScene {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| TestRoot::new(root))
+        .unwrap();
+    let retained = runtime.retained_snapshot(window).unwrap();
+    let style = runtime.style_snapshot(window).unwrap();
+    let layout = runtime.layout_snapshot(window).unwrap();
+    compile_scene_with_test_text_layout_debug_probe(
+        SceneCompileInput {
+            retained: &retained,
+            style: &style,
+            layout: &layout,
+            interaction: None,
+            previous: None,
+        },
+        enabled,
+    )
+    .scene
+}
+
 #[test]
 fn deterministic_paint_order_is_background_text_children() {
     let scene = compile_root(
@@ -54,11 +79,45 @@ fn deterministic_paint_order_is_background_text_children() {
         .map(|fragment| fragment.kind())
         .collect::<Vec<_>>();
 
-    assert!(matches!(kinds[0], PaintFragmentKind::Rect { .. }));
+    assert!(matches!(kinds[0], PaintFragmentKind::BoxShape { .. }));
     assert!(matches!(kinds[1], PaintFragmentKind::Text { .. }));
     assert!(matches!(kinds[2], PaintFragmentKind::Text { .. }));
     assert!(scene.fragments()[0].order().raw() < scene.fragments()[1].order().raw());
     assert!(scene.fragments()[1].order().raw() < scene.fragments()[2].order().raw());
+}
+
+#[test]
+fn test_only_text_layout_debug_probe_is_gated_and_emits_rect_markers() {
+    let root = div()
+        .key("root")
+        .child(text("Hello\nNekoUI").key("label").w(px(120.0)));
+    let normal = compile_root(root.clone());
+    let debug_disabled = compile_root_with_test_text_layout_debug_probe(root.clone(), false);
+    let debug = compile_root_with_test_text_layout_debug_probe(root, true);
+
+    assert_eq!(normal.fragments().len(), 1);
+    assert_eq!(debug_disabled.fragments().len(), normal.fragments().len());
+    assert!(debug.fragments().len() > normal.fragments().len());
+    assert!(debug.fragments().iter().any(|fragment| matches!(
+        fragment.kind(),
+        PaintFragmentKind::Rect { color } if *color == Color::rgb(0, 255, 255)
+    )));
+    assert!(debug.fragments().iter().any(|fragment| matches!(
+        fragment.kind(),
+        PaintFragmentKind::Rect { color } if *color == Color::rgb(255, 0, 255)
+    )));
+    assert!(debug.fragments().iter().any(|fragment| matches!(
+        fragment.kind(),
+        PaintFragmentKind::Rect { color } if *color == Color::rgb(255, 180, 0)
+    )));
+    assert!(debug.fragments().iter().any(|fragment| matches!(
+        fragment.kind(),
+        PaintFragmentKind::Rect { color } if *color == Color::rgb(255, 0, 0)
+    )));
+    assert!(debug.fragments().iter().any(|fragment| matches!(
+        fragment.kind(),
+        PaintFragmentKind::Rect { color } if *color == Color::rgb(0, 255, 0)
+    )));
 }
 
 #[test]
@@ -73,6 +132,131 @@ fn display_none_and_opacity_zero_obey_visibility_baseline() {
 
     assert_eq!(scene.fragments().len(), 1);
     assert_eq!(scene.hit_test().entries().len(), 3);
+}
+
+#[test]
+fn primitive_box_shape_opacity_is_carried_without_subtree_layer() {
+    let scene = compile_root(
+        div()
+            .key("root")
+            .bg(Color::rgb(1, 2, 3))
+            .opacity(opacity(0.5)),
+    );
+    let shape = scene
+        .fragments()
+        .iter()
+        .find_map(|fragment| match fragment.kind() {
+            PaintFragmentKind::BoxShape { shape } => Some(*shape),
+            _ => None,
+        })
+        .expect("primitive box decoration should emit a box shape");
+
+    assert_eq!(shape.opacity(), opacity(0.5));
+    assert!(!scene.fragments().iter().any(|fragment| matches!(
+        fragment.kind(),
+        PaintFragmentKind::Unsupported {
+            capability: "partial_opacity_layer"
+        }
+    )));
+    assert_eq!(scene.stats().unsupported_fragment_count, 0);
+}
+
+#[test]
+fn partial_opacity_with_children_keeps_box_shape_opaque_and_reports_layer() {
+    let scene = compile_root(
+        div()
+            .key("root")
+            .bg(Color::rgb(1, 2, 3))
+            .opacity(opacity(0.5))
+            .child(div().key("child").bg(Color::rgb(4, 5, 6))),
+    );
+    let root_shape = scene
+        .fragments()
+        .iter()
+        .find_map(|fragment| match fragment.kind() {
+            PaintFragmentKind::BoxShape { shape } if shape.fill() == Some(Color::rgb(1, 2, 3)) => {
+                Some(*shape)
+            }
+            _ => None,
+        })
+        .expect("root box decoration should still be present");
+
+    assert_eq!(root_shape.opacity(), opacity(1.0));
+    assert!(scene.fragments().iter().any(|fragment| matches!(
+        fragment.kind(),
+        PaintFragmentKind::Unsupported {
+            capability: "partial_opacity_layer"
+        }
+    )));
+    assert_eq!(scene.stats().unsupported_fragment_count, 1);
+}
+
+#[test]
+fn rounded_overflow_clip_keeps_rectangular_clip_and_reports_descendant_shape_gap() {
+    let scene = compile_root(
+        div()
+            .key("clipper")
+            .w(px(100.0))
+            .h(px(80.0))
+            .overflow(Overflow::Hidden)
+            .rounded(px(12.0))
+            .child(text("inside rounded clip").key("label")),
+    );
+    let unsupported = scene
+        .fragments()
+        .iter()
+        .filter(|fragment| {
+            matches!(
+                fragment.kind(),
+                PaintFragmentKind::Unsupported {
+                    capability: "rounded_overflow_clip.descendants_or_text"
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let clip = scene
+        .fragments()
+        .iter()
+        .find_map(|fragment| match fragment.kind() {
+            PaintFragmentKind::ClipPush { clip } => Some(*clip),
+            _ => None,
+        })
+        .expect("overflow clipping still emits a rectangular clip push");
+
+    assert_eq!(unsupported.len(), 1);
+    assert_eq!(clip, crate::layout::LayoutRect::new(0.0, 0.0, 100.0, 80.0));
+    assert!(
+        scene
+            .fragments()
+            .iter()
+            .any(|fragment| matches!(fragment.kind(), PaintFragmentKind::Text { .. }))
+    );
+    assert!(scene.resource_demands().iter().any(|demand| {
+        demand.kind() == ResourceDemandKind::Unsupported
+            && demand.expected_generation() == scene.generation().style_generation()
+    }));
+    assert_eq!(scene.stats().unsupported_fragment_count, 1);
+}
+
+#[test]
+fn rounded_overflow_clip_without_descendants_does_not_report_shape_gap() {
+    let scene = compile_root(
+        div()
+            .key("clipper")
+            .w(px(100.0))
+            .h(px(80.0))
+            .overflow(Overflow::Hidden)
+            .rounded(px(12.0))
+            .bg(Color::rgb(1, 2, 3)),
+    );
+
+    assert!(!scene.fragments().iter().any(|fragment| matches!(
+        fragment.kind(),
+        PaintFragmentKind::Unsupported {
+            capability: "rounded_overflow_clip.descendants_or_text"
+        }
+    )));
+    assert_eq!(scene.stats().unsupported_fragment_count, 0);
 }
 
 #[test]
@@ -402,6 +586,10 @@ fn focused_tall_input_text_and_caret_share_centered_line_box_origin() {
                 .unwrap()
     );
     assert_eq!(label_text_fragment.rect(), label_layout.content_rect());
+    assert_eq!(
+        label_text_fragment.clip(),
+        Some(label_layout.content_rect())
+    );
     assert_ne!(scene.generation(), unfocused_generation);
 }
 
@@ -440,6 +628,7 @@ fn ordinary_tall_text_uses_content_top_origin() {
             > 0.0
     );
     assert_eq!(label_text.rect(), label_layout.content_rect());
+    assert_eq!(label_text.clip(), Some(label_layout.content_rect()));
 }
 
 #[test]
@@ -492,6 +681,69 @@ fn focused_input_emits_static_caret_rect_after_text_fragment() {
 
     assert!(text_index < caret_index);
     assert_ne!(scene.generation(), unfocused_generation);
+}
+
+#[test]
+fn focused_emoji_input_text_and_caret_share_effective_line_box() {
+    let mut runtime = Runtime::new();
+    let window = runtime
+        .open_window(WindowOptions::new(), |_| {
+            TestRoot::new(
+                div().key("root").child(
+                    input("Hello 😀")
+                        .key("field")
+                        .h(px(120.0))
+                        .font_size(px(48.0)),
+                ),
+            )
+        })
+        .unwrap();
+
+    runtime
+        .pointer_input(window, PointerInput::down(LayoutPoint::new(1.0, 1.0)))
+        .unwrap();
+    for handle in runtime.take_platform_redraw_requests() {
+        runtime
+            .ingest_platform_fact(PlatformFact::RedrawRequested { handle })
+            .unwrap();
+    }
+
+    let scene = runtime.scene_snapshot(window).unwrap();
+    let retained = runtime.retained_snapshot(window).unwrap();
+    let layout = runtime.layout_snapshot(window).unwrap();
+    let field = retained.find_by_key("field").unwrap();
+    let field_layout = layout.find_by_key("field").unwrap();
+    let content = field_layout.content_rect();
+    let text_layout = field_layout.text_layout().unwrap();
+    let placement = text_viewport_placement(ElementKind::Input, content, text_layout);
+    let line = text_layout.lines()[0];
+    let text_fragment = scene
+        .fragments()
+        .iter()
+        .find(|fragment| {
+            fragment.node_id() == field.id()
+                && matches!(fragment.kind(), PaintFragmentKind::Text { .. })
+        })
+        .expect("focused emoji input should retain its text fragment");
+    let caret_fragment = scene
+        .fragments()
+        .iter()
+        .find(|fragment| {
+            fragment.node_id() == field.id()
+                && matches!(fragment.kind(), PaintFragmentKind::Rect { color } if *color == Color::BLACK)
+                && fragment.rect() == placement.visible_caret_rect()
+        })
+        .expect("focused emoji input should emit a caret rect");
+
+    assert_eq!(text_layout.metrics().line_count, 1);
+    assert!(line.height() >= line.required_height());
+    assert_eq!(text_fragment.rect(), placement.text_draw_rect());
+    assert_eq!(caret_fragment.rect(), placement.visible_caret_rect());
+    assert_eq!(placement.visible_caret_rect().height(), line.height());
+    assert_eq!(
+        placement.visible_caret_rect().y(),
+        text_fragment.rect().y() + line.top()
+    );
 }
 
 #[test]

@@ -27,7 +27,7 @@ pub use error::{ErrorKind, NekoError, NekoResult};
 extern crate self as nekoui;
 pub use layout::{LayoutGeneration, LayoutNodeSnapshot, LayoutPoint, LayoutTreeSnapshot, Viewport};
 pub use style::{
-    Color, ColorSpace, Dimension, Display, Length, Opacity, StyleExt, TextOverflow, auto, fill,
-    opacity, px,
+    Color, ColorSpace, CornerRadii, Dimension, Display, Length, Opacity, StyleExt, TextOverflow,
+    auto, fill, opacity, px,
 };
 pub use window::WindowHandle;

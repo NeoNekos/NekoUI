@@ -1,18 +1,18 @@
 use crate::error::{NekoError, NekoResult};
 use crate::render::{
-    GLYPH_MONO_D3D11_FRAGMENT_DXBC, GLYPH_MONO_D3D11_VERTEX_DXBC, SOLID_RECT_D3D11_FRAGMENT_DXBC,
-    SOLID_RECT_D3D11_VERTEX_DXBC,
+    BOX_SHAPE_D3D11_FRAGMENT_DXBC, BOX_SHAPE_D3D11_VERTEX_DXBC, GLYPH_COLOR_D3D11_FRAGMENT_DXBC,
+    GLYPH_COLOR_D3D11_VERTEX_DXBC, GLYPH_MONO_D3D11_FRAGMENT_DXBC, GLYPH_MONO_D3D11_VERTEX_DXBC,
 };
 
 const DXBC_MAGIC: &[u8] = b"DXBC";
 const DXBC_PLACEHOLDER_PREFIX: &[u8] = b"NEKOUI_DXBC_PLACEHOLDER_V0";
 
-pub(super) fn solid_rect_vertex_shader_bytes() -> NekoResult<&'static [u8]> {
-    checked_bytes(SOLID_RECT_D3D11_VERTEX_DXBC, "solid_rect vertex DXBC")
+pub(super) fn box_shape_vertex_shader_bytes() -> NekoResult<&'static [u8]> {
+    checked_bytes(BOX_SHAPE_D3D11_VERTEX_DXBC, "box_shape vertex DXBC")
 }
 
-pub(super) fn solid_rect_pixel_shader_bytes() -> NekoResult<&'static [u8]> {
-    checked_bytes(SOLID_RECT_D3D11_FRAGMENT_DXBC, "solid_rect pixel DXBC")
+pub(super) fn box_shape_pixel_shader_bytes() -> NekoResult<&'static [u8]> {
+    checked_bytes(BOX_SHAPE_D3D11_FRAGMENT_DXBC, "box_shape pixel DXBC")
 }
 
 pub(super) fn glyph_mono_vertex_shader_bytes() -> NekoResult<&'static [u8]> {
@@ -21,6 +21,14 @@ pub(super) fn glyph_mono_vertex_shader_bytes() -> NekoResult<&'static [u8]> {
 
 pub(super) fn glyph_mono_pixel_shader_bytes() -> NekoResult<&'static [u8]> {
     checked_bytes(GLYPH_MONO_D3D11_FRAGMENT_DXBC, "glyph_mono pixel DXBC")
+}
+
+pub(super) fn glyph_color_vertex_shader_bytes() -> NekoResult<&'static [u8]> {
+    checked_bytes(GLYPH_COLOR_D3D11_VERTEX_DXBC, "glyph_color vertex DXBC")
+}
+
+pub(super) fn glyph_color_pixel_shader_bytes() -> NekoResult<&'static [u8]> {
+    checked_bytes(GLYPH_COLOR_D3D11_FRAGMENT_DXBC, "glyph_color pixel DXBC")
 }
 
 fn checked_bytes(bytes: &'static [u8], label: &'static str) -> NekoResult<&'static [u8]> {

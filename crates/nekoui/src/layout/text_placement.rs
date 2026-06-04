@@ -72,9 +72,10 @@ pub(crate) fn text_viewport_placement(
         0.0
     };
     let text_draw_rect = visual.rect().translate(-input_inline_scroll, 0.0);
-    let visible_caret_rect = visual
+    let unclamped_caret = visual
         .place_local_rect(trailing_caret)
         .translate(-input_inline_scroll, 0.0);
+    let visible_caret_rect = clamp_input_caret_to_viewport(kind, unclamped_caret, content_rect);
 
     TextViewportPlacement {
         text_draw_rect,
@@ -84,6 +85,21 @@ pub(crate) fn text_viewport_placement(
     }
 }
 
+fn clamp_input_caret_to_viewport(
+    kind: ElementKind,
+    caret: LayoutRect,
+    content_rect: LayoutRect,
+) -> LayoutRect {
+    if kind != ElementKind::Input {
+        return caret;
+    }
+    let caret_width = caret.width().min(content_rect.width()).max(0.0);
+    let min_x = content_rect.x();
+    let max_x = content_rect.x() + (content_rect.width() - caret_width).max(0.0);
+    let x = caret.x().clamp(min_x, max_x);
+    LayoutRect::new(x, caret.y(), caret_width, caret.height())
+}
+
 fn derived_input_inline_scroll(content_rect: LayoutRect, trailing_caret: LayoutRect) -> f32 {
     let trailing_caret_right = trailing_caret.x() + trailing_caret.width();
     let content_width = content_rect.width();
@@ -91,4 +107,42 @@ fn derived_input_inline_scroll(content_rect: LayoutRect, trailing_caret: LayoutR
         return 0.0;
     }
     (trailing_caret_right - content_width).max(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::element::ElementKind;
+    use crate::layout::LayoutRect;
+
+    use super::clamp_input_caret_to_viewport;
+
+    #[test]
+    fn input_caret_clamps_to_zero_width_viewport() {
+        let viewport = LayoutRect::new(10.0, 20.0, 0.0, 16.0);
+        let caret = LayoutRect::new(50.0, 20.0, 1.0, 16.0);
+
+        let clamped = clamp_input_caret_to_viewport(ElementKind::Input, caret, viewport);
+
+        assert_eq!(clamped, LayoutRect::new(10.0, 20.0, 0.0, 16.0));
+    }
+
+    #[test]
+    fn input_caret_clamps_to_tiny_viewport() {
+        let viewport = LayoutRect::new(10.0, 20.0, 0.5, 16.0);
+        let caret = LayoutRect::new(50.0, 20.0, 1.0, 16.0);
+
+        let clamped = clamp_input_caret_to_viewport(ElementKind::Input, caret, viewport);
+
+        assert_eq!(clamped, LayoutRect::new(10.0, 20.0, 0.5, 16.0));
+    }
+
+    #[test]
+    fn ordinary_text_caret_is_not_clamped_to_viewport() {
+        let viewport = LayoutRect::new(10.0, 20.0, 0.5, 16.0);
+        let caret = LayoutRect::new(50.0, 20.0, 1.0, 16.0);
+
+        let clamped = clamp_input_caret_to_viewport(ElementKind::Text, caret, viewport);
+
+        assert_eq!(clamped, caret);
+    }
 }

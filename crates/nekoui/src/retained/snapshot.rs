@@ -78,6 +78,10 @@ impl RetainedNodeSnapshot {
             .or_else(|| self.text().map(ToOwned::to_owned))
     }
 
+    pub(crate) fn has_display_text(&self) -> bool {
+        self.editable.is_some() || self.text.is_some()
+    }
+
     pub fn children(&self) -> &[RetainedNodeSnapshot] {
         &self.children
     }

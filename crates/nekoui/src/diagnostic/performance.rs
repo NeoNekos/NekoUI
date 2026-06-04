@@ -79,6 +79,7 @@ pub struct RenderFrameGraphReport {
     pub draw_item_count: usize,
     pub upload_intent_count: usize,
     pub layer_count: usize,
+    pub box_shape_count: usize,
     pub unsupported_fragment_count: usize,
     pub stale_drop_count: u64,
     pub duration: Duration,

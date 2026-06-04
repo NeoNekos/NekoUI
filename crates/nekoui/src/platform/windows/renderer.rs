@@ -12,15 +12,16 @@ use crate::render::{DrawItemKind, PreparedFrame};
 use crate::text::FontManager;
 use crate::window::{AnyWindowHandle, WindowId};
 
+use super::clip::{ActiveClip, ClipStack};
 use super::device::D3d11DeviceState;
 use super::frame::{
-    ActiveFrame, FrameRecordResources, FrameReport, has_supported_glyph_text,
-    has_supported_solid_rects, receipt,
+    ActiveFrame, FrameRecordResources, FrameReport, has_supported_box_shapes,
+    has_supported_glyph_text, receipt,
 };
 use super::glyph::GlyphUnsupportedReport;
-use super::glyph::{GLYPH_ATLAS_HEIGHT, GLYPH_ATLAS_WIDTH, GlyphAtlas};
-use super::glyph_pipeline::D3d11GlyphMonoPipeline;
-use super::pipeline::D3d11SolidRectPipeline;
+use super::glyph::{GLYPH_ATLAS_HEIGHT, GLYPH_ATLAS_WIDTH, GlyphAtlas, GlyphDrawPlan};
+use super::glyph_pipeline::{D3d11GlyphColorPipeline, D3d11GlyphMonoPipeline};
+use super::pipeline::D3d11BoxShapePipeline;
 use super::surface::DxgiSurface;
 use super::window::{NativeWindowHandle, hwnd_from_winit};
 
@@ -28,9 +29,12 @@ pub(crate) struct NativeRenderer {
     device: D3d11DeviceState,
     surfaces: HashMap<WindowId, DxgiSurface>,
     active: HashMap<WindowId, ActiveFrame>,
-    solid_rect_pipeline: Option<D3d11SolidRectPipeline>,
-    glyph_pipeline: Option<D3d11GlyphMonoPipeline>,
-    glyph_atlas: Option<GlyphAtlas>,
+    box_shape_pipeline: Option<D3d11BoxShapePipeline>,
+    mono_glyph_pipeline: Option<D3d11GlyphMonoPipeline>,
+    color_glyph_pipeline: Option<D3d11GlyphColorPipeline>,
+    mono_glyph_atlas: Option<GlyphAtlas>,
+    color_glyph_atlas: Option<GlyphAtlas>,
+    glyph_draw_plan: GlyphDrawPlan,
 }
 
 impl NativeRenderer {
@@ -52,9 +56,12 @@ impl NativeRenderer {
             device,
             surfaces: HashMap::new(),
             active: HashMap::new(),
-            solid_rect_pipeline: None,
-            glyph_pipeline: None,
-            glyph_atlas: None,
+            box_shape_pipeline: None,
+            mono_glyph_pipeline: None,
+            color_glyph_pipeline: None,
+            mono_glyph_atlas: None,
+            color_glyph_atlas: None,
+            glyph_draw_plan: GlyphDrawPlan::default(),
         })
     }
 
@@ -234,9 +241,9 @@ impl NativeRenderer {
                 "active frame surface disappeared during record",
             );
         };
-        if has_supported_solid_rects(prepared) && self.solid_rect_pipeline.is_none() {
-            match D3d11SolidRectPipeline::new(&self.device) {
-                Ok(pipeline) => self.solid_rect_pipeline = Some(pipeline),
+        if has_supported_box_shapes(prepared) && self.box_shape_pipeline.is_none() {
+            match D3d11BoxShapePipeline::new(&self.device) {
+                Ok(pipeline) => self.box_shape_pipeline = Some(pipeline),
                 Err(error) => {
                     return self.record_failed_active_frame(
                         diagnostics,
@@ -249,35 +256,18 @@ impl NativeRenderer {
             }
             record_pipeline_created(diagnostics, handle, prepared);
         }
-        if has_supported_glyph_text(prepared) {
-            if self.glyph_atlas.is_none() {
-                match GlyphAtlas::new(GLYPH_ATLAS_WIDTH, GLYPH_ATLAS_HEIGHT) {
-                    Ok(atlas) => self.glyph_atlas = Some(atlas),
-                    Err(error) => {
-                        return self.record_failed_active_frame(
-                            diagnostics,
-                            active,
-                            surface.state(),
-                            error,
-                            "active frame failed during glyph atlas materialization",
-                        );
-                    }
+        if has_supported_glyph_text(prepared) && self.mono_glyph_atlas.is_none() {
+            match GlyphAtlas::new(GLYPH_ATLAS_WIDTH, GLYPH_ATLAS_HEIGHT) {
+                Ok(atlas) => self.mono_glyph_atlas = Some(atlas),
+                Err(error) => {
+                    return self.record_failed_active_frame(
+                        diagnostics,
+                        active,
+                        surface.state(),
+                        error,
+                        "active frame failed during glyph atlas materialization",
+                    );
                 }
-            }
-            if self.glyph_pipeline.is_none() {
-                match D3d11GlyphMonoPipeline::new(&self.device) {
-                    Ok(pipeline) => self.glyph_pipeline = Some(pipeline),
-                    Err(error) => {
-                        return self.record_failed_active_frame(
-                            diagnostics,
-                            active,
-                            surface.state(),
-                            error,
-                            "active frame failed during glyph pipeline materialization",
-                        );
-                    }
-                }
-                record_glyph_pipeline_created(diagnostics, handle, prepared);
             }
         }
         let record_report = match active.record(
@@ -286,9 +276,12 @@ impl NativeRenderer {
             prepared,
             FrameRecordResources {
                 font_manager,
-                glyph_atlas: self.glyph_atlas.as_mut(),
-                glyph_pipeline: self.glyph_pipeline.as_mut(),
-                solid_rect_pipeline: self.solid_rect_pipeline.as_mut(),
+                mono_glyph_atlas: self.mono_glyph_atlas.as_mut(),
+                color_glyph_atlas: &mut self.color_glyph_atlas,
+                mono_glyph_pipeline: &mut self.mono_glyph_pipeline,
+                color_glyph_pipeline: &mut self.color_glyph_pipeline,
+                glyph_draw_plan: &mut self.glyph_draw_plan,
+                box_shape_pipeline: self.box_shape_pipeline.as_mut(),
             },
         ) {
             Ok(report) => report,
@@ -308,6 +301,12 @@ impl NativeRenderer {
                 );
             }
         };
+        if record_report.mono_glyph_pipeline_created {
+            record_glyph_pipeline_created(diagnostics, handle, prepared, "core.glyph_mono");
+        }
+        if record_report.color_glyph_pipeline_created {
+            record_glyph_pipeline_created(diagnostics, handle, prepared, "core.glyph_color");
+        }
         record_unsupported_draw_items(diagnostics, handle, prepared);
         record_glyph_unsupported(
             diagnostics,
@@ -440,21 +439,44 @@ fn record_glyph_unsupported(
     );
 }
 
-fn record_unsupported_draw_items(
+pub(super) fn record_unsupported_draw_items(
     diagnostics: &mut Diagnostics,
     handle: AnyWindowHandle,
     prepared: &PreparedFrame,
 ) {
+    let mut clip_stack = ClipStack::default();
     for item in prepared.draw_items() {
+        match item.kind() {
+            DrawItemKind::ClipPush { clip } => {
+                clip_stack.push(*clip);
+                continue;
+            }
+            DrawItemKind::ClipPop => {
+                clip_stack.pop();
+                continue;
+            }
+            _ if clip_stack.active_clip() == ActiveClip::Empty => continue,
+            _ => {}
+        }
         let capability = match item.kind() {
-            DrawItemKind::Rect { color } if color.srgb_channels().is_some() => continue,
+            DrawItemKind::BoxShape { shape } => {
+                match super::box_shape::unsupported_box_shape_capability(*shape) {
+                    Some(capability) => capability,
+                    None => continue,
+                }
+            }
+            DrawItemKind::Rect { color } if color.to_current_backend_sdr_srgb_rgba().is_some() => {
+                continue;
+            }
             DrawItemKind::Rect { .. } => "rect.color_space",
             DrawItemKind::Text { .. } if item.kind().supported_windows_glyph_text() => continue,
-            DrawItemKind::Text { color, .. } if color.srgb_channels().is_none() => {
+            DrawItemKind::Text { color, .. }
+                if color.to_current_backend_sdr_srgb_rgba().is_none() =>
+            {
                 "text.color_space"
             }
             DrawItemKind::Text { .. } => "text.glyph_path",
-            DrawItemKind::ClipPush | DrawItemKind::ClipPop => "clip",
+            DrawItemKind::ClipPush { .. } | DrawItemKind::ClipPop => continue,
             DrawItemKind::Unsupported { capability } => capability,
         };
         diagnostics.record(
@@ -463,7 +485,7 @@ fn record_unsupported_draw_items(
                 DiagnosticSeverity::Warning,
                 ErrorKind::Unsupported,
                 "gpu.unsupported",
-                "Windows D3D11/DXGI v0 solid-rect backend skipped an unsupported draw item",
+                "Windows D3D11/DXGI v0 box-shape backend skipped an unsupported draw item",
             )
             .with_field("backend", "windows.d3d11.dxgi")
             .with_field("window", handle.id().raw().to_string())
@@ -485,7 +507,7 @@ fn record_pipeline_created(
             DiagnosticSeverity::Info,
             ErrorKind::Diagnostic,
             "gpu.pipeline",
-            "Windows D3D11 solid rect pipeline materialized from checked artifacts",
+            "Windows D3D11 box shape pipeline materialized from checked artifacts",
         )
         .with_field("backend", "windows.d3d11.dxgi")
         .with_field("window", handle.id().raw().to_string())
@@ -497,7 +519,7 @@ fn record_pipeline_created(
                 .unwrap_or(0)
                 .to_string(),
         )
-        .with_field("shader", "core.solid_rect")
+        .with_field("shader", "core.box_shape")
         .with_field("target", "d3d11.sm5.dxbc"),
     );
 }
@@ -506,6 +528,7 @@ fn record_glyph_pipeline_created(
     diagnostics: &mut Diagnostics,
     handle: AnyWindowHandle,
     prepared: &PreparedFrame,
+    shader: &'static str,
 ) {
     diagnostics.record(
         DiagnosticRecord::new(
@@ -525,7 +548,7 @@ fn record_glyph_pipeline_created(
                 .unwrap_or(0)
                 .to_string(),
         )
-        .with_field("shader", "core.glyph_mono")
+        .with_field("shader", shader)
         .with_field("target", "d3d11.sm5.dxbc"),
     );
 }

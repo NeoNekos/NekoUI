@@ -2,6 +2,7 @@
 
 use core::mem::size_of;
 
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::{
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2D,
 };
@@ -21,25 +22,26 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32G32_FLOAT,
+    DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::core::s;
 
 use crate::error::{NekoError, NekoResult};
 use crate::render::{
-    GLYPH_MONO_COLOR_OFFSET, GLYPH_MONO_GLYPH_ATLAS_D3D11_SRV_SLOT,
+    GLYPH_COLOR_COLOR_OFFSET, GLYPH_COLOR_GLYPH_ATLAS_D3D11_SRV_SLOT,
+    GLYPH_COLOR_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT, GLYPH_COLOR_POSITION_OFFSET,
+    GLYPH_COLOR_UV_OFFSET, GLYPH_MONO_COLOR_OFFSET, GLYPH_MONO_GLYPH_ATLAS_D3D11_SRV_SLOT,
     GLYPH_MONO_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT, GLYPH_MONO_POSITION_OFFSET, GLYPH_MONO_UV_OFFSET,
-    PreparedFrame, PreparedFrameContext,
+    PreparedFrameContext,
 };
-use crate::scene::SceneOrder;
 use crate::style::Color;
+use crate::text::GlyphBitmapFormat;
 
+use super::clip::PhysicalScissorRect;
 use super::device::D3d11DeviceState;
-use super::glyph::{
-    GLYPH_ATLAS_HEIGHT, GLYPH_ATLAS_WIDTH, GlyphAtlas, GlyphDraw, GlyphUnsupportedReport,
-    collect_glyph_draws,
-};
+use super::glyph::{GLYPH_ATLAS_HEIGHT, GLYPH_ATLAS_WIDTH, GlyphAtlas, GlyphDraw};
+use super::shaders::{glyph_color_pixel_shader_bytes, glyph_color_vertex_shader_bytes};
 use super::shaders::{glyph_mono_pixel_shader_bytes, glyph_mono_vertex_shader_bytes};
 
 const INITIAL_VERTEX_CAPACITY: usize = 4096;
@@ -57,7 +59,24 @@ pub(super) struct D3d11GlyphMonoPipeline {
     vertices: ID3D11Buffer,
     vertex_capacity: usize,
     vertex_scratch: Vec<GlyphVertex>,
-    glyph_draw_scratch: Vec<GlyphDraw>,
+    srv_slot: u32,
+    sampler_slot: u32,
+}
+
+pub(super) struct D3d11GlyphColorPipeline {
+    inner: D3d11GlyphMonoPipeline,
+}
+
+struct GlyphPipelineConfig {
+    label: &'static str,
+    vertex_bytecode: &'static [u8],
+    pixel_bytecode: &'static [u8],
+    atlas_format: GlyphBitmapFormat,
+    position_offset: u32,
+    uv_offset: u32,
+    color_offset: u32,
+    srv_slot: u32,
+    sampler_slot: u32,
 }
 
 #[repr(C)]
@@ -70,8 +89,21 @@ struct GlyphVertex {
 
 impl D3d11GlyphMonoPipeline {
     pub(super) fn new(device: &D3d11DeviceState) -> NekoResult<Self> {
-        let vertex_bytecode = glyph_mono_vertex_shader_bytes()?;
-        let pixel_bytecode = glyph_mono_pixel_shader_bytes()?;
+        let config = GlyphPipelineConfig {
+            label: "D3D11 glyph mono",
+            vertex_bytecode: glyph_mono_vertex_shader_bytes()?,
+            pixel_bytecode: glyph_mono_pixel_shader_bytes()?,
+            atlas_format: GlyphBitmapFormat::MaskR8,
+            position_offset: GLYPH_MONO_POSITION_OFFSET,
+            uv_offset: GLYPH_MONO_UV_OFFSET,
+            color_offset: GLYPH_MONO_COLOR_OFFSET,
+            srv_slot: GLYPH_MONO_GLYPH_ATLAS_D3D11_SRV_SLOT,
+            sampler_slot: GLYPH_MONO_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT,
+        };
+        Self::new_with_config(device, config)
+    }
+
+    fn new_with_config(device: &D3d11DeviceState, config: GlyphPipelineConfig) -> NekoResult<Self> {
         let mut vertex_shader = None;
         let mut pixel_shader = None;
         let mut input_layout = None;
@@ -87,26 +119,37 @@ impl D3d11GlyphMonoPipeline {
         unsafe {
             device
                 .device()
-                .CreateVertexShader(vertex_bytecode, None, Some(&mut vertex_shader))
+                .CreateVertexShader(config.vertex_bytecode, None, Some(&mut vertex_shader))
                 .map_err(|error| {
                     NekoError::resource_failure(format!(
-                        "D3D11 glyph vertex shader unavailable: {error}"
+                        "{} vertex shader unavailable: {error}",
+                        config.label
                     ))
                 })?;
             device
                 .device()
-                .CreatePixelShader(pixel_bytecode, None, Some(&mut pixel_shader))
+                .CreatePixelShader(config.pixel_bytecode, None, Some(&mut pixel_shader))
                 .map_err(|error| {
                     NekoError::resource_failure(format!(
-                        "D3D11 glyph pixel shader unavailable: {error}"
+                        "{} pixel shader unavailable: {error}",
+                        config.label
                     ))
                 })?;
             device
                 .device()
-                .CreateInputLayout(&input_elements(), vertex_bytecode, Some(&mut input_layout))
+                .CreateInputLayout(
+                    &input_elements(
+                        config.position_offset,
+                        config.uv_offset,
+                        config.color_offset,
+                    ),
+                    config.vertex_bytecode,
+                    Some(&mut input_layout),
+                )
                 .map_err(|error| {
                     NekoError::resource_failure(format!(
-                        "D3D11 glyph input layout unavailable: {error}"
+                        "{} input layout unavailable: {error}",
+                        config.label
                     ))
                 })?;
             device
@@ -142,7 +185,7 @@ impl D3d11GlyphMonoPipeline {
                     ))
                 })?;
         }
-        let (atlas_texture, atlas_view) = create_atlas_resources(device)?;
+        let (atlas_texture, atlas_view) = create_atlas_resources(device, config.atlas_format)?;
         Ok(Self {
             vertex_shader: vertex_shader.ok_or_else(|| {
                 NekoError::resource_failure("D3D11 glyph vertex shader was not returned")
@@ -170,36 +213,21 @@ impl D3d11GlyphMonoPipeline {
             vertices: create_dynamic_vertex_buffer(device, INITIAL_VERTEX_CAPACITY)?,
             vertex_capacity: INITIAL_VERTEX_CAPACITY,
             vertex_scratch: Vec::with_capacity(INITIAL_VERTEX_CAPACITY),
-            glyph_draw_scratch: Vec::new(),
+            srv_slot: config.srv_slot,
+            sampler_slot: config.sampler_slot,
         })
     }
 
-    pub(super) fn collect_glyph_draws(
-        &mut self,
-        prepared: &PreparedFrame,
-        atlas: &GlyphAtlas,
-    ) -> NekoResult<GlyphUnsupportedReport> {
-        collect_glyph_draws(prepared, atlas, &mut self.glyph_draw_scratch)
-    }
-
-    pub(super) fn glyph_draw_count(&self) -> usize {
-        self.glyph_draw_scratch.len()
-    }
-
-    pub(super) fn glyph_draw_order(&self, index: usize) -> SceneOrder {
-        self.glyph_draw_scratch[index].order
-    }
-
-    pub(super) fn draw_collected_range(
+    pub(super) fn draw_glyphs(
         &mut self,
         device: &D3d11DeviceState,
         target: &ID3D11RenderTargetView,
         context: PreparedFrameContext,
-        range: std::ops::Range<usize>,
+        glyphs: &[GlyphDraw],
+        scissor: PhysicalScissorRect,
     ) -> NekoResult<usize> {
-        let glyphs = &self.glyph_draw_scratch[range];
         build_vertices_into(glyphs, context, &mut self.vertex_scratch);
-        self.draw_vertices(device, target, context)
+        self.draw_vertices(device, target, context, scissor)
     }
 
     fn draw_vertices(
@@ -207,6 +235,7 @@ impl D3d11GlyphMonoPipeline {
         device: &D3d11DeviceState,
         target: &ID3D11RenderTargetView,
         context: PreparedFrameContext,
+        scissor: PhysicalScissorRect,
     ) -> NekoResult<usize> {
         let vertex_count = self.vertex_scratch.len();
         if vertex_count == 0 {
@@ -229,12 +258,14 @@ impl D3d11GlyphMonoPipeline {
         let render_targets = [Some(target.clone())];
         let shader_resources = [Some(self.atlas_view.clone())];
         let samplers = [Some(self.sampler.clone())];
+        let scissor_rect = d3d11_rect(scissor);
 
         // SAFETY: All pipeline COM objects and the target RTV were created from this backend
         // device, and the immediate context is owned and serialized by the Windows renderer for
         // this frame. The vertex buffer has been grown and written for `vertex_count` tightly
         // packed `GlyphVertex` values, the atlas SRV/sampler stay alive through the call, and the
-        // RTV belongs to the current surface generation selected by the frame transaction.
+        // scissor was clamped for the current framebuffer. The RTV belongs to the current surface
+        // generation selected by the frame transaction.
         unsafe {
             device
                 .context()
@@ -253,17 +284,17 @@ impl D3d11GlyphMonoPipeline {
             );
             device.context().VSSetShader(&self.vertex_shader, None);
             device.context().PSSetShader(&self.pixel_shader, None);
-            device.context().PSSetShaderResources(
-                GLYPH_MONO_GLYPH_ATLAS_D3D11_SRV_SLOT,
-                Some(&shader_resources),
-            );
             device
                 .context()
-                .PSSetSamplers(GLYPH_MONO_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT, Some(&samplers));
+                .PSSetShaderResources(self.srv_slot, Some(&shader_resources));
+            device
+                .context()
+                .PSSetSamplers(self.sampler_slot, Some(&samplers));
             device
                 .context()
                 .OMSetBlendState(&self.blend_state, None, u32::MAX);
             device.context().RSSetState(&self.rasterizer_state);
+            device.context().RSSetScissorRects(Some(&[scissor_rect]));
             device
                 .context()
                 .OMSetDepthStencilState(&self.depth_stencil_state, 0);
@@ -298,16 +329,66 @@ impl D3d11GlyphMonoPipeline {
     }
 }
 
+impl D3d11GlyphColorPipeline {
+    pub(super) fn new(device: &D3d11DeviceState) -> NekoResult<Self> {
+        let config = GlyphPipelineConfig {
+            label: "D3D11 glyph color",
+            vertex_bytecode: glyph_color_vertex_shader_bytes()?,
+            pixel_bytecode: glyph_color_pixel_shader_bytes()?,
+            atlas_format: GlyphBitmapFormat::ColorRgba8,
+            position_offset: GLYPH_COLOR_POSITION_OFFSET,
+            uv_offset: GLYPH_COLOR_UV_OFFSET,
+            color_offset: GLYPH_COLOR_COLOR_OFFSET,
+            srv_slot: GLYPH_COLOR_GLYPH_ATLAS_D3D11_SRV_SLOT,
+            sampler_slot: GLYPH_COLOR_GLYPH_SAMPLER_D3D11_SAMPLER_SLOT,
+        };
+        Ok(Self {
+            inner: D3d11GlyphMonoPipeline::new_with_config(device, config)?,
+        })
+    }
+
+    pub(super) fn draw_glyphs(
+        &mut self,
+        device: &D3d11DeviceState,
+        target: &ID3D11RenderTargetView,
+        context: PreparedFrameContext,
+        glyphs: &[GlyphDraw],
+        scissor: PhysicalScissorRect,
+    ) -> NekoResult<usize> {
+        self.inner
+            .draw_glyphs(device, target, context, glyphs, scissor)
+    }
+
+    pub(super) fn upload_if_dirty(
+        &mut self,
+        device: &D3d11DeviceState,
+        atlas: &mut GlyphAtlas,
+    ) -> NekoResult<()> {
+        self.inner.upload_if_dirty(device, atlas)
+    }
+}
+
 fn create_atlas_resources(
     device: &D3d11DeviceState,
+    format: GlyphBitmapFormat,
 ) -> NekoResult<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
-    let zeros = vec![0_u8; (GLYPH_ATLAS_WIDTH * GLYPH_ATLAS_HEIGHT) as usize];
+    let dxgi_format = match format {
+        GlyphBitmapFormat::MaskR8 => DXGI_FORMAT_R8_UNORM,
+        GlyphBitmapFormat::ColorRgba8 => DXGI_FORMAT_R8G8B8A8_UNORM,
+    };
+    let row_pitch = GLYPH_ATLAS_WIDTH
+        .checked_mul(format.bytes_per_pixel() as u32)
+        .ok_or_else(|| NekoError::resource_failure("D3D11 glyph atlas row pitch overflow"))?;
+    let slice_pitch = row_pitch
+        .checked_mul(GLYPH_ATLAS_HEIGHT)
+        .ok_or_else(|| NekoError::resource_failure("D3D11 glyph atlas slice pitch overflow"))?;
+    let zeros = vec![0_u8; slice_pitch as usize];
     let desc = D3D11_TEXTURE2D_DESC {
         Width: GLYPH_ATLAS_WIDTH,
         Height: GLYPH_ATLAS_HEIGHT,
         MipLevels: 1,
         ArraySize: 1,
-        Format: DXGI_FORMAT_R8_UNORM,
+        Format: dxgi_format,
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: 1,
             Quality: 0,
@@ -319,14 +400,14 @@ fn create_atlas_resources(
     };
     let initial = D3D11_SUBRESOURCE_DATA {
         pSysMem: zeros.as_ptr().cast(),
-        SysMemPitch: GLYPH_ATLAS_WIDTH,
-        SysMemSlicePitch: GLYPH_ATLAS_WIDTH * GLYPH_ATLAS_HEIGHT,
+        SysMemPitch: row_pitch,
+        SysMemSlicePitch: slice_pitch,
     };
     let mut texture = None;
 
     // SAFETY: The atlas texture descriptor uses fixed nonzero glyph-atlas dimensions and a
-    // single-mip R8 texture. `zeros` contains exactly width * height bytes, and the pitch/slice
-    // values describe that checked byte store for the duration of the CreateTexture2D call.
+    // single-mip texture matching the atlas format. `zeros` contains exactly the slice bytes, and
+    // the pitch/slice values describe that checked byte store for the CreateTexture2D call.
     unsafe {
         device
             .device()
@@ -340,7 +421,7 @@ fn create_atlas_resources(
     let texture = texture
         .ok_or_else(|| NekoError::resource_failure("D3D11 glyph atlas texture was not returned"))?;
     let view_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-        Format: DXGI_FORMAT_R8_UNORM,
+        Format: dxgi_format,
         ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
         Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
             Texture2D: D3D11_TEX2D_SRV {
@@ -352,7 +433,7 @@ fn create_atlas_resources(
     let mut view = None;
 
     // SAFETY: `texture` is a live COM object returned by CreateTexture2D on the same backend
-    // device, and `view_desc` matches its R8 texture format, 2D dimension, and one-mip layout.
+    // device, and `view_desc` matches its texture format, 2D dimension, and one-mip layout.
     // The output slot is a valid `Option<ID3D11ShaderResourceView>` for D3D11 to initialize.
     unsafe {
         device
@@ -372,7 +453,15 @@ fn upload_atlas(
     texture: &ID3D11Texture2D,
     atlas: &GlyphAtlas,
 ) -> NekoResult<()> {
-    if atlas.pixels().len() != (GLYPH_ATLAS_WIDTH * GLYPH_ATLAS_HEIGHT) as usize {
+    let row_pitch = GLYPH_ATLAS_WIDTH
+        .checked_mul(atlas.bytes_per_pixel() as u32)
+        .ok_or_else(|| {
+            NekoError::resource_failure("D3D11 glyph atlas upload row pitch overflow")
+        })?;
+    let slice_pitch = row_pitch.checked_mul(GLYPH_ATLAS_HEIGHT).ok_or_else(|| {
+        NekoError::resource_failure("D3D11 glyph atlas upload slice pitch overflow")
+    })?;
+    if atlas.pixels().len() != slice_pitch as usize {
         return Err(NekoError::resource_failure(
             "glyph atlas pixel store has unexpected size",
         ));
@@ -388,16 +477,16 @@ fn upload_atlas(
 
     // SAFETY: `texture` is the live glyph atlas texture owned by this pipeline, `box_all` covers
     // exactly the fixed atlas dimensions, and the length check above proves `atlas.pixels()` holds
-    // width * height R8 bytes. The source pointer stays valid for the synchronous D3D11 upload, and
-    // the immediate context is owned by the Windows renderer while this upload is recorded.
+    // the full atlas byte store for its format. The source pointer stays valid for the synchronous
+    // D3D11 upload, and the immediate context is owned by the Windows renderer while recording.
     unsafe {
         device.context().UpdateSubresource(
             texture,
             0,
             Some(&box_all),
             atlas.pixels().as_ptr().cast(),
-            GLYPH_ATLAS_WIDTH,
-            GLYPH_ATLAS_WIDTH * GLYPH_ATLAS_HEIGHT,
+            row_pitch,
+            slice_pitch,
         );
     }
     Ok(())
@@ -477,14 +566,18 @@ fn vertex_buffer_byte_width(vertex_capacity: usize) -> NekoResult<u32> {
         .map_err(|_| NekoError::resource_failure("D3D11 glyph vertex buffer exceeds u32"))
 }
 
-fn input_elements() -> [D3D11_INPUT_ELEMENT_DESC; 3] {
+fn input_elements(
+    position_offset: u32,
+    uv_offset: u32,
+    color_offset: u32,
+) -> [D3D11_INPUT_ELEMENT_DESC; 3] {
     [
         D3D11_INPUT_ELEMENT_DESC {
             SemanticName: s!("LOC"),
             SemanticIndex: 0,
             Format: DXGI_FORMAT_R32G32_FLOAT,
             InputSlot: 0,
-            AlignedByteOffset: GLYPH_MONO_POSITION_OFFSET,
+            AlignedByteOffset: position_offset,
             InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
             InstanceDataStepRate: 0,
         },
@@ -493,7 +586,7 @@ fn input_elements() -> [D3D11_INPUT_ELEMENT_DESC; 3] {
             SemanticIndex: 1,
             Format: DXGI_FORMAT_R32G32_FLOAT,
             InputSlot: 0,
-            AlignedByteOffset: GLYPH_MONO_UV_OFFSET,
+            AlignedByteOffset: uv_offset,
             InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
             InstanceDataStepRate: 0,
         },
@@ -502,7 +595,7 @@ fn input_elements() -> [D3D11_INPUT_ELEMENT_DESC; 3] {
             SemanticIndex: 2,
             Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
             InputSlot: 0,
-            AlignedByteOffset: GLYPH_MONO_COLOR_OFFSET,
+            AlignedByteOffset: color_offset,
             InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
             InstanceDataStepRate: 0,
         },
@@ -548,9 +641,18 @@ fn rasterizer_desc() -> D3D11_RASTERIZER_DESC {
         DepthBiasClamp: 0.0,
         SlopeScaledDepthBias: 0.0,
         DepthClipEnable: false.into(),
-        ScissorEnable: false.into(),
+        ScissorEnable: true.into(),
         MultisampleEnable: false.into(),
         AntialiasedLineEnable: false.into(),
+    }
+}
+
+fn d3d11_rect(scissor: PhysicalScissorRect) -> RECT {
+    RECT {
+        left: scissor.left,
+        top: scissor.top,
+        right: scissor.right,
+        bottom: scissor.bottom,
     }
 }
 
@@ -632,15 +734,9 @@ fn to_ndc_y(y: f32, logical_extent: f32) -> f32 {
 }
 
 fn color_to_rgba(color: Color) -> [f32; 4] {
-    let (red, green, blue, alpha) = color
-        .srgb_channels()
-        .expect("glyph pipeline only receives sRGB colors");
-    [
-        red as f32 / 255.0,
-        green as f32 / 255.0,
-        blue as f32 / 255.0,
-        alpha as f32 / 255.0,
-    ]
+    color
+        .to_current_backend_sdr_srgb_rgba()
+        .expect("glyph pipeline only receives colors convertible to SDR sRGB")
 }
 
 #[cfg(test)]
@@ -649,21 +745,31 @@ mod tests {
     use super::*;
     use crate::layout::{LayoutRect, LayoutSize, Viewport};
     use crate::platform::PhysicalSize;
-    use crate::render::GLYPH_MONO_VERTEX_STRIDE;
+    use crate::render::{GLYPH_COLOR_VERTEX_STRIDE, GLYPH_MONO_VERTEX_STRIDE};
     use crate::scene::SceneOrder;
     use core::mem::offset_of;
 
     #[test]
     fn vertex_layout_matches_generated_shader_offsets() {
         assert_eq!(size_of::<GlyphVertex>() as u32, GLYPH_MONO_VERTEX_STRIDE);
+        assert_eq!(size_of::<GlyphVertex>() as u32, GLYPH_COLOR_VERTEX_STRIDE);
         assert_eq!(
             offset_of!(GlyphVertex, position) as u32,
             GLYPH_MONO_POSITION_OFFSET
         );
+        assert_eq!(
+            offset_of!(GlyphVertex, position) as u32,
+            GLYPH_COLOR_POSITION_OFFSET
+        );
         assert_eq!(offset_of!(GlyphVertex, uv) as u32, GLYPH_MONO_UV_OFFSET);
+        assert_eq!(offset_of!(GlyphVertex, uv) as u32, GLYPH_COLOR_UV_OFFSET);
         assert_eq!(
             offset_of!(GlyphVertex, color) as u32,
             GLYPH_MONO_COLOR_OFFSET
+        );
+        assert_eq!(
+            offset_of!(GlyphVertex, color) as u32,
+            GLYPH_COLOR_COLOR_OFFSET
         );
     }
 
@@ -742,5 +848,43 @@ mod tests {
         assert_eq!(vertices.capacity(), capacity);
         assert_eq!(vertices.len(), 6);
         assert_eq!(vertices[0].uv, [0.1, 0.2]);
+    }
+
+    #[test]
+    fn glyph_vertices_pack_oklch_as_sdr_srgb() {
+        let context = PreparedFrameContext::for_surface(
+            Viewport::new(LayoutSize::new(100.0, 50.0), 1.0),
+            PhysicalSize::new(100, 50),
+            1,
+        );
+        let vertices = build_vertices(
+            &[GlyphDraw {
+                order: SceneOrder::new(1),
+                rect: LayoutRect::new(0.0, 0.0, 10.0, 5.0),
+                uv: GlyphUv {
+                    left: 0.25,
+                    top: 0.5,
+                    right: 0.75,
+                    bottom: 1.0,
+                },
+                color: Color::oklcha(0.5, 0.1, 120.0, 0.25),
+            }],
+            context,
+        );
+
+        assert_eq!(vertices.len(), 6);
+        assert_rgba_close(
+            vertices[0].color,
+            [0.420_088_9, 0.328_834_68, 0.593_882_74, 0.25],
+        );
+    }
+
+    fn assert_rgba_close(actual: [f32; 4], expected: [f32; 4]) {
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 0.000_001,
+                "{actual} != {expected}"
+            );
+        }
     }
 }

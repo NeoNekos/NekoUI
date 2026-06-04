@@ -5,13 +5,17 @@ use crate::render::{
     DrawItem, DrawItemKind, FrameGraphStats, PreparedFrame, PreparedFrameContext,
     PreparedFrameGeneration, PreparedPass, RenderPass, UploadPlan,
 };
-use crate::scene::{SceneGeneration, SceneOrder};
-use crate::style::StyleExt;
+use crate::scene::{BoxShape, SceneGeneration, SceneOrder};
+use crate::style::{CornerRadii, Edges, Length, Opacity, StyleExt};
 use crate::window::{AnyWindowHandle, WindowId, WindowOptions};
 use crate::{Application, Color, Context, IntoElement, NekoResult, Render, div, fill, px, text};
 
-use super::frame::{ActiveFrame, count_unsupported_draw_items_for_backend, receipt};
-use super::renderer::record_frame_report;
+use super::box_shape::unsupported_box_shape_capability;
+use super::frame::{
+    ActiveFrame, count_unsupported_draw_items_for_backend, has_supported_box_shapes,
+    has_supported_glyph_text, receipt,
+};
+use super::renderer::{record_frame_report, record_unsupported_draw_items};
 use super::surface::{WINDOWS_BACKEND_CLEAR_COLOR, swap_chain_background_color, swap_chain_desc};
 
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM};
@@ -93,10 +97,18 @@ fn stale_generation_receipt_is_a_stale_drop() {
 }
 
 #[test]
-fn rect_and_glyph_text_draw_items_are_supported_while_advanced_items_remain_unsupported() {
+fn box_shape_and_glyph_text_draw_items_are_supported_while_advanced_items_remain_unsupported() {
     let prepared = prepared_frame_with_draw_items(vec![
         DrawItem::new(
             SceneOrder::new(1),
+            9,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::ClipPush {
+                clip: crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(2),
             10,
             crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
             DrawItemKind::Rect {
@@ -104,7 +116,7 @@ fn rect_and_glyph_text_draw_items_are_supported_while_advanced_items_remain_unsu
             },
         ),
         DrawItem::new(
-            SceneOrder::new(2),
+            SceneOrder::new(3),
             11,
             crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
             DrawItemKind::Text {
@@ -116,7 +128,13 @@ fn rect_and_glyph_text_draw_items_are_supported_while_advanced_items_remain_unsu
             },
         ),
         DrawItem::new(
-            SceneOrder::new(3),
+            SceneOrder::new(4),
+            9,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::ClipPop,
+        ),
+        DrawItem::new(
+            SceneOrder::new(5),
             12,
             crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
             DrawItemKind::Unsupported {
@@ -126,6 +144,108 @@ fn rect_and_glyph_text_draw_items_are_supported_while_advanced_items_remain_unsu
     ]);
 
     assert_eq!(count_unsupported_draw_items_for_backend(&prepared), 1);
+}
+
+#[test]
+fn empty_nested_clip_skips_unsupported_backend_draw_items() {
+    let prepared = prepared_frame_with_draw_items(vec![
+        DrawItem::new(
+            SceneOrder::new(1),
+            10,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::ClipPush {
+                clip: crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(2),
+            11,
+            crate::layout::LayoutRect::new(20.0, 20.0, 5.0, 5.0),
+            DrawItemKind::ClipPush {
+                clip: crate::layout::LayoutRect::new(20.0, 20.0, 5.0, 5.0),
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(3),
+            12,
+            crate::layout::LayoutRect::new(20.0, 20.0, 5.0, 5.0),
+            DrawItemKind::Unsupported {
+                capability: "advanced_effect",
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(4),
+            11,
+            crate::layout::LayoutRect::new(20.0, 20.0, 5.0, 5.0),
+            DrawItemKind::ClipPop,
+        ),
+        DrawItem::new(
+            SceneOrder::new(5),
+            10,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::ClipPop,
+        ),
+    ]);
+
+    assert_eq!(count_unsupported_draw_items_for_backend(&prepared), 0);
+}
+
+#[test]
+fn empty_nested_clip_does_not_materialize_supported_backend_draw_paths() {
+    let prepared = prepared_frame_with_draw_items(vec![
+        DrawItem::new(
+            SceneOrder::new(1),
+            10,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::ClipPush {
+                clip: crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(2),
+            11,
+            crate::layout::LayoutRect::new(20.0, 20.0, 5.0, 5.0),
+            DrawItemKind::ClipPush {
+                clip: crate::layout::LayoutRect::new(20.0, 20.0, 5.0, 5.0),
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(3),
+            12,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::Rect {
+                color: Color::rgb(1, 2, 3),
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(4),
+            13,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::Text {
+                text_generation: crate::scene::SceneInputSignature::default(),
+                text_metrics_generation: 1,
+                layout: test_text_layout_with_glyph(),
+                clip: None,
+                color: Color::rgb(1, 2, 3),
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(5),
+            11,
+            crate::layout::LayoutRect::new(20.0, 20.0, 5.0, 5.0),
+            DrawItemKind::ClipPop,
+        ),
+        DrawItem::new(
+            SceneOrder::new(6),
+            10,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::ClipPop,
+        ),
+    ]);
+
+    assert!(!has_supported_box_shapes(&prepared));
+    assert!(!has_supported_glyph_text(&prepared));
+    assert_eq!(count_unsupported_draw_items_for_backend(&prepared), 0);
 }
 
 #[test]
@@ -147,21 +267,198 @@ fn empty_text_draw_items_remain_unsupported_until_glyphs_exist() {
 }
 
 #[test]
-fn non_srgb_rect_colors_remain_unsupported_until_color_conversion_exists() {
+fn oklch_box_shape_colors_convert_to_supported_sdr_srgb() {
+    let shape = BoxShape::new(
+        Some(Color::oklch(0.5, 0.1, 120.0)),
+        Some(Color::oklcha(0.6, 0.12, 40.0, 0.75)),
+        Edges::all(px(1.0)),
+        CornerRadii::all(Length::ZERO),
+        Opacity::OPAQUE,
+    );
+    let prepared = prepared_frame_with_draw_items(vec![
+        DrawItem::new(
+            SceneOrder::new(1),
+            10,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::Rect {
+                color: Color::oklch(0.5, 0.1, 120.0),
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(2),
+            11,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::BoxShape { shape },
+        ),
+    ]);
+
+    assert_eq!(unsupported_box_shape_capability(shape), None);
+    assert!(has_supported_box_shapes(&prepared));
+    assert_eq!(count_unsupported_draw_items_for_backend(&prepared), 0);
+}
+
+#[test]
+fn oklch_text_color_converts_to_supported_sdr_srgb() {
     let prepared = prepared_frame_with_draw_items(vec![DrawItem::new(
         SceneOrder::new(1),
         10,
         crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
-        DrawItemKind::Rect {
-            color: Color::oklch(0.5, 0.1, 120.0),
+        DrawItemKind::Text {
+            text_generation: crate::scene::SceneInputSignature::default(),
+            text_metrics_generation: 1,
+            layout: test_text_layout_with_glyph(),
+            clip: None,
+            color: Color::oklch(0.7, 0.08, 220.0),
         },
     )]);
 
-    assert_eq!(count_unsupported_draw_items_for_backend(&prepared), 1);
+    assert!(has_supported_glyph_text(&prepared));
+    assert_eq!(count_unsupported_draw_items_for_backend(&prepared), 0);
 }
 
 #[test]
-fn empty_rect_batch_has_no_invalid_draw_or_unsupported_count() {
+fn invalid_oklch_colors_remain_unconvertible_at_backend_boundary() {
+    let border_shape = BoxShape::new(
+        None,
+        Some(Color::oklch(0.5, -0.1, 0.0)),
+        Edges::all(px(1.0)),
+        CornerRadii::all(Length::ZERO),
+        Opacity::OPAQUE,
+    );
+    let prepared = prepared_frame_with_draw_items(vec![
+        DrawItem::new(
+            SceneOrder::new(1),
+            10,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::Rect {
+                color: Color::oklch(f32::NAN, 0.1, 0.0),
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(2),
+            11,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::BoxShape {
+                shape: border_shape,
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(3),
+            12,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::Text {
+                text_generation: crate::scene::SceneInputSignature::default(),
+                text_metrics_generation: 1,
+                layout: test_text_layout_with_glyph(),
+                clip: None,
+                color: Color::oklcha(0.5, 0.1, 0.0, f32::NAN),
+            },
+        ),
+    ]);
+
+    assert_eq!(
+        unsupported_box_shape_capability(border_shape),
+        Some("box_shape.border.color_space")
+    );
+    assert_eq!(count_unsupported_draw_items_for_backend(&prepared), 3);
+}
+
+#[test]
+fn invalid_oklch_colors_keep_color_space_unsupported_diagnostics() {
+    let border_shape = BoxShape::new(
+        None,
+        Some(Color::oklch(0.5, -0.1, 0.0)),
+        Edges::all(px(1.0)),
+        CornerRadii::all(Length::ZERO),
+        Opacity::OPAQUE,
+    );
+    let prepared = prepared_frame_with_draw_items(vec![
+        DrawItem::new(
+            SceneOrder::new(1),
+            10,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::Rect {
+                color: Color::oklch(f32::NAN, 0.1, 0.0),
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(2),
+            11,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::BoxShape {
+                shape: border_shape,
+            },
+        ),
+        DrawItem::new(
+            SceneOrder::new(3),
+            12,
+            crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+            DrawItemKind::Text {
+                text_generation: crate::scene::SceneInputSignature::default(),
+                text_metrics_generation: 1,
+                layout: test_text_layout_with_glyph(),
+                clip: None,
+                color: Color::oklcha(0.5, 0.1, 0.0, f32::NAN),
+            },
+        ),
+    ]);
+    let mut diagnostics = Diagnostics::default();
+
+    record_unsupported_draw_items(
+        &mut diagnostics,
+        AnyWindowHandle::new_for_tests(WindowId::new(99)),
+        &prepared,
+    );
+
+    let snapshot = diagnostics.snapshot();
+    let capabilities = snapshot
+        .records()
+        .iter()
+        .filter_map(|record| record.fields.get("capability").map(|value| value.as_ref()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        capabilities,
+        vec![
+            "rect.color_space",
+            "box_shape.border.color_space",
+            "text.color_space",
+        ]
+    );
+}
+
+#[test]
+fn non_uniform_box_shape_border_or_radius_is_supported() {
+    let shape = BoxShape::new(
+        Some(Color::rgb(1, 2, 3)),
+        Some(Color::rgb(4, 5, 6)),
+        Edges {
+            top: Length::ZERO,
+            right: px(1.0),
+            bottom: Length::ZERO,
+            left: Length::ZERO,
+        },
+        CornerRadii {
+            top_left: px(2.0),
+            top_right: Length::ZERO,
+            bottom_right: px(3.0),
+            bottom_left: Length::ZERO,
+        },
+        Opacity::OPAQUE,
+    );
+    let prepared = prepared_frame_with_draw_items(vec![DrawItem::new(
+        SceneOrder::new(1),
+        10,
+        crate::layout::LayoutRect::new(0.0, 0.0, 10.0, 10.0),
+        DrawItemKind::BoxShape { shape },
+    )]);
+
+    assert_eq!(unsupported_box_shape_capability(shape), None);
+    assert!(has_supported_box_shapes(&prepared));
+    assert_eq!(count_unsupported_draw_items_for_backend(&prepared), 0);
+}
+
+#[test]
+fn empty_box_shape_batch_has_no_invalid_draw_or_unsupported_count() {
     let prepared = prepared_frame_with_draw_items(Vec::new());
 
     assert_eq!(count_unsupported_draw_items_for_backend(&prepared), 0);
@@ -176,11 +473,13 @@ fn shader_artifact_internals_do_not_leak_through_public_facades() {
         "src/render.rs",
     ] {
         let source = std::fs::read_to_string(file).unwrap();
-        assert!(!source.contains("D3d11SolidRectPipeline"));
+        assert!(!source.contains("D3d11BoxShapePipeline"));
         assert!(!source.contains("D3d11GlyphMonoPipeline"));
+        assert!(!source.contains("D3d11GlyphColorPipeline"));
         assert!(!source.contains("GlyphAtlas"));
-        assert!(!source.contains("solid_rect_vertex_shader_bytes"));
+        assert!(!source.contains("box_shape_vertex_shader_bytes"));
         assert!(!source.contains("glyph_mono_vertex_shader_bytes"));
+        assert!(!source.contains("glyph_color_vertex_shader_bytes"));
         assert!(!source.contains("ID3D11VertexShader"));
     }
 }
@@ -365,6 +664,7 @@ fn prepared_frame_with_draw_items(draw_items: Vec<DrawItem>) -> PreparedFrame {
             draw_item_count,
             upload_intent_count: 0,
             layer_count: 0,
+            box_shape_count: 0,
             unsupported_fragment_count: 0,
             stale_drop_count: 0,
             duration: std::time::Duration::ZERO,
@@ -405,7 +705,7 @@ fn test_text_layout(
         text_generation: crate::text::TextGeneration::INITIAL,
         style_generation: crate::text::TextGeneration::INITIAL,
         text_hash: 1,
-        available_inline_width_bits: None,
+        inline_constraint: crate::text::TextInlineConstraint::MaxContent.cache_key(),
         layout_mode: crate::text::TextLayoutMode::SoftWrap,
         font_size_bits: 12.0_f32.to_bits(),
         max_lines: None,
@@ -447,20 +747,20 @@ fn manual_windows_d3d11_resize_generation_smoke() -> NekoResult<()> {
 }
 
 #[test]
-#[ignore = "manual Windows D3D11/DXGI smoke: draws solid rects using generated framework shader artifacts"]
-fn manual_windows_d3d11_solid_rect_smoke() -> NekoResult<()> {
+#[ignore = "manual Windows D3D11/DXGI smoke: draws box shapes using generated framework shader artifacts"]
+fn manual_windows_d3d11_box_shape_smoke() -> NekoResult<()> {
     run_manual_windows_backend_smoke(
-        "NekoUI D3D11 solid rect smoke - expect visible dark and blue rects",
-        ManualRoot::solid_rects(),
+        "NekoUI D3D11 box shape smoke - expect visible dark and blue rects",
+        ManualRoot::box_shapes(),
     )
 }
 
 #[test]
-#[ignore = "manual Windows D3D11/DXGI smoke: resizes while drawing solid rects"]
-fn manual_windows_d3d11_solid_resize_generation_smoke() -> NekoResult<()> {
+#[ignore = "manual Windows D3D11/DXGI smoke: resizes while drawing box shapes"]
+fn manual_windows_d3d11_box_resize_generation_smoke() -> NekoResult<()> {
     run_manual_windows_backend_smoke(
-        "NekoUI D3D11 solid rect resize smoke - resize then close",
-        ManualRoot::solid_resize_hint(),
+        "NekoUI D3D11 box shape resize smoke - resize then close",
+        ManualRoot::box_resize_hint(),
     )
 }
 
@@ -521,21 +821,21 @@ impl ManualRoot {
 
     fn many_children(child_count: usize) -> Self {
         Self {
-            label: "Manual stress harness: this creates many solid rect rows for the D3D11 rect pass.",
+            label: "Manual stress harness: this creates many box shape rows for the D3D11 rect pass.",
             child_count,
         }
     }
 
-    fn solid_rects() -> Self {
+    fn box_shapes() -> Self {
         Self {
-            label: "Solid rect smoke: visible rows should be drawn by the D3D11 rect pass.",
+            label: "Box shape smoke: visible rows should be drawn by the D3D11 rect pass.",
             child_count: 24,
         }
     }
 
-    fn solid_resize_hint() -> Self {
+    fn box_resize_hint() -> Self {
         Self {
-            label: "Resize this solid-rect window several times, then close it.",
+            label: "Resize this box-shape window several times, then close it.",
             child_count: 96,
         }
     }

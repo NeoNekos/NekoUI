@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "nekoui"
-version = "0.0.76"
+version = "0.0.77"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "nekoui-build"
-version = "0.0.76"
+version = "0.0.77"
 dependencies = [
  "naga",
  "wesl",

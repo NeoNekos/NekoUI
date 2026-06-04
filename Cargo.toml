@@ -7,7 +7,7 @@ members = [
 default-members = ["crates/nekoui"]
 
 [workspace.package]
-version = "0.0.76"
+version = "0.0.77"
 edition = "2024"
 authors = ["Yamrc <yamrci@outlook.com>"]
 license = "MPL-2.0"
