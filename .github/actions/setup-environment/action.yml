@@ -1,5 +1,5 @@
-name: setup-rust
-description: Shared Rust CI environment setup for NekoUI workflows.
+name: setup-environment
+description: Shared CI environment setup for NekoUI workflows.
 
 inputs:
   components:
@@ -7,7 +7,7 @@ inputs:
     required: false
     default: ""
   install-linux-ui-deps:
-    description: Whether to install Linux GUI development packages.
+    description: Whether to install Linux UI development packages.
     required: false
     default: "false"
 

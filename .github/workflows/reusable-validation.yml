@@ -1,0 +1,52 @@
+name: reusable-validation
+
+on:
+  workflow_call:
+    inputs:
+      include_installers:
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  platform-validation:
+    name: Validate ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64-pc-msvc
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            install_linux_ui_deps: "false"
+          - platform: linux-x86_64-unknown-gnu
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            install_linux_ui_deps: "true"
+          - platform: macos-aarch64-darwin
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            install_linux_ui_deps: "false"
+
+    steps:
+      - name: step::checkout
+        uses: actions/checkout@v6
+
+      - name: step::setup
+        uses: ./.github/actions/setup-environment
+        with:
+          components: clippy
+          install-linux-ui-deps: ${{ matrix.install_linux_ui_deps }}
+
+      - name: step::clippy
+        run: cargo clippy --target ${{ matrix.target }} --all-features --all-targets -- -D warnings
+
+      - name: step::build
+        run: cargo build --target ${{ matrix.target }}
+
+      - name: step::test
+        run: cargo test --target ${{ matrix.target }} --workspace --all-targets

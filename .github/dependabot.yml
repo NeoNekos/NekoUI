@@ -1,0 +1,87 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      timezone: Asia/Shanghai
+    assignees:
+      - Yamrc
+    pull-request-branch-name:
+      separator: "-"
+    commit-message:
+      prefix: Build
+    versioning-strategy: lockfile-only
+    open-pull-requests-limit: 10
+    groups:
+      platform:
+        patterns:
+          - "accesskit*"
+          - "arboard"
+          - "ash"
+          - "objc*"
+          - "raw-window-handle"
+          - "rfd"
+          - "windows"
+          - "winit"
+          - "zbus"
+        update-types:
+          - patch
+          - minor
+      rendering-and-text:
+        patterns:
+          - "bytemuck"
+          - "cosmic-text"
+          - "etagere"
+          - "fontdb"
+          - "image"
+          - "lyon*"
+          - "naga"
+          - "resvg"
+          - "swash"
+          - "unicode-segmentation"
+          - "usvg"
+          - "wesl"
+        update-types:
+          - patch
+          - minor
+      foundation:
+        patterns:
+          - "bitflags"
+          - "crossbeam-channel"
+          - "hashbrown"
+          - "parking_lot"
+          - "rustc-hash"
+          - "slotmap"
+          - "smallvec"
+          - "thiserror"
+          - "tracing"
+          - "tracing-subscriber"
+        update-types:
+          - patch
+          - minor
+      other:
+        update-types:
+          - patch
+          - minor
+      major:
+        update-types:
+          - major
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      timezone: Asia/Shanghai
+    assignees:
+      - Yamrc
+    pull-request-branch-name:
+      separator: "-"
+    commit-message:
+      prefix: CI
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns:
+          - "*"

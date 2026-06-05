@@ -1,0 +1,41 @@
+name: reusable-checks
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: step::checkout
+        uses: actions/checkout@v6
+
+      - name: step::setup
+        uses: ./.github/actions/setup-environment
+        with:
+          components: rustfmt
+
+      - name: step::check_formatting
+        run: cargo fmt --all --check
+
+  clippy-fast:
+    name: Clippy fast
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: step::checkout
+        uses: actions/checkout@v6
+
+      - name: step::setup
+        uses: ./.github/actions/setup-environment
+        with:
+          components: clippy
+          install-linux-ui-deps: "true"
+
+      - name: step::clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings

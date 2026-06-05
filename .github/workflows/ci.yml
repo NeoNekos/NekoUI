@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: ./.github/workflows/reusable-checks.yml
+    secrets: inherit
+
+  validation:
+    needs: checks
+    uses: ./.github/workflows/reusable-validation.yml
+    secrets: inherit
+    with:
+      include_installers: false
