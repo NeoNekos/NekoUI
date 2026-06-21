@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: step::checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: step::setup
         uses: ./.github/actions/setup-environment
